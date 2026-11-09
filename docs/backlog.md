@@ -1783,6 +1783,14 @@ unit-tested over synthetic `DeviceProbe` values only (`caps::tests`), which
 proves the RULE, not the PROBE that feeds it: no NVIDIA, Intel or
 AMD-proprietary device has ever filled a `DeviceProbe` in this tree.
 
+**Intel Xe2 arm, run on hardware (2026-11-09, Arc Pro B70, Mesa 26.2.4 ANV):**
+the probe classified the part `IntelXe2/INTEL_OPEN_SOURCE_MESA` and the trust
+rule returned `Enumerated`, which is correct. The Intel pre-Xe2 `Tile8Only` arm is
+still unrun. The real Xe2 problem is the shape, not trust: ANV enumerates only
+8x16x16 (f16, bf16) and 8x16x32 (int8). That matches neither the 16x16x16 kernels
+nor the 8x8x16 opt-in, so every coopmat tier is dark (`docs/intel-b70.md`).
+`shader_core_count` read 0 (`cores:?`) because `0xE223` is not in the table.
+
 **The specific things a machine with one of those parts should check first:**
 
 - That `probe_device_facts` actually fills `wavefronts_per_simd` /
@@ -1825,7 +1833,11 @@ with `Recorder::vkb`'s bind check promoted from `debug_assert!` to a release
   pinned at the guaranteed minimum, so every dispatch wider than that pays a 2-D
   split RDNA3 does not need. Reading the real limit is a few lines; whether the
   split costs anything measurable has **never been profiled**, and that
-  measurement is the actual blocker — not the code.
+  measurement is the actual blocker — not the code. **First measurement
+  (2026-11-09, Arc Pro B70):** the device limit is 2^31−1. Lifting the pin to
+  that took the 248,320-row Qwen3.5-4B lm_head GEMV (124,160 workgroups, so
+  split 2-D) from split to flat and moved tg128 from 62.6 to 60.8 t/s, within
+  noise. Not worth doing for speed on that shape.
 - **`maxComputeWorkGroupInvocations` / `maxComputeWorkGroupSize`** → never
   queried; every `local_size_x` is a compile-time constant at or under the
   guaranteed 1024. Safe by spec, not by check. A guard would have to live in the
@@ -3330,3 +3342,68 @@ The DeltaNet arm clones `q/k/v` to split borrows; measured ~216 MB of memcpy per
 512-token prefill on the 9B, about 0.1% of a ~4.7 s prefill, with no RSS cost
 and nothing to clone at decode. Revisit only if a profile flags DeltaNet
 allocation.
+
+### B102 — a native Intel backend (Level Zero), deferred behind the Vulkan fixes (2026-11-09)
+
+**Tag:** backend · Intel · **Blocked on:** the Xe2 Vulkan slices in
+`docs/intel-b70.md` § Plan landing first
+
+infr has no SYCL or Level Zero backend. On the B70, llama.cpp's SYCL build runs
+Qwen3.5-4B prefill at 7031 t/s against its own Vulkan build's 3165
+(`docs/intel-b70.md` § Numbers). That gap is XMX GEMMs through oneMKL/oneDNN,
+which a Vulkan coopmat path on Mesa ANV may not reach. The decision (2026-11-09)
+was to close the gap to llama.cpp's Vulkan backend first, because every measured
+cause is inside `infr-vulkan`. After that, measure what is left before starting
+a fourth backend.
+
+If it is built, the shape is TensorFold's XPU port, not a SYCL one:
+
+- Level Zero loaded with `dlopen` (the `ash` analogue).
+- Kernels in OpenCL C, compiled offline by `ocloc` to zebins embedded in the
+  crate (the `glslc` analogue).
+
+That keeps the README's rule that the only non-Rust parts are driver calls and
+kernels. A true SYCL backend needs a C++ shim built with `icpx` and oneAPI at
+build time, which breaks that rule. Both options and the evidence are in
+`docs/intel-b70.md`.
+
+### B103 — fp32 divide is not correctly rounded on Intel, and `quant_q8` divides (2026-11-09)
+
+**Tag:** vulkan · correctness · Intel · **Blocked on:** nothing; found reading,
+not reproduced
+
+`quant_q8.comp` computes `d = amax / 127.0` and `inv = 1.0 / d`. SPIR-V
+`OpFDiv` is allowed 2.5 ulp, and Strata's SYCL port measured Arc's fp32 divide
+as not correctly rounded: its byte-exact `amax / 127` quantizer had 303k
+mismatches against ggml until it built with
+`-cl-fp32-correctly-rounded-divide-sqrt` (no Vulkan equivalent exists). Any infr
+contract that needs the GPU's int8 activations to be byte-identical to a CPU or
+host reference is therefore at risk on Intel. Check which tests assert that,
+then run them on `Vulkan1`. If one fails, compute `d` with a correctly-rounded
+sequence (a Newton step on `1/x`, or keep the reference's division order and
+compare with a tolerance).
+
+### B104 — the default device on a two-identical-GPU box is the display card (2026-11-09)
+
+**Tag:** vulkan · device selection · **Blocked on:** a way to tell the cards
+apart that is not a vendor table
+
+With no `--dev`, infr binds the first discrete device. On this box that is
+`Vulkan0` = PCI 0a:00.0, the B70 that drives the display and sits behind the
+chipset on a ~7 GB/s link. The headless card (03:00.0) is `Vulkan1`. Strata
+measured ~2x the per-kernel launch gap on the display card. Vulkan reports no
+"has a display" or link-width property. The candidates are reading the PCIe
+link width/speed from sysfs through `infr-plat`, or `VK_EXT_pci_bus_info` plus
+the same sysfs read. Until then, `docs/intel-b70.md` tells users to pass
+`--dev Vulkan1`.
+
+### B105 — the activation quantizer is 144 dispatches per decoded token (2026-11-09)
+
+**Tag:** vulkan · perf · decode · **Blocked on:** the three larger decode costs
+in `docs/intel-b70.md` (lm_head, DeltaNet, attn_qkv) going first
+
+Qwen3.5-4B on the B70: `quant_q8` runs 144 times per token at ~7 µs each, ~1 ms
+of a ~16 ms token, mostly fixed per-dispatch cost. TensorFold's XPU port fuses
+residual add + RMSNorm + activation quantization into one kernel. The
+`quant_q8` that follows a norm is the obvious first fusion. Bit-identical if the
+fused kernel keeps the same per-block `amax` and rounding.

@@ -44,6 +44,10 @@ at that index. It holds:
   / Strix Halo class): the UMA heap-table insight, the per-submit watchdog
   root-cause + submit-splitter fix, and the model survey. Correctness done; iGPU
   perf is `backlog.md` B99.
+- [intel-b70.md](intel-b70.md) — Intel Arc Pro B70 (Xe2) on the dev box: first
+  run against llama.cpp Vulkan and SYCL, the test-suite results, where prefill
+  and decode lose (dark 8x16x16 coopmat, lm_head, DeltaNet), lessons from
+  Strata's SYCL and TensorFold's Level Zero ports, and the Vulkan-first plan.
 
 ## Models & architectures
 
