@@ -1880,6 +1880,7 @@ impl VulkanBackend {
                 .filter(|&&(_, _, _, a, b, _, _)| a == f16c && b == f16c)
                 .map(|&(m, n, k, ..)| (m, n, k)),
             cm8_env,
+            true,
         );
         // Extension-added ComponentTypeKHR raw values (ash 0.38 predates these variants, so match by
         // raw i32). CONFIRMED on RDNA4/Navi44 via INFR_DEBUG_COOPMAT — all CORE types are 0..=10
@@ -1901,6 +1902,7 @@ impl VulkanBackend {
                 .filter(|&&(_, _, _, a, b, _, _)| is_f8(a.as_raw()) && is_f8(b.as_raw()))
                 .map(|&(m, n, k, ..)| (m, n, k)),
             false,
+            false,
         )
         // The shader declares `floate4m3_t` coopmat operands, so the tier needs the extension AND
         // `shaderFloat8CooperativeMatrix` — not merely an enumerated fp8 config.
@@ -1913,6 +1915,7 @@ impl VulkanBackend {
                 .filter(trusted)
                 .filter(|&&(_, _, _, a, b, _, _)| a.as_raw() == CT_BF16 && b.as_raw() == CT_BF16)
                 .map(|&(m, n, k, ..)| (m, n, k)),
+            false,
             false,
         )
         // `native_gemm_warp.comp`'s -DBF16CM build declares `bfloat16_t` coopmat operands
@@ -1938,6 +1941,7 @@ impl VulkanBackend {
                 .filter(|&&(_, _, _, a, b, _, r)| a == i8c && b == i8c && r == i32c)
                 .map(|&(m, n, k, ..)| (m, n, k)),
             false,
+            false,
         );
 
         // ── force-disable capabilities for fallback-path testing on capable HW ──
@@ -1952,13 +1956,13 @@ impl VulkanBackend {
         let coopmat_f16 = coopmat_f16
             .filter(|_| has_f16 && vkcfg.coopmat)
             .filter(|&s| {
-                // 8x8x16 additionally needs a pinnable subgroup size 16: the `_cm8` builds run
-                // 128 threads = 8 warps × 16 lanes (XMX/DPAS is SIMD16-native) and reuse the
-                // kernel's 8-warp index math, so a device that can't pin 16 can't run them.
-                // (Checked here so the coopmat ext is never enabled for a shape we then refuse.
-                // The physical-device subgroup range is queried again for `caps` below; this
-                // early copy exists because that query currently runs after device creation.)
-                if s != infr_core::COOPMAT_TILE_8 {
+                // 8x8x16 and 8x16x16 additionally need a pinnable subgroup size 16: the `_cm8`/
+                // `_cm816` builds run 128 threads = 8 warps × 16 lanes (XMX/DPAS is SIMD16-native)
+                // and reuse the kernel's 8-warp index math, so a device that can't pin 16 can't run
+                // them. (Checked here so the coopmat ext is never enabled for a shape we then
+                // refuse. The physical-device subgroup range is queried again for `caps` below;
+                // this early copy exists because that query currently runs after device creation.)
+                if s == infr_core::COOPMAT_TILE_16 {
                     return true;
                 }
                 let mut sgp = vk::PhysicalDeviceSubgroupSizeControlProperties::default();
@@ -1991,9 +1995,9 @@ impl VulkanBackend {
                      prefill tier live (other coopmat families stay on their non-coopmat \
                      fallbacks)"
                 ),
-                Some(_) => tracing::warn!(
-                    "[infr] INFR_CM_8X8=1 has no effect: device provides the default 16x16x16 \
-                     f16 coopmat tile — kernel set unchanged"
+                Some(s) => tracing::warn!(
+                    "[infr] INFR_CM_8X8=1 has no effect: device provides the preferred {s:?} f16 \
+                     coopmat tile — kernel set unchanged"
                 ),
                 None => tracing::warn!(
                     "[infr] INFR_CM_8X8=1 has no effect: device enumerates no usable 8x8x16 f16 \
@@ -2353,6 +2357,14 @@ impl VulkanBackend {
         // across `warmup()` + every turn (see `chat/vulkan.rs`'s `mtp_vk`), so an ordinary
         // `INFR_MTP=1` run prints exactly one banner again without needing this dedup.
         let yn = |b: bool| if b { "y" } else { "n" };
+        // `f16cm` names the tile when it is one of the small Intel ones (only `native_gemm_warp`'s
+        // XMX builds run there), so the banner does not read "n" on a device whose prefill GEMMs
+        // are on coopmat.
+        let f16cm = match caps.coopmat_f16 {
+            Some(infr_core::COOPMAT_TILE_8X16) => "8x16",
+            Some(infr_core::COOPMAT_TILE_8) => "8x8",
+            _ => yn(caps.f16_coopmat()),
+        };
         tracing::info!(
             "[infr] GPU: {} | {:?}/{} | f16:{} f16cm:{} bf16:{} bf16cm:{} f8:{} f8cm:{} i8:{} \
              i8dot:{} i8cm:{} cm2:{} subgroup:{}-{} sgp:{} cores:{} shared:{}KB",
@@ -2360,7 +2372,7 @@ impl VulkanBackend {
             device_arch,
             driver_label,
             yn(caps.f16),
-            yn(caps.f16_coopmat()),
+            f16cm,
             yn(caps.bf16),
             yn(caps.bf16_coopmat()),
             yn(caps.f8),

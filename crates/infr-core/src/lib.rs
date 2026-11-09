@@ -36,7 +36,7 @@ pub mod tier;
 pub use backend::{
     initial_submit_dispatch_cap, integrated_ubatch_rows, submit_cap_from_measurement, Backend,
     Bindings, Buffer, BufferUsage, Capabilities, GraphPlan, Plan, COOPMAT_TILE_16, COOPMAT_TILE_8,
-    SUBMIT_BUDGET_NS, SUBMIT_DANGER_NS,
+    COOPMAT_TILE_8X16, SUBMIT_BUDGET_NS, SUBMIT_DANGER_NS,
 };
 pub use error::{Error, Result};
 pub use graph::{Activation, AttnMask, Graph, Op, TensorDecl, TensorKind};

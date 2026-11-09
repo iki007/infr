@@ -1433,18 +1433,19 @@ fn lower_op(
             // `rows=m`; they dispatch `rows*out_f` (or row-tiled) workgroups with no upper bound
             // on `rows`, so they are a drop-in, just without any weight-reuse-across-rows win).
             // Bit-identical to before when caps are all true.
-            // ── 8x8x16 coopmat prefill GEMM tier (Intel Arc/ANV XMX; `caps.f16_coopmat_8x8()` is
-            // Some only when the device enumerates the 8x8x16 f16 shape AND `INFR_CM_8X8=1` —
-            // NEVER on RADV, which enumerates 16x16x16 and keeps the full tier below untouched).
-            // Only `native_gemm_warp`'s `_cm8` builds exist at this shape: one fixed
-            // NARROW_N+BM32 tile (BN=128, BK=64 → n%128, k%64) over the hot k-quants + Q8_0.
-            // Anything it can't cover (dtype without a `_cm8` build, non-dividing shape) keeps
-            // falling to the nc_mmq/nc_fma tier — the Arc default this knob A/Bs against.
+            // ── small-fragment coopmat prefill GEMM tier (Intel XMX) ── `caps.f16_coopmat_8x8()`
+            // is true only when the device enumerates the 8x8x16 f16 shape AND `INFR_CM_8X8=1`
+            // (Alchemist); `caps.f16_coopmat_8x16()` whenever the device enumerates 8x16x16 (Xe2,
+            // its only f16 shape). NEVER on RADV, which enumerates 16x16x16 and keeps the full
+            // tier below untouched. Only `native_gemm_warp`'s `_cm8`/`_cm816` builds exist at these
+            // shapes (`gemm::native_gemm_warp_xmx` owns their tiles and n/k rules). Anything it
+            // can't cover (dtype without a build, non-dividing shape) keeps falling to the
+            // nc_mmq/nc_fma tier.
             let cm8_ok = gemm_ok
-                && be_.caps().f16_coopmat_8x8()
-                && out_f % 128 == 0
-                && in_f % 64 == 0
-                && crate::gemm::native_gemm_warp_cm8_build_spv(dt).is_some();
+                && (be_.caps().f16_coopmat_8x8() || be_.caps().f16_coopmat_8x16())
+                && be_.caps().coopmat_f16.is_some_and(|s| {
+                    crate::gemm::native_gemm_warp_xmx(dt, s, out_f, in_f).is_some()
+                });
             let is_gemm = cm8_ok
                 || (gemm_ok
                     && be_.caps().f16_coopmat()
@@ -1560,10 +1561,10 @@ fn lower_op(
                         && (bf16cm_wide || bf16cm_narrow)
                         && be_.cfg().kernels.vulkan.bf16_coopmat;
                     if cm8_ok {
-                        // 8x8x16 `_cm8` warptile (see the `cm8_ok` doc above). First in the chain:
-                        // when it's true, `caps.f16_coopmat()` is false (the shapes are mutually
-                        // exclusive), so every 16x16x16 branch below would mis-dispatch — none of
-                        // their SPIR-V exists at the device's fragment shape.
+                        // `_cm8`/`_cm816` XMX warptile (see the `cm8_ok` doc above). First in the
+                        // chain: when it's true, `caps.f16_coopmat()` is false (the shapes are
+                        // mutually exclusive), so every 16x16x16 branch below would mis-dispatch —
+                        // none of their SPIR-V exists at the device's fragment shape.
                         rec.matmul_native_cm8(dt, xb, w, w_off, out, m, in_f, out_f);
                     } else if f8cm_ok {
                         // E4M3's range is tiny (max normal 448) — unscaled f32 activations overflow to

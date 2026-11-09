@@ -2156,13 +2156,12 @@ impl<'a> Recorder<'a> {
         );
     }
 
-    /// 8x8x16-fragment coopmat warptile GEMM (`_cm8` builds — Intel Arc/ANV XMX). One fixed tile:
-    /// NARROW_N+BM32 (BM=32, BN=128, BK=64) with CM_M=CM_N=8 fragments, 128 threads pinned at
-    /// subgroup size 16 (XMX/DPAS is SIMD16-native; 8 subgroups keep the kernel's 8-warp index
-    /// math). Caller (the adapter's `cm8_ok` gate) guarantees: the device's selected f16 coopmat
-    /// shape is 8x8x16 (`caps.f16_coopmat_8x8()` — never true on RADV), n%128==0, k%64==0, and
-    /// the `_cm8` SPIR-V exists for `dtype`. No wide/split-K/A_GLOBAL variants yet — this is the
-    /// minimal plumbing-proof tier; widen after the first A770/B580 A/B reports.
+    /// Small-fragment coopmat warptile GEMM for Intel XMX — the `_cm8` (8x8x16, Alchemist) or
+    /// `_cm816` (8x16x16, Xe2) builds, picked with their tile by `gemm::native_gemm_warp_xmx` from
+    /// the device's selected f16 coopmat shape. Subgroup pinned at 16 (XMX/DPAS is SIMD16-native).
+    /// Caller (the adapter's `cm8_ok` gate) guarantees the shape is one of those two (never on
+    /// RADV) and that a build exists for (`dtype`, shape, `n`, `k`). C is the adapter's
+    /// ceil(m/64)*64-row padded dst; the kernel zero-pads A rows past `m`.
     #[allow(clippy::too_many_arguments)]
     pub fn matmul_native_cm8(
         &self,
@@ -2175,18 +2174,20 @@ impl<'a> Recorder<'a> {
         k: usize,
         n: usize,
     ) {
-        let (name, spv) = crate::gemm::native_gemm_warp_cm8_build_spv(dtype).expect("cm8 GEMM spv");
-        self.label_gemm(name, m, k, n);
-        let kern = self.be.kernel_sg(name, spv, 3, 16, 16);
+        let shape = self
+            .be
+            .caps()
+            .coopmat_f16
+            .expect("XMX GEMM: no f16 coopmat shape selected");
+        let t = crate::gemm::native_gemm_warp_xmx(dtype, shape, n, k).expect("XMX GEMM spv");
+        self.label_gemm(t.name, m, k, n);
+        let kern = self.be.kernel_sg(t.name, t.spv, 3, 16, 16);
         let mut push = [0u8; 16];
         push[0..4].copy_from_slice(&(m as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(n as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&(k as u32).to_ne_bytes());
         push[12..16].copy_from_slice(&(w_base as u32).to_ne_bytes());
-        // BM=32 row tiles × BN=128 column tiles (the kernel zero-pads A rows past `m`; C pad rows
-        // land in the adapter's ceil(m/64)*64-row padded dst, same convention as the 16x16x16
-        // warptiles).
-        let groups = (m.div_ceil(32) * (n / 128)) as u32;
+        let groups = (m.div_ceil(t.bm) * (n / t.bn)) as u32;
         self.dispatch(
             kern,
             &[Self::vkb(a), Self::vkb(w), Self::vkb(c)],

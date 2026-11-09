@@ -37,6 +37,9 @@ pub const COOPMAT_TILE_16: (u32, u32, u32) = (16, 16, 16);
 /// shape any kernel here is built for, and only `native_gemm_warp`'s `_cm8` variants at that
 /// (opt-in via `INFR_CM_8X8=1`; see the Vulkan backend's shape selection).
 pub const COOPMAT_TILE_8: (u32, u32, u32) = (8, 8, 16);
+/// The 8x16x16 (M,N,K) tile Intel Xe2 (Battlemage / Arc Pro B70, Mesa ANV) enumerates for f16 and
+/// bf16 — its ONLY f16 shape. Only `native_gemm_warp`'s `_cm816` variants are built at it.
+pub const COOPMAT_TILE_8X16: (u32, u32, u32) = (8, 16, 16);
 
 /// Device capabilities the graph compiler queries to pick fast vs fallback kernels.
 #[derive(Clone, Debug, Default)]
@@ -339,6 +342,11 @@ impl Capabilities {
     /// `native_gemm_warp` `_cm8` builds; every other coopmat family has no kernel at this shape.
     pub fn f16_coopmat_8x8(&self) -> bool {
         self.coopmat_f16 == Some(COOPMAT_TILE_8)
+    }
+    /// The 8x16x16 f16 tile was selected (Intel Xe2) — gates ONLY the `native_gemm_warp`
+    /// `_cm816` builds; every other coopmat family has no kernel at this shape.
+    pub fn f16_coopmat_8x16(&self) -> bool {
+        self.coopmat_f16 == Some(COOPMAT_TILE_8X16)
     }
     /// 16x16x16 f8 coopmat GEMM tier available (see `coopmat_f8`).
     pub fn f8_coopmat(&self) -> bool {

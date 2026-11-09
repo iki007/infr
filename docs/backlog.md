@@ -1788,8 +1788,10 @@ the probe classified the part `IntelXe2/INTEL_OPEN_SOURCE_MESA` and the trust
 rule returned `Enumerated`, which is correct. The Intel pre-Xe2 `Tile8Only` arm is
 still unrun. The real Xe2 problem is the shape, not trust: ANV enumerates only
 8x16x16 (f16, bf16) and 8x16x32 (int8). That matches neither the 16x16x16 kernels
-nor the 8x8x16 opt-in, so every coopmat tier is dark (`docs/intel-b70.md`).
-`shader_core_count` read 0 (`cores:?`) because `0xE223` is not in the table.
+nor the 8x8x16 opt-in, so every coopmat tier was dark (`docs/intel-b70.md`).
+The prefill GEMMs now have `_cm816` builds at that shape; every other coopmat
+family is still dark there. `shader_core_count` read 0 (`cores:?`) because
+`0xE223` was not in the table; it is now.
 
 **The specific things a machine with one of those parts should check first:**
 

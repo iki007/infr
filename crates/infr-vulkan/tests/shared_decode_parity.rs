@@ -65,6 +65,31 @@ fn vulkan_linear_all_weight_quants_m4_match_the_host_oracle() {
     sweep_linear_on("vulkan Linear m=4", &be, &cases, |_| VK_TOL).assert_ok();
 }
 
+/// All 24 weight quants on the prefill GEMM tier, at two shapes every GEMM family accepts, so each
+/// device runs its own default: the 16x16x16 coopmat warptiles on RDNA3/NVIDIA, the 8x16x16
+/// `_cm816` XMX warptiles on Intel Xe2 for the formats that have a build (the rest on
+/// `nc_mmq`/`nc_fma`), the non-coopmat tier everywhere else.
+///
+/// * m=40, 512x256: under one 128-row Xe2 tile (its `ROW_GUARD` skips the fragments past `m`),
+///   n%256 == 0 (the wide `_cm816` build).
+/// * m=200, 512x384: two row tiles with a partial last one, n%256 != 0 (the `_cm816_n128` build).
+///
+/// f16 activations (coopmat) or int8 activations (`nc_mmq`) put the error in the same ~5e-3 band
+/// the m=4 tier documents, well under [`VK_TOL`]; a mis-decoded format or a wrong fragment layout
+/// is O(1).
+#[test]
+#[ignore = "requires a Vulkan-capable GPU"]
+fn vulkan_linear_all_weight_quants_gemm_tier_match_the_host_oracle() {
+    let Ok(be) = VulkanBackend::new() else {
+        eprintln!("skip: no Vulkan device");
+        return;
+    };
+    let cases = weight_quant_cases(40, 512, 256);
+    sweep_linear_on("vulkan Linear m=40", &be, &cases, |_| VK_TOL).assert_ok();
+    let cases = weight_quant_cases(200, 512, 384);
+    sweep_linear_on("vulkan Linear m=200", &be, &cases, |_| VK_TOL).assert_ok();
+}
+
 /// The dense float weight paths, which take no quant decode — the oracle reads the SAME bytes the
 /// GPU does, so the only gap is f32 summation order.
 #[test]

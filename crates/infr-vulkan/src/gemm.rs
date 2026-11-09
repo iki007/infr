@@ -1481,17 +1481,38 @@ pub(crate) fn native_gemm_warp_n128_kernel_name(dtype: infr_core::DType) -> Opti
     })
 }
 
-/// 8x8x16-fragment `_cm8` warptile variants (Intel Arc/ANV XMX; `-DCM_M=8 -DCM_N=8` on the
-/// NARROW_N+BM32 tile, 128 threads / pinned subgroup 16) — dispatched ONLY when the device's
-/// selected f16 coopmat shape is 8x8x16 (`caps.f16_coopmat_8x8()`, which itself requires the
-/// `INFR_CM_8X8=1` opt-in; see lib.rs `select_coopmat_shape`). Name+SPIR-V so `kernel_sg` caches
-/// distinct pipelines. Hot k-quants + Q8_0 only; `None` routes the shape to the nc_mmq/nc_fma
-/// non-coopmat tier (the Arc default).
+/// One small-fragment Intel XMX warptile build of `native_gemm_warp`: its kernel-cache name and
+/// SPIR-V, plus the workgroup tile the dispatch grid needs. Every one runs at a pinned subgroup of
+/// 16 (XMX/DPAS is SIMD16-native); the thread count is baked into the SPIR-V.
+pub(crate) struct XmxGemm {
+    pub name: &'static str,
+    pub spv: &'static [u32],
+    /// Rows per workgroup tile. C is padded by the caller to ceil(m/64)*64 rows only; the BM=128
+    /// builds skip fragments past `m` (`-DROW_GUARD`).
+    pub bm: usize,
+    /// Columns per workgroup tile (`n % bn == 0`, already checked).
+    pub bn: usize,
+}
+
+/// The Intel XMX warptile for a GEMM of `n` output columns over `k`, by the device's selected f16
+/// coopmat `shape` (lib.rs `select_coopmat_shape`):
+///
+/// * 8x8x16 (Alchemist, only under the `INFR_CM_8X8=1` opt-in): the `_cm8` builds, BM=32 x BN=128,
+///   BK=64, 128 threads.
+/// * 8x16x16 (Xe2, selected whenever enumerated): the `_cm816` builds, BM=128 x BN=256, BK=32,
+///   1024 threads, or `_cm816_n128` (BM=128 x BN=128, BK=64, 512 threads) when n%256 != 0.
+///
+/// `None` for any other shape, a dtype without a build, or a non-dividing `n`/`k`: the GEMM then
+/// takes the nc_mmq/nc_fma non-coopmat tier.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_gemm_warp_cm8_build_spv(
+pub(crate) fn native_gemm_warp_xmx(
     dtype: infr_core::DType,
-) -> Option<(&'static str, &'static [u32])> {
+    shape: (u32, u32, u32),
+    n: usize,
+    k: usize,
+) -> Option<XmxGemm> {
     use infr_core::DType::*;
+    use infr_core::{COOPMAT_TILE_8, COOPMAT_TILE_8X16};
     macro_rules! v {
         ($name:literal) => {{
             static S: OnceLock<Vec<u32>> = OnceLock::new();
@@ -1504,12 +1525,52 @@ pub(crate) fn native_gemm_warp_cm8_build_spv(
             )
         }};
     }
-    Some(match dtype {
-        Q4K => v!("native_gemm_warp_q4k_cm8"),
-        Q6K => v!("native_gemm_warp_q6k_cm8"),
-        Q8_0 => v!("native_gemm_warp_q8_0_cm8"),
+    let wide = n.is_multiple_of(256) && k.is_multiple_of(32);
+    let narrow = n.is_multiple_of(128) && k.is_multiple_of(64);
+    let (bm, bn, (name, spv)) = match shape {
+        COOPMAT_TILE_8 if narrow => (
+            32,
+            128,
+            match dtype {
+                Q4K => v!("native_gemm_warp_q4k_cm8"),
+                Q6K => v!("native_gemm_warp_q6k_cm8"),
+                Q8_0 => v!("native_gemm_warp_q8_0_cm8"),
+                _ => return None,
+            },
+        ),
+        COOPMAT_TILE_8X16 if wide => (
+            128,
+            256,
+            match dtype {
+                Q4K => v!("native_gemm_warp_q4k_cm816"),
+                Q5K => v!("native_gemm_warp_q5k_cm816"),
+                Q6K => v!("native_gemm_warp_q6k_cm816"),
+                Q8_0 => v!("native_gemm_warp_q8_0_cm816"),
+                Q2K => v!("native_gemm_warp_q2k_cm816"),
+                Q3K => v!("native_gemm_warp_q3k_cm816"),
+                Iq4Xs => v!("native_gemm_warp_iq4xs_cm816"),
+                Iq4Nl => v!("native_gemm_warp_iq4nl_cm816"),
+                _ => return None,
+            },
+        ),
+        COOPMAT_TILE_8X16 if narrow => (
+            128,
+            128,
+            match dtype {
+                Q4K => v!("native_gemm_warp_q4k_cm816_n128"),
+                Q5K => v!("native_gemm_warp_q5k_cm816_n128"),
+                Q6K => v!("native_gemm_warp_q6k_cm816_n128"),
+                Q8_0 => v!("native_gemm_warp_q8_0_cm816_n128"),
+                Q2K => v!("native_gemm_warp_q2k_cm816_n128"),
+                Q3K => v!("native_gemm_warp_q3k_cm816_n128"),
+                Iq4Xs => v!("native_gemm_warp_iq4xs_cm816_n128"),
+                Iq4Nl => v!("native_gemm_warp_iq4nl_cm816_n128"),
+                _ => return None,
+            },
+        ),
         _ => return None,
-    })
+    };
+    Some(XmxGemm { name, spv, bm, bn })
 }
 
 /// A_GLOBAL warptile variants: A pre-converted to f16 by the caller and coopMatLoad'd straight

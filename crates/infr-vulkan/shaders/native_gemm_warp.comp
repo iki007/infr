@@ -74,18 +74,34 @@ const uint THREADS = WG_THREADS;
 // restoring the WARPS_M*WARPS_N==8 invariant the compute/store loop relies on — every launched
 // warp gets exactly one CMS_M×CMS_N frag block (1×1 narrow, 1×2 wide) and the tile math stays
 // generic (CMS_M/CMS_N fall out of WM/WN as always).
+// -DXE_WM=<n>u / -DXE_WN=<n>u override the per-warp tile WM/WN that BM*/NARROW_N would pick (the
+// `_cm816` Intel Xe2 builds). The warp math needs WARPS_M*WARPS_N == WG_THREADS/subgroup, so an
+// override always comes with a matching -DWG_THREADS: Xe2 runs MANY small warps (16-lane, 2x2
+// 8x16 fragments each) instead of 8 large ones, because larger per-warp tiles spill its registers
+// (measured on an Arc Pro B70: 128x256 with 64 warps 1.8 ms vs 8 warps of 32x128 4.3 ms, Qwen3.5-4B
+// m=512 2560x18432 Q4_K). Unset = WM_DEF(x) -> x, so every other build is unchanged.
+#ifdef XE_WM
+#define WM_DEF(x) XE_WM
+#else
+#define WM_DEF(x) x
+#endif
+#ifdef XE_WN
+#define WN_DEF(x) XE_WN
+#else
+#define WN_DEF(x) x
+#endif
 #ifdef BM128
 const uint BM = 128u;
-const uint WM = 64u;
+const uint WM = WM_DEF(64u);
 #elif defined(BM32)
 const uint BM = 32u;
-const uint WM = 16u;
+const uint WM = WM_DEF(16u);
 #elif defined(BM16)
 const uint BM = 16u;
-const uint WM = 16u;
+const uint WM = WM_DEF(16u);
 #else
 const uint BM = 64u;
-const uint WM = 32u;
+const uint WM = WM_DEF(32u);
 #endif
 #ifdef NARROW_N
 const uint BN = 128u;
@@ -95,9 +111,9 @@ const uint BK = 32u;
 const uint BK = 64u;
 #endif
 #ifdef BM16
-const uint WN = 16u;
+const uint WN = WN_DEF(16u);
 #else
-const uint WN = 32u;
+const uint WN = WN_DEF(32u);
 #endif
 #else
 const uint BN = 256u;
@@ -107,9 +123,9 @@ const uint BK = 64u;
 const uint BK = 32u;
 #endif
 #ifdef BM16
-const uint WN = 32u;
+const uint WN = WN_DEF(32u);
 #else
-const uint WN = 64u;
+const uint WN = WN_DEF(64u);
 #endif
 #endif
 const uint WARPS_M = BM / WM;   // 2 (1 for BM16)
@@ -260,6 +276,14 @@ void main() {
         [[unroll]] for (uint j = 0u; j < CMS_N; j++) {
             uint cr = wgRow + warp_r * WM + i * CM_M;
             uint cc = wgCol + warp_c * WN + j * CM_N;
+#ifdef ROW_GUARD
+            // -DROW_GUARD (the BM=128 `_cm816` builds): the caller pads C to ceil(m/64)*64 rows
+            // only, so a fragment starting at or past `m` is skipped. One that starts below `m`
+            // ends below ceil(m/8)*8 <= the padded height (fragments are CM_M = 8 rows).
+            if (cr >= pc.m) {
+                continue;
+            }
+#endif
 #ifdef SPLIT_K
             coopMatStore(acc[i][j], c, split * pc.mpad * pc.n + cr * pc.n + cc, pc.n,
                          gl_CooperativeMatrixLayoutRowMajor);

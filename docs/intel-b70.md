@@ -8,10 +8,13 @@ here; for Intel behaviour, this file supersedes them.
 ## Status
 
 infr builds and runs on Xe2 and generates coherent text on both cards (Qwen3.5-4B
-and Qwen3.8-27B checked by hand). It is **2–3.4x behind llama.cpp's Vulkan
-backend on prefill and ~1.7x behind on decode**. The causes are measured
-(below), and every one of them is inside the existing Vulkan backend. A native
-Intel backend (Level Zero) is deferred until those are fixed (`backlog.md`
+and Qwen3.8-27B checked by hand). The first run was **2–3.4x behind llama.cpp's
+Vulkan backend on prefill and ~1.7x behind on decode**. The causes are measured
+(below), and every one of them is inside the existing Vulkan backend. Plan
+slices 1 and 2 have landed: the GPU suite is clean, and prefill runs on XMX
+through an 8x16x16 coopmat tile (+53% / +71% pp512), but it is still 1.3x / 2x
+behind llama.cpp's Vulkan prefill. Decode is unchanged so far. A native Intel
+backend (Level Zero) is deferred until the Vulkan work is done (`backlog.md`
 B102).
 
 ## Running on this box
@@ -35,20 +38,24 @@ INFR_DEV=Vulkan1 cargo test --release -p infr-vulkan --no-fail-fast -- --include
 
 ## Numbers (2026-11-09, `Vulkan1`, `-fa 1` for llama.cpp)
 
-| model                       | infr Vulkan | llama.cpp Vulkan | llama.cpp SYCL |
-| --------------------------- | ----------- | ---------------- | -------------- |
-| Qwen3.5-4B Q4_K_M pp512     | 1571        | 3165             | 7031           |
-| Qwen3.5-4B Q4_K_M tg128     | 62.6        | 111.2            | 148.5          |
-| Qwen3.8-27B UD-Q4_K_M pp512 | 220         | 746              | 1087           |
-| Qwen3.8-27B UD-Q4_K_M tg64  | 13.8        | 23.1             | 29.9           |
+| model                       | infr first run | infr `_cm816` | llama.cpp Vulkan | llama.cpp SYCL |
+| --------------------------- | -------------- | ------------- | ---------------- | -------------- |
+| Qwen3.5-4B Q4_K_M pp512     | 1571           | 2406          | 3165             | 7031           |
+| Qwen3.5-4B Q4_K_M tg128     | 62.6           | —             | 111.2            | 148.5          |
+| Qwen3.8-27B UD-Q4_K_M pp512 | 220            | 376           | 746              | 1087           |
+| Qwen3.8-27B UD-Q4_K_M tg64  | 13.8           | —             | 23.1             | 29.9           |
 
-llama.cpp at `0f236bc21`. infr's 27B prefill armed the submit splitter
-(`split/185`). That is a symptom of the slow forward, not a cause: the
-splitter's cap is measured from forward time.
+llama.cpp at `0f236bc21`. "infr first run" is `f568ff7`; the `_cm816` column is
+plan slice 2 (decode is not touched by it). `INFR_NO_COOPMAT=1` still gives the
+first-run prefill numbers, which is how the A/B was taken. infr's 27B prefill
+arms the submit splitter (`split/185`, `split/244`). That is a symptom of the
+slow forward, not a cause: the splitter's cap is measured from forward time.
 
 ## Test suite (2026-11-09)
 
-284 pass, 17 fail. None of the 17 is a production-path failure:
+The first run: 284 pass, 17 fail. None of the 17 was a production-path failure,
+and all 17 are fixed (plan slice 1); the suite now passes on the B70. What they
+were:
 
 - **12 coopmat tests run a 16x16x16 kernel the device does not enumerate**
   (`coopmat_gemm_tiled_matches_cpu`, `warp_gemm_matches_cpu`, the
@@ -68,7 +75,7 @@ splitter's cap is measured from forward time.
 
 ## Where the time goes
 
-### Prefill: cooperative matrix is dark
+### Prefill: cooperative matrix was dark
 
 ANV on Xe2 enumerates exactly these coopmat configs (`INFR_DEBUG_COOPMAT=1`):
 
@@ -91,9 +98,35 @@ reaches ~16 TOPS. llama.cpp builds its coopmat shaders with the tile as
 specialization constants (`TM/TN/TK` from the enumeration), so it runs XMX at
 8x16x16 here.
 
-`native_gemm_warp.comp` already derives everything from separate `CM_M` and
-`CM_N`, so an `8x16` build is a contained change: new build entries, a third
-tile in `select_coopmat_shape`, and the adapter routing.
+**Landed (plan slice 2):** `select_coopmat_shape` takes 8x16x16 for f16
+(`COOPMAT_TILE_8X16`, `caps.f16_coopmat_8x16()`), and `native_gemm_warp` has
+`_cm816` builds for Q4_K, Q5_K, Q6_K, Q8_0, Q2_K, Q3_K, IQ4_XS and IQ4_NL. They
+ride the adapter's existing `cm8_ok` XMX tier, and `gemm::native_gemm_warp_xmx`
+owns their tiles. Other formats stay on `nc_mmq`. f16 activations make these
+GEMMs closer to the host oracle than the int8 tier: ~3e-4 relative against
+~3.5e-3, from `vulkan_linear_all_weight_quants_gemm_tier_match_the_host_oracle`.
+Greedy output on Qwen3.5-4B is identical with and without the tier. The banner
+now prints `f16cm:8x16`.
+
+The tile is the part that mattered. Reusing `_cm8`'s geometry (BM=32 x BN=128,
+8 warps of 16 lanes) made prefill **slower** than dp4a. Larger tiles at 8 warps
+were slower still: more fragments per warp spill Xe2's registers. What works is
+llama.cpp's shape: many small warps. Q4_K, m=512, Qwen3.5-4B, ms per GEMM:
+
+| tile                                        | 2560x18432 | 9216x2560 |
+| ------------------------------------------- | ---------- | --------- |
+| `nc_mmq` (dp4a, the previous default)       | 3.1        | 1.6       |
+| 32x128, 8 warps x 16 lanes (`_cm8` shape)   | 4.3        | 2.8       |
+| 64x256, 8 warps x 32 lanes                  | 7.5        | 3.6       |
+| 128x256, 8 warps x 32 lanes                 | 20.1       | 7.7       |
+| 128x128, 32 warps x 16 lanes (512 threads)  | 2.1        | 1.6       |
+| 128x256, 64 warps x 16 lanes (1024 threads) | **1.8**    | **1.4**   |
+
+The last row is `_cm816`, and `_cm816_n128` is the 512-thread row for n%256 != 0.
+Both use the shader's new `XE_WM`/`XE_WN` per-warp overrides and a `ROW_GUARD`,
+because C is padded to 64 rows, not 128. Still open: the remaining 1.3x / 2x to
+llama.cpp. Candidates are an f16-A (`A_GLOBAL`) variant to drop the As stage, the
+attention and DeltaNet prefill kernels, and the formats without a build.
 
 ### Decode: three ops are the whole gap
 
@@ -190,10 +223,11 @@ This is the shape a pure-Rust native Intel backend would take (B102).
 
 Each slice is measured against the numbers above on `Vulkan1`.
 
-1. Detection and tests: the B70/B65 core counts; the 17 test-side failures
-   (skip coopmat tests without the 16x16x16 shape, skip missing sg16 `mmv_mw`
-   builds, compare devices by UUID).
-2. Prefill: an 8x16x16 coopmat tile for `native_gemm_warp`, selected when the
-   device enumerates it.
+1. **Done.** Detection and tests: the B70/B65 core counts and the 17 test-side
+   failures. Coopmat tests skip without the 16x16x16 shape, the Q5_K sg16
+   `mmv_mw` arms are wired, two host-reference metrics now tolerate
+   cancellation zeros, and the two-device test no longer compares names.
+2. **Done.** Prefill: the 8x16x16 `_cm816` XMX tile (above). +53% pp512 on
+   Qwen3.5-4B, +71% on Qwen3.8-27B.
 3. Decode: subgroup-16 DeltaNet with the reduction spread across lanes; then
    the lm_head shape; then attn_qkv onto the int8 tier.

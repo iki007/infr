@@ -10,7 +10,7 @@
 //!
 //! Nothing here reads the environment, the config, or a `VkPhysicalDevice`.
 
-use infr_core::{COOPMAT_TILE_16, COOPMAT_TILE_8};
+use infr_core::{COOPMAT_TILE_16, COOPMAT_TILE_8, COOPMAT_TILE_8X16};
 
 use ash::vk;
 
@@ -23,25 +23,33 @@ use ash::vk;
 ///    device that enumerates it (RADV/RDNA3+, NVIDIA, and reportedly some Battlemage drivers)
 ///    always gets it, regardless of `allow_8x8x16` — the env knob must never move a device off the
 ///    proven kernel set.
-/// 2. [`COOPMAT_TILE_8`] (8x8x16, Intel Arc/ANV XMX) — only when `allow_8x8x16` (the
+/// 2. [`COOPMAT_TILE_8X16`] (8x16x16, Intel Xe2/ANV XMX — the only f16 shape Battlemage
+///    enumerates) — when `allow_8x16x16`, which the caller sets for f16 only: just
+///    `native_gemm_warp`'s `_cm816` builds exist at this shape.
+/// 3. [`COOPMAT_TILE_8`] (8x8x16, Intel Arc/ANV XMX) — only when `allow_8x8x16` (the
 ///    `INFR_CM_8X8=1` opt-in; only `native_gemm_warp`'s `_cm8` builds exist at this shape, and
 ///    Alchemist coopmat is a llama.cpp-documented regression, so it stays default-OFF).
-/// 3. `None` — no shape any kernel here is built for; the non-coopmat tiers take over.
+/// 4. `None` — no shape any kernel here is built for; the non-coopmat tiers take over.
 ///
-/// Pure function of the enumerated list + the opt-in flag (no env reads) so the selection is
+/// Pure function of the enumerated list + the opt-in flags (no env reads) so the selection is
 /// unit-testable with synthetic property lists. The caller filters the list through
 /// [`coopmat_shape_trusted`] FIRST, so a shape this driver may not be believed about never reaches
 /// the preference order.
 pub(crate) fn select_coopmat_shape(
     shapes: impl IntoIterator<Item = (u32, u32, u32)>,
     allow_8x8x16: bool,
+    allow_8x16x16: bool,
 ) -> Option<(u32, u32, u32)> {
-    let mut has_8x8x16 = false;
+    let (mut has_8x8x16, mut has_8x16x16) = (false, false);
     for s in shapes {
         if s == COOPMAT_TILE_16 {
             return Some(COOPMAT_TILE_16);
         }
         has_8x8x16 |= s == COOPMAT_TILE_8;
+        has_8x16x16 |= s == COOPMAT_TILE_8X16;
+    }
+    if allow_8x16x16 && has_8x16x16 {
+        return Some(COOPMAT_TILE_8X16);
     }
     (allow_8x8x16 && has_8x8x16).then_some(COOPMAT_TILE_8)
 }
@@ -657,22 +665,30 @@ mod tests {
     fn coopmat_shape_selection() {
         let t16 = COOPMAT_TILE_16;
         let t8 = COOPMAT_TILE_8;
+        let t816 = COOPMAT_TILE_8X16;
         // RADV/RDNA3 + NVIDIA: 16x16x16 always wins, opt-in or not.
         let radv = [t16];
-        assert_eq!(select_coopmat_shape(radv, false), Some(t16));
-        assert_eq!(select_coopmat_shape(radv, true), Some(t16));
-        // A device listing both keeps the production shape even with the knob set.
-        let both = [t8, t16];
-        assert_eq!(select_coopmat_shape(both, false), Some(t16));
-        assert_eq!(select_coopmat_shape(both, true), Some(t16));
+        assert_eq!(select_coopmat_shape(radv, false, true), Some(t16));
+        assert_eq!(select_coopmat_shape(radv, true, true), Some(t16));
+        // A device listing several keeps the production shape even with every knob set.
+        let all = [t8, t816, t16];
+        assert_eq!(select_coopmat_shape(all, false, false), Some(t16));
+        assert_eq!(select_coopmat_shape(all, true, true), Some(t16));
         // Intel Arc (ANV): 8x8x16 only — dark unless the opt-in asks for it.
         let anv = [t8];
-        assert_eq!(select_coopmat_shape(anv, false), None);
-        assert_eq!(select_coopmat_shape(anv, true), Some(t8));
+        assert_eq!(select_coopmat_shape(anv, false, true), None);
+        assert_eq!(select_coopmat_shape(anv, true, true), Some(t8));
+        // Intel Xe2 (ANV, Arc Pro B70): 8x16x16 only, taken whenever the caller allows it
+        // (f16), and never for the component types that pass `false` (bf16/f8/i8).
+        let xe2 = [t816];
+        assert_eq!(select_coopmat_shape(xe2, false, true), Some(t816));
+        assert_eq!(select_coopmat_shape(xe2, true, false), None);
+        // 8x16x16 is preferred over the 8x8x16 opt-in when both are listed.
+        assert_eq!(select_coopmat_shape([t8, t816], true, true), Some(t816));
         // Nothing enumerated, and a shape no kernel exists for.
-        assert_eq!(select_coopmat_shape([], false), None);
-        assert_eq!(select_coopmat_shape([], true), None);
-        assert_eq!(select_coopmat_shape([(32, 32, 16)], true), None);
+        assert_eq!(select_coopmat_shape([], false, true), None);
+        assert_eq!(select_coopmat_shape([], true, true), None);
+        assert_eq!(select_coopmat_shape([(32, 32, 16)], true, true), None);
     }
 
     // ── architecture bucketing ──────────────────────────────────────────────────────────────────
@@ -1007,16 +1023,16 @@ mod tests {
                 .into_iter()
                 .filter(move |&s| coopmat_shape_trusted(t, s))
         };
-        assert_eq!(select_coopmat_shape(keep(refused), true), None);
-        assert_eq!(select_coopmat_shape(keep(refused), false), None);
+        assert_eq!(select_coopmat_shape(keep(refused), true, true), None);
+        assert_eq!(select_coopmat_shape(keep(refused), false, true), None);
         let tile8 = CoopmatTrust::Tile8Only("test");
         assert_eq!(
-            select_coopmat_shape(keep(tile8), true),
+            select_coopmat_shape(keep(tile8), true, true),
             Some(COOPMAT_TILE_8)
         );
-        assert_eq!(select_coopmat_shape(keep(tile8), false), None);
+        assert_eq!(select_coopmat_shape(keep(tile8), false, true), None);
         assert_eq!(
-            select_coopmat_shape(keep(CoopmatTrust::Enumerated), false),
+            select_coopmat_shape(keep(CoopmatTrust::Enumerated), false, true),
             Some(COOPMAT_TILE_16)
         );
     }
