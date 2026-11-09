@@ -349,6 +349,18 @@ const uint KV_IQ4NL_W[4] = uint[](0xBFAD9881u, 0xF6EADDCFu, 0x26190D01u, 0x71594
 int kv_iq4nl(uint idx) {
     return bitfieldExtract(int(KV_IQ4NL_W[idx >> 2u]), int((idx & 3u) << 3u), 8);
 }
+// Byte-pair LUT in shared memory: KVP[b] = kv[b & 15] | kv[b >> 4] << 8 (both as int8 bytes), so
+// each `qs` byte costs ONE shared load instead of two dynamic codebook lookups. Same values, so
+// bit-identical. Filled once per workgroup by `iq4_lut_init` at the top of main(). Measured on an
+// Arc Pro B70 (docs/intel-b70.md); Strata's SYCL port found the same table its best IQ4_XS decode
+// on these cards.
+shared uint KVP[256];
+void iq4_lut_init(uint t) {
+    for (uint i = t; i < 256u; i += 64u) {
+        KVP[i] = (uint(kv_iq4nl(i & 15u)) & 0xFFu) | ((uint(kv_iq4nl(i >> 4u)) & 0xFFu) << 8u);
+    }
+    barrier();
+}
 void wdec(uint gelem, out uint qp[8], out float f0, out float f1) {
     uint p = gelem % 256u;
     uint bd = (gelem / 256u) * 136u;
@@ -365,9 +377,9 @@ void wdec(uint gelem, out uint qp[8], out float f0, out float f1) {
         uint q = qv[j];                  // qs[4j..4j+3]
         uint wl = 0u; uint wh = 0u;
         for (uint b = 0u; b < 4u; b++) {
-            uint qbyte = (q >> (8u * b)) & 0xFFu;
-            wl |= (uint(kv_iq4nl(qbyte & 0xFu)) & 0xFFu) << (8u * b);
-            wh |= (uint(kv_iq4nl(qbyte >> 4u)) & 0xFFu) << (8u * b);
+            uint pr = KVP[(q >> (8u * b)) & 0xFFu];
+            wl |= (pr & 0xFFu) << (8u * b);
+            wh |= (pr >> 8u) << (8u * b);
         }
         qp[j] = wl;
         qp[j + 4u] = wh;
@@ -518,6 +530,14 @@ const uint KV_IQ4NL_W[4] = uint[](0xBFAD9881u, 0xF6EADDCFu, 0x26190D01u, 0x71594
 int kv_iq4nl(uint idx) {
     return bitfieldExtract(int(KV_IQ4NL_W[idx >> 2u]), int((idx & 3u) << 3u), 8);
 }
+// The same shared byte-pair LUT as FMT_IQ4XS (see there): one shared load per `qs` byte.
+shared uint KVP[256];
+void iq4_lut_init(uint t) {
+    for (uint i = t; i < 256u; i += 64u) {
+        KVP[i] = (uint(kv_iq4nl(i & 15u)) & 0xFFu) | ((uint(kv_iq4nl(i >> 4u)) & 0xFFu) << 8u);
+    }
+    barrier();
+}
 void wdec(uint gelem, out uint qp[8], out float f0, out float f1) {
     uint bd = (gelem / 32u) * 18u;
     f0 = f16tof32(ru16(bd));
@@ -527,9 +547,9 @@ void wdec(uint gelem, out uint qp[8], out float f0, out float f1) {
         uint q = qv[j];
         uint wl = 0u; uint wh = 0u;
         for (uint b = 0u; b < 4u; b++) {
-            uint qbyte = (q >> (8u * b)) & 0xFFu;
-            wl |= (uint(kv_iq4nl(qbyte & 0xFu)) & 0xFFu) << (8u * b);
-            wh |= (uint(kv_iq4nl(qbyte >> 4u)) & 0xFFu) << (8u * b);
+            uint pr = KVP[(q >> (8u * b)) & 0xFFu];
+            wl |= (pr & 0xFFu) << (8u * b);
+            wh |= (pr >> 8u) << (8u * b);
         }
         qp[j] = wl;
         qp[j + 4u] = wh;
@@ -606,6 +626,9 @@ void main() {
     uint o0 = (gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x) * 4u;
     uint t = gl_LocalInvocationID.x;
     w_addr = arena_base(pc.arena_lo, pc.arena_hi); // resident slot base byte address; NO slot multiply
+#if defined(FMT_IQ4XS) || defined(FMT_IQ4NL)
+    iq4_lut_init(t);
+#endif
     uint ot = t >> 4u;               // which of the 4 outputs this lane serves
     uint sl = t & 15u;               // K sub-lane within the output's 16
     uint nsub = pc.in_f / 32u;
@@ -717,6 +740,9 @@ void main() {
     if (o0 >= pc.out_f) { return; }
     uint t = gl_LocalInvocationID.x;
     w_addr = arena_base(pc.arena_lo, pc.arena_hi); // resident slot base byte address; NO slot multiply
+#if defined(FMT_IQ4XS) || defined(FMT_IQ4NL)
+    iq4_lut_init(t);
+#endif
     uint nsub = pc.in_f / 32u;
     uint in_fq = pc.in_f >> 4u;      // activation row stride in packed uvec4s
     uint wb0 = pc.w_base + o0 * pc.in_f;

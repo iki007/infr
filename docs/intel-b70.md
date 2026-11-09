@@ -14,7 +14,7 @@ Vulkan backend on prefill and ~1.7x behind on decode**. The causes are measured
 slices 1–3 have landed. The GPU suite is clean. Prefill runs on XMX through an
 8x16x16 coopmat tile (+53% / +71% pp512), still 1.3x / 2x behind llama.cpp's
 Vulkan prefill. Decode on Qwen3.5-4B is now **ahead of llama.cpp's Vulkan
-backend** (120 vs 111 t/s). On Qwen3.8-27B it is 18.8 vs 23.1 t/s. A native Intel
+backend** (120 vs 111 t/s), and so is Qwen3.8-27B (25.3 vs 23.1 t/s). A native Intel
 backend (Level Zero) is deferred until the Vulkan work is done (`backlog.md`
 B102).
 
@@ -44,7 +44,7 @@ INFR_DEV=Vulkan1 cargo test --release -p infr-vulkan --no-fail-fast -- --include
 | Qwen3.5-4B Q4_K_M pp512     | 1571           | 2380      | 3165             | 7031           |
 | Qwen3.5-4B Q4_K_M tg128     | 62.6           | **120.0** | 111.2            | 148.5          |
 | Qwen3.8-27B UD-Q4_K_M pp512 | 220            | 376       | 746              | 1087           |
-| Qwen3.8-27B UD-Q4_K_M tg128 | 13.8           | 18.8      | 23.1             | 29.9           |
+| Qwen3.8-27B UD-Q4_K_M tg128 | 13.8           | **25.3**  | 23.1             | 29.9           |
 
 llama.cpp at `0f236bc21`; its 27B decode row is tg64. "infr first run" is
 `f568ff7`. "infr now" is after plan slice 3. Prefill moved in slice 2,
@@ -173,11 +173,15 @@ llama.cpp's 10.1 ms.
   has Q5_K and IQ4_XS (IQ4_XS gained the `_res` mrow twins it lacked). 27B decode
   15.7 → 18.8, 4B 115.7 → 120.0.
 
-What is left on the 27B (profile after slice 3, ms per token of ~58): the int8
-mrow GEMVs at its larger shapes run ~270–290 GB/s (5120x17408 181 µs,
-17408x5120 175 µs), where Strata measured llama.cpp at 510–537 GB/s on these
-cards. That is the next decode lever, and it is kernel work in
-`native_mmv_mrow.comp`.
+- **IQ4_XS / IQ4_NL codebook — fixed (slice 4).** The mrow decode did two
+  dynamic codebook lookups per `qs` byte. A 256-entry byte-pair table in shared
+  memory (`KVP`, one load per byte; bit-identical) took the cold-weight GEMV,
+  in GB/s: IQ4_XS 5120x17408 230 → 290, 17408x5120 187 → 316; IQ4_NL 256 → 350
+  and 209 → 307. 27B decode 18.8 → 25.3.
+
+Where decode stands against the hardware: Qwen3.8-27B reads ~15.3 GB of weights
+per token, so 25.3 t/s is ~390 GB/s effective. The practical streaming ceiling
+on this card is ~560 GB/s (Strata), about 36 t/s single-stream.
 
 Smaller items: the activation quantizer is 144 dispatches per token at ~7 µs
 each (B105). The `argmax_part` row (174 µs) is probably the profiler charging
@@ -252,5 +256,6 @@ Each slice is measured against the numbers above on `Vulkan1`.
 3. **Done.** Decode: the DeltaNet rewrite, device-local decode logits, and the
    Xe2 int8 decode set. Qwen3.5-4B tg128 62.6 → 120.0, past llama.cpp's 111.2;
    Qwen3.8-27B 13.8 → 18.8.
-4. Next: the int8 mrow GEMV at large shapes (27B decode), then the remaining
-   prefill gap (an f16-A `_cm816` variant, attention and DeltaNet prefill).
+4. **Done.** The IQ4 codebook byte-pair LUT: Qwen3.8-27B tg128 18.8 → 25.3.
+5. Next: prefill (an f16-A `_cm816` variant, attention and DeltaNet prefill),
+   and speculative decoding for the bandwidth-bound decode.
