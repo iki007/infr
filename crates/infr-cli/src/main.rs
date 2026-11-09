@@ -2139,10 +2139,12 @@ fn cmd_bench(
     // combined ingest+reply shape the MTP arm doesn't have an equivalent for). Models without a
     // head take the exact path above unchanged — `mtp` stays `None`, `print_bench_avg_mtp` falls
     // straight through to the pre-existing `print_bench_avg` line.
-    let mtp = if infr_llama::mtp::mtp_enabled()
+    // Opt-in like chat (`should_use_mtp`: `INFR_MTP=1` + an MTP head): the arm builds its own
+    // trunk on a second backend, so running it unasked on a large model would upload the weights
+    // twice (a 27B does not fit a 32 GB card that way).
+    let mtp = if infr_llama::mtp::should_use_mtp(model.config(), model.engine_cfg())
         && pg.is_none()
         && n_gen > 0
-        && model.config().n_layer_nextn > 0
     {
         Some(bench_mtp_tg(&model, n_prompt, depth, n_gen, reps, cfg)?)
     } else {
@@ -2511,10 +2513,9 @@ fn cmd_bench_metal(
         // gets its self-speculative Metal decode (accept rate + phase split) measured alongside the
         // baseline tg above. `bench_mtp_tg` reads the resolved backend (Metal here, via INFR_DEV) to
         // route onto the Metal timed driver. Models without a head keep `mtp = None` → byte-identical.
-        let mtp = if infr_llama::mtp::mtp_enabled()
+        let mtp = if infr_llama::mtp::should_use_mtp(model.config(), model.engine_cfg())
             && pg.is_none()
             && n_gen > 0
-            && model.config().n_layer_nextn > 0
         {
             Some(bench_mtp_tg(&model, n_prompt, depth, n_gen, reps, cfg)?)
         } else {
@@ -2973,10 +2974,10 @@ fn cmd_compare_sweep(
         // run + one infr mtp run; every other model prints a blank row instantly, keeping the
         // sweep's runtime dominated by the 4 metrics above, not this column).
         let metric_label = "mtp128".to_string();
-        // MTP is PARKED (`infr_llama::mtp::mtp_enabled`'s doc) — the column stays in the table shape
-        // (a blank row, same as any model without a head) so the sweep archive's columns keep lining
-        // up with older archives, but neither engine is measured.
-        if infr_llama::mtp::mtp_enabled() && mb.has_mtp_head() {
+        // MTP is OPT-IN (`INFR_MTP=1`; see `infr_llama::mtp::mtp_enabled`'s doc) — without it the
+        // column stays in the table shape (a blank row, same as any model without a head) so the
+        // sweep archive's columns keep lining up with older archives, and neither engine is measured.
+        if infr_llama::mtp::mtp_enabled() && cfg.spec.mtp && mb.has_mtp_head() {
             let iv = mb.infr_mtp(&["-p", "0", "-n", "128"]);
             let lv = mb.llama_cli_mtp(128);
             print_sweep_cell(

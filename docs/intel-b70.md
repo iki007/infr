@@ -257,5 +257,39 @@ Each slice is measured against the numbers above on `Vulkan1`.
    Xe2 int8 decode set. Qwen3.5-4B tg128 62.6 → 120.0, past llama.cpp's 111.2;
    Qwen3.8-27B 13.8 → 18.8.
 4. **Done.** The IQ4 codebook byte-pair LUT: Qwen3.8-27B tg128 18.8 → 25.3.
-5. Next: prefill (an f16-A `_cm816` variant, attention and DeltaNet prefill),
-   and speculative decoding for the bandwidth-bound decode.
+5. **Done (opt-in).** MTP speculative decode, below. Qwen3.8-27B 25.3 → 38.0
+   t/s under `INFR_MTP=1`.
+6. Next: the MTP cycle cost (an XMX small-m verify GEMV, the per-cycle host
+   round trips, the draft head), then prefill.
+
+## MTP (speculative decode, `INFR_MTP=1`)
+
+Re-enabled as an opt-in after four fixes, each measured on Qwen3.8-27B
+UD-Q4_K_M (its GGUF ships the `nextn` head), greedy, 200 tokens:
+
+| step                                                                                                                   | t/s                                |
+| ---------------------------------------------------------------------------------------------------------------------- | ---------------------------------- |
+| the parked path, kill switch flipped                                                                                   | OOM (trunk weights uploaded twice) |
+| warmup no longer builds the plain session                                                                              | 17.1                               |
+| `MROW_BANDS_XMX`: verify m=5..16 at wide n on the mrow GEMV, not the 128-row `_cm816` tile (1.3 ms → ~0.2 ms per GEMM) | 32.2                               |
+| device-local verify logits on the GPU accept path                                                                      | 33.3                               |
+| persistent trunk session across turns (was a ~15 GB re-upload per call; TTFT 12.4 s → 0.4 s)                           | 38.0                               |
+
+Verify now also runs decode's own `deltanet` kernel (m <= 16), which made the
+MTP greedy text match plain greedy on the test prompt at the same speed.
+Acceptance is α = 0.66 at 6 drafts.
+
+Against llama.cpp `0f236bc21` with `--spec-type draft-mtp` on the same card
+(llama-server, the same prompt, greedy):
+
+| engine           | plain | MTP n_max=3 | MTP n_max=6 |
+| ---------------- | ----- | ----------- | ----------- |
+| infr Vulkan      | 25.3  | —           | 38.0        |
+| llama.cpp Vulkan | 23.0  | 44.2        | 41.9        |
+| llama.cpp SYCL   | 29.5  | 72          | **80**      |
+
+Same acceptance (llama.cpp 159/233 = 0.68), so the gap is cycle cost. An m=7
+infr forward costs 1.73x an m=1 forward (`pp7` 72.8 ms vs `pp1` 42 ms) because
+the int8 mrow GEMV's dp4a work scales with m on Xe2. Each draft step also
+re-reads the 1 GB vocab head (2.2 ms), and a cycle spends ~20 ms on host round
+trips: a re-recorded static verify graph and a staged hidden-row download.

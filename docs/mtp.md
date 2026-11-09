@@ -8,9 +8,12 @@ the `nextn.*` head tensors are baked into the MAIN GGUF (no sibling file for
 qwen35; the `--mtp`/`mtp-*.gguf` sibling download flow is for other arch
 families). llama.cpp reports ~1.5-2× generation speedup.
 
-> **Status: PARKED — built, then disabled.** `mtp_enabled()` in
-> `crates/infr-llama/src/mtp/mod.rs` returns `false`, so `INFR_MTP=1` is ignored
-> with a warning; why is in [MTP is parked](#mtp-is-parked-2026-07-31). The
+> **Status: OPT-IN (re-enabled 2026-11-10).** `INFR_MTP=1` turns it on for a
+> GGUF that ships an MTP head; the default decode path is unchanged. Greedy
+> output may differ from plain greedy on a near-tie, which is why it stays
+> opt-in (history: [MTP is parked](#mtp-is-parked-2026-07-31)). On an Arc Pro
+> B70, Qwen3.8-27B UD-Q4_K_M: 25.3 t/s plain, **38.0 t/s with MTP**, and the
+> 200-token greedy test text matched plain greedy (`docs/intel-b70.md` § MTP). The
 > single-head path itself was wired for CPU + Vulkan
 > (`crates/infr-llama/src/mtp/`, `chat/{cpu,vulkan}.rs`), with temp-aware
 > stochastic spec-accept, token-identical to the target-only greedy path. Tests:

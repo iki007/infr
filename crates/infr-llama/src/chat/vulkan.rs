@@ -29,6 +29,10 @@ pub struct DenseSeamChat {
     /// turn on the SAME VkDevice/allocator/pipeline-cache instead of constructing a new one each
     /// time (previously: two full Vulkan backends for a single-turn `INFR_MTP=1` run).
     mtp_vk: Option<infr_vulkan::VulkanBackend>,
+    /// MTP mode's trunk session (uploaded trunk weights + KV) on `mtp_vk`, kept across turns so a
+    /// chat or `serve` turn does not re-upload the whole trunk (~15 GB / ~12 s on Qwen3.8-27B);
+    /// the driver resets its token cache each call. MTP mode never builds the plain `session`.
+    mtp_trunk: Option<crate::seam::SeamKv>,
     /// Physical device this chat's session pins: `Some(idx)` = `VulkanN` (the multi-device path,
     /// `new_on`), `None` = the default device (`new`, byte-identical to before). Threaded into
     /// [`ensure_session`](Self::ensure_session) and [`ensure_mtp_backend`](Self::ensure_mtp_backend)
@@ -45,6 +49,7 @@ impl DenseSeamChat {
             mtp_head: None,
             mtp_checked: false,
             mtp_vk: None,
+            mtp_trunk: None,
             dev: None,
         }
     }
@@ -59,6 +64,7 @@ impl DenseSeamChat {
             mtp_head: None,
             mtp_checked: false,
             mtp_vk: None,
+            mtp_trunk: None,
             dev: Some(idx),
         }
     }
@@ -138,6 +144,14 @@ impl ChatModel for DenseSeamChat {
     }
 
     fn warmup(&mut self) -> Result<()> {
+        if self.wants_mtp()? {
+            // MTP mode runs on its own backend and trunk session; warming the plain session too
+            // would upload the trunk weights a second time (on a 32 GB card that does not fit a
+            // 27B). Instead one throwaway MTP turn uploads the trunk and compiles the pipelines.
+            return crate::with_profiling_suppressed(|| {
+                self.generate("hi", 1, None, &mut |_| {}).map(|_| ())
+            });
+        }
         // The shared session warmup (throwaway generate + reset so the first real prompt prefills
         // clean slots from row 0), wrapped in the INFR_PROF_OPS suppression the Vulkan recorders need.
         crate::with_profiling_suppressed(|| self.warmup_session())
@@ -158,6 +172,7 @@ impl ChatModel for DenseSeamChat {
                 vk,
                 &self.model,
                 head,
+                &mut self.mtp_trunk,
                 prompt,
                 max_new,
                 |p| on_piece(p),

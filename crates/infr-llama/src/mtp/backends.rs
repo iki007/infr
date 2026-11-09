@@ -99,6 +99,10 @@ pub fn generate_mtp_spec_vulkan(
 /// plus every later chat turn) should call [`generate_mtp_spec_vulkan_timed_on`] instead and hold
 /// the backend itself — otherwise every call re-pays a full VkDevice + allocator + pipeline-cache
 /// init (issue: an `INFR_MTP=1` chat run used to construct TWO full Vulkan backends — one for
+/// Floor on a persistent MTP trunk session's KV capacity (see
+/// [`generate_mtp_spec_vulkan_timed_on`]): a turn that outgrows it re-uploads the whole trunk.
+pub const MTP_TRUNK_MIN_CTX: usize = 16384;
+
 /// `warmup()`, one for the first real turn — for exactly this reason).
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub fn generate_mtp_spec_vulkan_timed(
@@ -110,26 +114,35 @@ pub fn generate_mtp_spec_vulkan_timed(
 ) -> Result<(crate::GenStats, MtpTiming)> {
     let vk = infr_vulkan::VulkanBackend::new_with(model.cfg().clone())
         .map_err(|e| anyhow!("vulkan init: {e}"))?;
-    generate_mtp_spec_vulkan_timed_on(&vk, model, head, prompt, max_new, on_piece)
+    generate_mtp_spec_vulkan_timed_on(&vk, model, head, &mut None, prompt, max_new, on_piece)
 }
 
-/// [`generate_mtp_spec_vulkan_timed`] over a CALLER-supplied Vulkan backend, so a persistent
-/// caller can share ONE device (+ allocator + pipeline cache) across every MTP `generate()` call
-/// instead of constructing a fresh one per call. Each call still rebuilds a fresh trunk+head
-/// SESSION (KV cache state) by design — see this module's doc on "no cross-turn KV reuse" — that
-/// is an ordinary-sized allocation, not a VkDevice re-init, so sharing the backend loses nothing
-/// while dropping the redundant device construction.
+/// [`generate_mtp_spec_vulkan_timed`] over a CALLER-supplied Vulkan backend AND trunk session, so
+/// a persistent caller shares ONE device (+ allocator + pipeline cache) and ONE uploaded copy of
+/// the trunk weights across every MTP `generate()` call. `trunk` is reused when its KV capacity
+/// covers this call (only its token cache is reset — no cross-turn KV reuse), else rebuilt; a
+/// rebuild re-uploads every trunk weight, which on Qwen3.8-27B is ~15 GB and ~12 s, so it is sized
+/// to at least [`MTP_TRUNK_MIN_CTX`] tokens to make that rare. The draft head's own session stays
+/// per call (one layer; small).
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub fn generate_mtp_spec_vulkan_timed_on(
+pub(crate) fn generate_mtp_spec_vulkan_timed_on(
     vk: &infr_vulkan::VulkanBackend,
     model: &crate::SeamModel,
     head: &MtpHeadWeights,
+    trunk: &mut Option<crate::seam::SeamKv>,
     prompt: &str,
     max_new: usize,
     on_piece: impl FnMut(&str),
 ) -> Result<(crate::GenStats, MtpTiming)> {
     let cfg = model.config();
-    let max_ctx = model.encode(prompt)?.len() + max_new + DEFAULT_N_MAX + 8;
+    let need = model.encode(prompt)?.len() + max_new + DEFAULT_N_MAX + 8;
+    if trunk.as_ref().is_some_and(|t| t.max_ctx() < need) {
+        *trunk = None;
+    }
+    let max_ctx = match trunk.as_ref() {
+        Some(t) => t.max_ctx(),
+        None => need.max(MTP_TRUNK_MIN_CTX),
+    };
     let bind: &BindWeightFn = &|_name, tb, dt, _n| {
         let bytes = tb.materialize();
         let padded = infr_vulkan::linear::pad_to_u32_align(&bytes);
@@ -154,6 +167,7 @@ pub fn generate_mtp_spec_vulkan_timed_on(
         bind,
         model,
         &mut head_sess,
+        trunk,
         max_ctx,
         prompt,
         max_new,
@@ -198,6 +212,7 @@ pub fn generate_mtp_spec_metal_timed(
         bind,
         model,
         &mut head_sess,
+        &mut None,
         max_ctx,
         prompt,
         max_new,
@@ -244,6 +259,7 @@ pub fn generate_mtp_spec_cpu_timed(
         bind,
         model,
         &mut head_sess,
+        &mut None,
         max_ctx,
         prompt,
         max_new,

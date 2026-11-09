@@ -4970,9 +4970,6 @@ pub(crate) fn generate_dense_backend(
         let vf_pos_buf = be
             .alloc(m * 4, BufferUsage::Staging)
             .map_err(|e| anyhow!("{e}"))?;
-        let vf_logits_buf = be
-            .alloc(m * c.vocab * 4, BufferUsage::Staging)
-            .map_err(|e| anyhow!("{e}"))?;
         be.upload(vf_hidden_buf.as_ref(), bytemuck::cast_slice(&vf_hidden))
             .map_err(|e| anyhow!("{e}"))?;
         be.upload(vf_pos_buf.as_ref(), bytemuck::cast_slice(&vf_positions))
@@ -4999,6 +4996,20 @@ pub(crate) fn generate_dense_backend(
             && caps.argmax_rows
             && ec.spec.gpu_argmax
             && ec.spec.gpu_mtp_accept;
+        // The m×vocab verify logits: device-local when only the per-row argmax ids come back (the
+        // GPU accept path never downloads them), host-visible only when they are downloaded. On an
+        // Arc Pro B70 the LM head's scattered stores into host memory cost ~5.5 ms per ROW (see
+        // `SeamKv::logits_dev`), i.e. most of an MTP verify.
+        let vf_logits_buf = be
+            .alloc(
+                m * c.vocab * 4,
+                if gpu_verify_ids {
+                    BufferUsage::Activations
+                } else {
+                    BufferUsage::Staging
+                },
+            )
+            .map_err(|e| anyhow!("{e}"))?;
         let t_vbuild0 = std::time::Instant::now();
         let (vg, vh) = build(
             m,

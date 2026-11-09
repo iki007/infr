@@ -410,6 +410,22 @@ const MROW_BANDS: [infr_core::tier::MultiRowBand; 2] = [
         out_f_max: usize::MAX,
     },
 ];
+/// [`MROW_BANDS`] for a device whose GEMM tier is the Intel Xe2 `_cm816` XMX tile
+/// (`caps.f16_coopmat_8x16()`): the same bands with NO wide-n cutoff. The cutoff exists because
+/// the 16x16 coopmat warptiles fill the device at wide n and beat the mrow there; the `_cm816`
+/// tile is 128 rows tall, so at m <= 16 it is mostly padding. Measured on an Arc Pro B70
+/// (Qwen3.8-27B MTP verify, 5120x17408): `_cm816` at m=7 1.3 ms per GEMM against the mrow's
+/// ~0.23 ms at the comparable 17408x5120 m=7.
+const MROW_BANDS_XMX: [infr_core::tier::MultiRowBand; 2] = [
+    infr_core::tier::MultiRowBand {
+        wide_out_f_max: usize::MAX,
+        ..MROW_BANDS[0]
+    },
+    infr_core::tier::MultiRowBand {
+        wide_out_f_max: usize::MAX,
+        ..MROW_BANDS[1]
+    },
+];
 /// Index of the m = 2..=8 band in [`MROW_BANDS`].
 const MROW_BAND: usize = 0;
 /// Index of the m = 9..=16 int8 band in [`MROW_BANDS`].
@@ -1371,7 +1387,12 @@ fn lower_op(
             // int8 tier (others keep the GEMM route — no dequant mrow above 8 rows).
             // The two bands' SHAPE arithmetic lives in `MROW_BANDS` (shared policy); the
             // capability half — kernel builds, dtype sets, caps, env hatches — stays here.
-            let mrow_tier = infr_core::tier::linear_tier(m, out_f, &MROW_BANDS);
+            let bands = if be_.caps().f16_coopmat_8x16() {
+                &MROW_BANDS_XMX
+            } else {
+                &MROW_BANDS
+            };
+            let mrow_tier = infr_core::tier::linear_tier(m, out_f, bands);
             let in_band = |b: usize| mrow_tier == infr_core::tier::LinearTier::MultiRow { band: b };
             let mrow16 = in_band(MROW16_BAND)
                 && mmv_gate
@@ -3634,7 +3655,15 @@ fn lower_op(
                 *head_k as usize,
                 *head_v as usize,
             );
-            let chunked = rows_ >= 2 && be_.cfg().kernels.vulkan.dn_chunk;
+            // An MTP verify batch (`graph.mtp_verify`, m <= 16) runs the SAME `deltanet` kernel as
+            // the m=1 decode it is checked against: that kernel is per-token identical for any
+            // `rows`, so verify reproduces decode's recurrence bit for bit, and on an Arc Pro B70
+            // the Qwen3.8-27B MTP greedy text matched plain greedy over 200 tokens (the
+            // chunked/seq-split path flipped a near-tie ~20 tokens in), at equal speed (38.0 vs
+            // 37.8 t/s). Ordinary multi-row prefill keeps the faster chunked/seq paths.
+            let chunked = rows_ >= 2
+                && !(graph.mtp_verify && rows_ <= 16)
+                && be_.cfg().kernels.vulkan.dn_chunk;
             // DEFAULT prefill path: the token-serial scan with the state column register-resident
             // (norm + gates + seq). The chunked delta rule was believed to win by doing ⌈rows/32⌉
             // state sweeps instead of `rows`, but counted out it does NOT save arithmetic (~420M vs

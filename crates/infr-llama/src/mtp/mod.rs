@@ -68,7 +68,9 @@ pub struct MtpHeadWeights {
     pub shared_head_norm: Option<MtpTensor>,
 }
 
-/// MASTER KILL-SWITCH for the whole MTP self-speculative decode path — currently **DISABLED**.
+/// MASTER KILL-SWITCH for the whole MTP self-speculative decode path — **ENABLED** again
+/// (2026-11-10) as an OPT-IN: [`should_use_mtp`] still requires `INFR_MTP=1` and an MTP head in the
+/// GGUF, so the default decode path is untouched. History below.
 ///
 /// Every MTP entry point (the three `chat/{cpu,metal,vulkan}.rs` `INFR_MTP=1` gates, `infr bench`'s
 /// `mtp` arm, `infr compare`'s `mtp128` column) routes through this. While it returns `false`:
@@ -88,11 +90,13 @@ pub struct MtpHeadWeights {
 /// prefill) and others. Rather than hold every other dtype's win hostage to a speculative-decode
 /// path that was already our slowest row (0.59-0.78x vs llama.cpp), MTP is parked.
 ///
-/// TO RE-ENABLE: return `true` here, then make `mtp_spec_matches_target_only_greedy` pass again.
-/// The real fix is an accuracy mitigation (e.g. re-verify in f32 when the top-2 logit margin is
-/// below a threshold), NOT faster kernels — see `infr_vulkan`'s `mmv_int8_decode_dtypes` doc.
+/// RE-ENABLED 2026-11-10, opt-in, by user decision: under `INFR_MTP=1` greedy output may differ
+/// from plain greedy on a near-tie (llama.cpp accepts the same). On Vulkan the verify batch now
+/// runs decode's own `deltanet` kernel, and on an Arc Pro B70 Qwen3.8-27B's MTP greedy text matched
+/// plain greedy over 200 tokens; `mtp_spec_matches_target_only_greedy` stays `#[ignore]`d because
+/// that is not guaranteed in general. Measured there: 25.3 t/s plain, 38.0 t/s with MTP.
 pub fn mtp_enabled() -> bool {
-    false
+    true
 }
 
 /// The SINGLE MTP opt-in decision the chat backends share (`chat::vulkan`/`chat::metal`/`chat::cpu`
@@ -2374,6 +2378,7 @@ fn generate_mtp_spec_core(
     bind: &BindWeightFn,
     model: &crate::SeamModel,
     head_sess: &mut MtpHeadSession,
+    trunk: &mut Option<crate::seam::SeamKv>,
     max_ctx: usize,
     prompt: &str,
     max_new: usize,
@@ -2423,7 +2428,13 @@ fn generate_mtp_spec_core(
     anyhow::ensure!(!prompt_tokens.is_empty(), "generate_mtp_spec: empty prompt");
     let p = prompt_tokens.len();
 
-    let mut trunk_state: Option<crate::seam::SeamKv> = None;
+    // The trunk session (weights + KV) is the CALLER's, so a persistent chat keeps its uploaded
+    // weights across turns; only the token cache is reset, which re-prefills from position 0 (the
+    // same reset the plain chat path does between turns). `None` = build it on first use.
+    if let Some(st) = trunk.as_mut() {
+        st.reset();
+    }
+    let trunk_state = trunk;
 
     // ── prime: one VERIFY over the whole prompt, then catch the head up over it ──────────────
     let t_prime = std::time::Instant::now();
@@ -2439,7 +2450,7 @@ fn generate_mtp_spec_core(
             ec,
             model.embd(),
             &prompt_tokens,
-            &mut trunk_state,
+            trunk_state,
             max_ctx,
         )?;
         (Vec::new(), logits0, h_rows0)
@@ -2452,7 +2463,7 @@ fn generate_mtp_spec_core(
             ec,
             model.embd(),
             &prompt_tokens,
-            &mut trunk_state,
+            trunk_state,
             max_ctx,
         )?;
         (ids0, Vec::new(), h_rows0)
@@ -2574,7 +2585,7 @@ fn generate_mtp_spec_core(
                 ec,
                 model.embd(),
                 &feed,
-                &mut trunk_state,
+                trunk_state,
                 max_ctx,
             )?;
             (Vec::new(), vlogits, h_rows)
@@ -2587,7 +2598,7 @@ fn generate_mtp_spec_core(
                 ec,
                 model.embd(),
                 &feed,
-                &mut trunk_state,
+                trunk_state,
                 max_ctx,
             )?;
             (vids, Vec::new(), h_rows)
@@ -2772,7 +2783,7 @@ fn generate_mtp_spec_core(
                 ec,
                 model.embd(),
                 &committed,
-                &mut trunk_state,
+                trunk_state,
                 max_ctx,
                 stochastic,
             )?;
