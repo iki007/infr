@@ -275,9 +275,23 @@ UD-Q4_K_M (its GGUF ships the `nextn` head), greedy, 200 tokens:
 | device-local verify logits on the GPU accept path                                                                      | 33.3                               |
 | persistent trunk session across turns (was a ~15 GB re-upload per call; TTFT 12.4 s → 0.4 s)                           | 38.0                               |
 
-Verify now also runs decode's own `deltanet` kernel (m <= 16), which made the
-MTP greedy text match plain greedy on the test prompt at the same speed.
-Acceptance is α = 0.66 at 6 drafts.
+Verify now also runs decode's own `deltanet` kernel (m <= 16), and takes the
+int8 mrow exactly where decode does (`mmv_mw_choice`), which lifted α from 0.66
+to 0.71 at 6 drafts. The draft length is adaptive with a cap of 3 (the measured
+best; llama.cpp's default too):
+
+| Qwen3.8-27B greedy, 200 tok | plain | MTP cap 6 fixed | MTP cap 3 fixed | MTP cap 3 adaptive |
+| --------------------------- | ----- | --------------- | --------------- | ------------------ |
+| code prompt                 | 25.3  | 39.0            | 42.4            | 41.4               |
+| prose prompt                | 25.3  | 15.7            | 22.9            | 24.5               |
+
+On prose MTP still only breaks even. After a partial accept, DeltaNet's state
+cannot be rewound, so the next verify re-prefills from the last clean snapshot
+(m=13 at ~100 ms). llama.cpp writes a state snapshot per verified row instead
+(its `K` slots in `gated_delta_net.comp`), which keeps every verify at drafts+1
+rows. That is the next MTP change, with an XMX small-m verify GEMV. Greedy MTP
+output can still differ from plain on a near-tie; on the code prompt it does at
+cap 3 (one identifier, ~20 tokens in).
 
 Against llama.cpp `0f236bc21` with `--spec-type draft-mtp` on the same card
 (llama-server, the same prompt, greedy):

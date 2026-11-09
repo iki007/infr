@@ -2056,9 +2056,11 @@ fn top1_softmax(logits: &[f32]) -> (u32, f32) {
 
 // ─── Phase 3: the MTP self-speculative generation loop + run/serve wiring (issue #33) ───────────
 
-/// llama.cpp's oracle run used `--spec-draft-n-max 6` (`docs/mtp.md`) — the max candidates drafted
-/// per cycle before a batched verify.
-pub const DEFAULT_N_MAX: usize = 6;
+/// The max candidates drafted per cycle before a batched verify (the adaptive length's cap).
+/// llama.cpp's oracle run used `--spec-draft-n-max 6` (`docs/mtp.md`); its own default is 3. 3 is
+/// also the fastest cap measured on an Arc Pro B70 (Qwen3.8-27B, greedy): code 42.4 t/s at 3 vs 39.0
+/// at 6, prose 22.9 vs 15.7 — a verify row is not free on the int8 mrow GEMV.
+pub const DEFAULT_N_MAX: usize = 3;
 
 /// One batched VERIFY forward (`seam.rs`'s VERIFY branch) over `tokens`' un-cached suffix,
 /// on a persistent Vulkan session, ALSO capturing `h` for every returned row — the primitive
@@ -2528,8 +2530,15 @@ fn generate_mtp_spec_core(
     let mut sum_catchup_secs = 0.0f64;
     let t_decode = std::time::Instant::now();
 
+    // Adaptive draft length: after a full accept draft one more next round (up to `n_max`), after a
+    // partial one draft `accepted + 1`. A verify row costs real GPU time (the int8 mrow GEMV's work
+    // grows with m), so drafts the trunk will reject are not free — on prose (α≈0.5) a fixed 6
+    // ran BELOW plain decode. The committed stream is trunk-greedy whatever the length, so this
+    // moves speed only. Measured on an Arc Pro B70, Qwen3.8-27B, cap 3: prose 22.9 -> 24.5 t/s,
+    // code 42.4 -> 41.3 (docs/intel-b70.md § MTP).
+    let mut n_dyn = n_max;
     'cycles: while out.len() < max_new {
-        let n_max_round = n_max.min(max_new - out.len());
+        let n_max_round = n_dyn.min(max_new - out.len());
         if n_max_round == 0 {
             break;
         }
@@ -2647,6 +2656,11 @@ fn generate_mtp_spec_core(
         };
         total_drafted += cand.len();
         total_accepted += accepted;
+        n_dyn = if accepted == cand.len() {
+            (n_dyn + 1).min(n_max)
+        } else {
+            (accepted + 1).min(n_max)
+        };
 
         // DeltaNet rollback bookkeeping (see `mtp_ckpt`'s doc). A fully-accepted cycle leaves the
         // trunk's recurrent state on a clean committed prefix (`cached == committed ++ cand`, every

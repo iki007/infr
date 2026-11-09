@@ -1367,17 +1367,47 @@ fn lower_op(
             // 9..=16 tier can require them UP FRONT: unlike m<=8 there is no dequant-mrow
             // fallback above 8 rows, so entering the tier is only legal when the int8 kernel is
             // actually dispatchable.
-            let mmv_gate = be_.caps().i8_dot
-                && in_f * out_f >= 8 << 20
-                && out_f < 65536
-                && crate::gemm::native_mmv_mrow_kernel_name(dt).is_some()
-                && mrow_int8_dtype_ok(
+            // An MTP verify batch takes the int8 mrow EXACTLY when the m=1 decode it is checked
+            // against takes the int8 GEMV (`mmv_mw_choice`, the decode tier's own gate), so the two
+            // streams run the same kernel per row — the unified mrow is bit-identical across
+            // `rows` (`mmv_row1_bit_identical`). The ordinary-prefill size/vocab gates below were
+            // measured for throughput and made verify DISAGREE with decode in three places: the
+            // vocab head (decode int8, verify dequant), m=2 (verify dequant), and 2M..8M-element
+            // projections (decode int8, verify dequant). Measured on an Arc Pro B70 (Qwen3.8-27B
+            // MTP): the dequant verify head alone was ~10 ms per cycle.
+            let verify_int8 = graph.mtp_verify
+                && !crate::recorder::bda_weight_breaches(
+                    dt,
+                    in_f,
+                    out_f,
+                    &be_.cfg().kernels.vulkan,
+                )
+                && mmv_mw_choice(
+                    be_.caps(),
                     be_.device_arch(),
                     &be_.cfg().kernels.vulkan,
                     dt,
-                    graph.mtp_verify,
+                    in_f,
+                    out_f,
                 )
-                && be_.cfg().kernels.vulkan.mmv;
+                .is_some();
+            let mmv_gate = if graph.mtp_verify {
+                verify_int8
+                    && crate::gemm::native_mmv_mrow_kernel_name(dt).is_some()
+                    && be_.cfg().kernels.vulkan.mmv
+            } else {
+                be_.caps().i8_dot
+                    && in_f * out_f >= 8 << 20
+                    && out_f < 65536
+                    && crate::gemm::native_mmv_mrow_kernel_name(dt).is_some()
+                    && mrow_int8_dtype_ok(
+                        be_.device_arch(),
+                        &be_.cfg().kernels.vulkan,
+                        dt,
+                        graph.mtp_verify,
+                    )
+                    && be_.cfg().kernels.vulkan.mmv
+            };
             // rows 9..=16 int8 mrow tier (INFR_NO_MROW16 A/B escape): the MTP spec-verify batch
             // once its rollback window carries a few committed rows on top of the n_max drafts.
             // These shapes previously fell through to the split-K coopmat tile, which streams the
@@ -1427,7 +1457,7 @@ fn lower_op(
                 //    dequant ALU hides fully behind the stream) — the int8 form measured a hair
                 //    SLOWER there (qwen3-0.6b pp4@d4096 931 vs 916 with lm_head included).
                 // Same INFR_NO_MMV escape as the m=1 mmv (A/B).
-                if m >= 3 && mmv_gate {
+                if (m >= 3 || graph.mtp_verify) && mmv_gate {
                     let nblk = in_f / 32;
                     let qa = pooled(pool, be_, "mmvr_qa", m * in_f)?;
                     let dact = pooled(pool, be_, "mmvr_dact", m * nblk * 2)?;
