@@ -4374,6 +4374,19 @@ fn probe_device_facts(
 
 // ── tests ─────────────────────────────────────────────────────────────────────
 
+/// Guard for the unit tests that call a 16x16x16 f16 coopmat kernel directly, bypassing the shape
+/// selection production goes through. Those kernels exist at no other shape, and a driver that does
+/// not enumerate it may still build the pipeline and compute wrong numbers: Mesa ANV on Intel Xe2
+/// (8x16x16 only) does (`docs/intel-b70.md`). `true` = the calling test should skip; says so.
+#[cfg(test)]
+pub(crate) fn skip_without_f16_coopmat(be: &VulkanBackend, test: &str) -> bool {
+    let skip = !be.caps().f16_coopmat();
+    if skip {
+        eprintln!("skip: {test} needs the 16x16x16 f16 coopmat shape");
+    }
+    skip
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

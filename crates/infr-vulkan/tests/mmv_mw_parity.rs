@@ -334,7 +334,11 @@ fn mmv_mw_q2k_q3k_match_host_reference() {
                         _ => unreachable!(),
                     };
                 }
-                mr = mr.max((g - acc).abs() / (g.abs().max(acc.abs()) + 1e-6));
+                // Mixed abs/rel, the same shape as the Q5_K and native_mmv tests in this file: the
+                // subgroup-16 build on an Arc Pro B70 put a 7.6e-6 reassociation residue on a
+                // cancellation zero (in2048/out6145 o=2688: 0.0022888 vs host 0.0022812, beside
+                // outputs of magnitude 1..8), which pure relative error reads as 3.3e-3.
+                mr = mr.max(((g - acc).abs() - 1e-4).max(0.0) / (g.abs().max(acc.abs()) + 1e-6));
             }
             worst = worst.max(mr);
             println!("  {dt:?} in{in_f} out{out_f} W{warps}: max rel err vs host {mr:.2e}");
@@ -504,15 +508,24 @@ fn mmv_mw_q5k_match_host_reference() {
             // figures), which a pure-relative metric reads as a false 3.1e-2 "error". A 5e-4
             // absolute floor covers that residue; genuinely wrong math would be orders of
             // magnitude above it.
+            //
+            // The floor also grows with the f32 summation bound `nblk·ε·Σ|term|`: the GPU sums the
+            // same per-sub-block terms in f32 in its own order, so that much is rounding. A fixed
+            // 5e-4 was calibrated to RADV's order; the Arc Pro B70's subgroup-16 build put o=3972 at
+            // 0.005798 vs host 0.006805 (|diff| 1.0e-3 beside terms of ~1e4), which is the same
+            // cancellation zero, not a decode error.
             let mut mr = 0f32;
             for (o, &g) in got.iter().enumerate().take(out_f) {
-                let mut acc = 0f64;
+                let (mut acc, mut mag) = (0f64, 0f64);
                 for (s, (&da, &sa)) in dact_h.iter().zip(&sact_h).enumerate().take(nblk) {
                     let gelem = o * in_f + s * 32;
-                    acc += dpsub_q5k(&src, gelem, &qa_h, s * 32, da, sa) as f64;
+                    let t = dpsub_q5k(&src, gelem, &qa_h, s * 32, da, sa) as f64;
+                    acc += t;
+                    mag += t.abs();
                 }
                 let acc = acc as f32;
-                let e = ((g - acc).abs() - 5e-4).max(0.0) / (g.abs().max(acc.abs()) + 1e-6);
+                let floor = 5e-4f32.max(nblk as f32 * f32::EPSILON * mag as f32);
+                let e = ((g - acc).abs() - floor).max(0.0) / (g.abs().max(acc.abs()) + 1e-6);
                 if e > mr {
                     mr = e;
                 }

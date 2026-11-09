@@ -899,6 +899,10 @@ pub(crate) fn native_mmv_mw_spv(
         (Q5K, true, 4, false) => v!("native_mmv_mw_q5k_w4_res"),
         (Q5K, false, 8, false) => v!("native_mmv_mw_q5k_w8"),
         (Q5K, true, 8, false) => v!("native_mmv_mw_q5k_w8_res"),
+        (Q5K, false, 4, true) => v!("native_mmv_mw_q5k_w4_sg16"),
+        (Q5K, true, 4, true) => v!("native_mmv_mw_q5k_w4_res_sg16"),
+        (Q5K, false, 8, true) => v!("native_mmv_mw_q5k_w8_sg16"),
+        (Q5K, true, 8, true) => v!("native_mmv_mw_q5k_w8_res_sg16"),
         _ => None,
     }
 }
@@ -3848,6 +3852,9 @@ mod tests {
     #[ignore = "requires a Vulkan GPU with cooperative matrix"]
     fn coopmat_gemm_tiled_matches_cpu() {
         let be = VulkanBackend::new().unwrap();
+        if crate::skip_without_f16_coopmat(&be, "coopmat_gemm_tiled_matches_cpu") {
+            return;
+        }
         let (m, k, n) = (128usize, 96usize, 64usize); // m,n %64, k %32
         let a: Vec<f32> = (0..m * k).map(|i| ((i % 13) as f32 - 6.0) * 0.05).collect();
         let b: Vec<f32> = (0..k * n).map(|i| ((i % 7) as f32 - 3.0) * 0.05).collect();
@@ -3859,6 +3866,9 @@ mod tests {
     #[ignore = "requires a Vulkan GPU"]
     fn warp_gemm_matches_cpu() {
         let be = VulkanBackend::new().unwrap();
+        if crate::skip_without_f16_coopmat(&be, "warp_gemm_matches_cpu") {
+            return;
+        }
         for &(m, k, n) in &[
             (128usize, 16usize, 128usize),
             (256, 128, 256),

@@ -255,12 +255,14 @@ pub(crate) fn shader_core_count(p: &DeviceProbe) -> u32 {
 /// struct at all.
 ///
 /// **Transcribed verbatim** from llama.cpp's `ggml_vk_intel_shader_core_count`
-/// (`ggml/src/ggml-vulkan/ggml-vulkan.cpp:18805-18846`, read at pin 030ebb5). Every id and count
-/// here is upstream's; none was inferred, and an id upstream does not list returns 0 (unknown)
-/// rather than a nearby part's number. The comments are the SKU names upstream records.
+/// (`ggml/src/ggml-vulkan/ggml-vulkan.cpp:18805-18846`, read at pin 030ebb5; the Pro B65/B70 ids
+/// from `ggml-vulkan.cpp:16453` at 0f236bc21). Every id and count here is upstream's; none was
+/// inferred, and an id upstream does not list returns 0 (unknown) rather than a nearby part's
+/// number. The comments are the SKU names upstream records.
 ///
-/// UNVALIDATED: no Intel GPU exists on this machine, so not one of these ids has ever been matched
-/// by this code against a real device. The test below checks the transcription, not the hardware.
+/// Only the Pro B70 (`0xE223`) has been matched against a real device (2026-11-09, two of them on
+/// the dev box — see `docs/intel-b70.md`). The test below checks the transcription, not the
+/// hardware.
 fn intel_shader_core_count(device_id: u32) -> u32 {
     match device_id {
         0x56A6 => 6,  // A310
@@ -279,6 +281,8 @@ fn intel_shader_core_count(device_id: u32) -> u32 {
         0xE20C => 18, // B570
         0xE20B => 20, // B580
         0xE211 => 20, // Pro B60
+        0xE222 => 20, // Pro B65
+        0xE223 => 32, // Pro B70
         0xB080 => 12, // PTL Xe3 LPG 2x6 (12 subslices)
         _ => 0,
     }
@@ -880,6 +884,8 @@ mod tests {
             (0xE20C, 18),
             (0xE20B, 20),
             (0xE211, 20),
+            (0xE222, 20),
+            (0xE223, 32),
             (0xB080, 12),
         ];
         for (id, want) in upstream {

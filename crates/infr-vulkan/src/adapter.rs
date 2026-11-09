@@ -8495,10 +8495,9 @@ mod tests {
                     .fold(0f32, f32::max)
             );
         }
-        assert_ne!(
-            devs[0].name, devs[1].name,
-            "the two devices must be distinct physical GPUs"
-        );
+        // `d0`/`d1` are distinct physical GPUs by construction: `enumerate_devices` lists every
+        // device once (`physical_devices` drops a second ICD's entry for the same `deviceUUID`).
+        // Not checked by name — two identical cards (the dual Arc Pro B70 box) share one.
     }
 
     /// diffusion-gemma's `MoeFfn` shape: a SEPARATE `router_x` (not `x`), a FUSED `gate_up_exps`

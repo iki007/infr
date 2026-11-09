@@ -11236,6 +11236,9 @@ mod tests {
     #[ignore = "requires a Vulkan GPU"]
     fn attention_prefill_nonfa_matches_cpu() {
         let be = be_with(|_| {});
+        if crate::skip_without_f16_coopmat(&be, "attention_prefill_nonfa_matches_cpu") {
+            return;
+        }
         // hd=128 (qwen3), full causal, default scale — the pre-existing regression cases.
         run_attn_prefill_nonfa(&be, 64, 64, 2, 1, 128, 0, 0.0);
         run_attn_prefill_nonfa(&be, 128, 200, 4, 2, 128, 0, 0.0);
@@ -11331,6 +11334,9 @@ mod tests {
     #[ignore = "requires a Vulkan GPU"]
     fn attention_prefill_flash_matches_cpu() {
         let be = be_with(|_| {});
+        if crate::skip_without_f16_coopmat(&be, "attention_prefill_flash_matches_cpu") {
+            return;
+        }
         for &(q, kv, nh, nkv, hd) in &[
             (64usize, 64usize, 2usize, 1usize, 128usize),
             (128, 200, 4, 2, 128),
@@ -11498,6 +11504,12 @@ mod tests {
     #[test]
     #[ignore = "requires a Vulkan GPU"]
     fn attn_flash_stage_dequant_parity() {
+        if crate::skip_without_f16_coopmat(
+            &VulkanBackend::new().unwrap(),
+            "attn_flash_stage_dequant_parity",
+        ) {
+            return;
+        }
         use infr_core::DType;
         // Pin Off onto the DIRECT attn_flash_partial (same kernel the staged builds fork from):
         // no register warp, forced split-K partial+combine (n_splits==1 else takes the fused
@@ -11667,6 +11679,12 @@ mod tests {
     #[test]
     #[ignore = "requires a Vulkan GPU"]
     fn attn_flash_warp_dequant_parity() {
+        if crate::skip_without_f16_coopmat(
+            &VulkanBackend::new().unwrap(),
+            "attn_flash_warp_dequant_parity",
+        ) {
+            return;
+        }
         use infr_core::DType;
         // Leave warp ON (`flash_warp` default `true`). Force split-K so the warp partial+combine
         // reduce is covered in addition to the n_splits==1 warp path. Its own backend, so the knob
@@ -11849,6 +11867,12 @@ mod tests {
     #[test]
     #[ignore = "requires a Vulkan GPU"]
     fn attn_flash_coopmat_bda_parity() {
+        if crate::skip_without_f16_coopmat(
+            &VulkanBackend::new().unwrap(),
+            "attn_flash_coopmat_bda_parity",
+        ) {
+            return;
+        }
         let gen = |n: usize, salt: usize| -> Vec<f32> {
             (0..n)
                 .map(|i| (((i * 13 + salt) % 29) as f32 - 14.0) * 0.05)
@@ -12139,6 +12163,9 @@ mod tests {
     #[ignore = "requires a Vulkan GPU"]
     fn attention_prefill_flash_reg_matches_cpu() {
         let be = be_with(|_| {});
+        if crate::skip_without_f16_coopmat(&be, "attention_prefill_flash_reg_matches_cpu") {
+            return;
+        }
         for &(q, kv, nh, nkv) in &[
             (128usize, 128usize, 4usize, 2usize),
             (128, 300, 2, 1),
@@ -12332,6 +12359,9 @@ mod tests {
     #[ignore = "requires a Vulkan GPU"]
     fn matmul_proj_matches_cpu() {
         let be = VulkanBackend::new().unwrap();
+        if crate::skip_without_f16_coopmat(&be, "matmul_proj_matches_cpu") {
+            return;
+        }
         let (m, k, n) = (800usize, 64usize, 256usize); // m≥768 & not %64 → warp path + padding; n%256
         let mpad = m.div_ceil(64) * 64;
         let a: Vec<f32> = (0..m * k).map(|i| ((i % 17) as f32 - 8.0) * 0.05).collect();
@@ -12380,6 +12410,9 @@ mod tests {
     #[ignore = "requires a Vulkan GPU"]
     fn matmul_native_splitk_f16_matches_cpu() {
         let be = VulkanBackend::new().unwrap();
+        if crate::skip_without_f16_coopmat(&be, "matmul_native_splitk_f16_matches_cpu") {
+            return;
+        }
         let (m, k, n, splits) = (70usize, 2048usize, 256usize, 4usize);
         let mpad = m.div_ceil(64) * 64;
         let a: Vec<f32> = (0..m * k).map(|i| ((i % 17) as f32 - 8.0) * 0.05).collect();
@@ -12434,6 +12467,12 @@ mod tests {
     #[test]
     #[ignore = "requires a Vulkan GPU"]
     fn native_gemm_warp_iq4nl_matches_cpu() {
+        if crate::skip_without_f16_coopmat(
+            &VulkanBackend::new().unwrap(),
+            "native_gemm_warp_iq4nl_matches_cpu",
+        ) {
+            return;
+        }
         const KV: [i32; 16] = [
             -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
         ];

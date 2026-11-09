@@ -1719,9 +1719,8 @@ fn main() {
         // Q5_K mmv_mw: NEW int8 decode arm (previously no int8 tier in either stream — see
         // adapter.rs's `mmv_int8_decode_dtypes` doc). Same {plain,res} × WARPS∈{4,8} set as
         // Q2_K/Q3_K; no dispatch-shape sweep (AMD-only measurement). `native_mmv_mw` is in
-        // SG16_SOURCES below, so a `_sg16` twin gets auto-compiled too, but `gemm.rs`
-        // deliberately leaves the sg16 match arms unwired — Q5_K isn't in Intel's decode-dtype
-        // set, so nothing would ever request it; add the arms alongside an Intel measurement.
+        // SG16_SOURCES below, so a `_sg16` twin gets auto-compiled too; `gemm.rs` wires its
+        // arms (checked on an Arc Pro B70 by the mmv_mw parity tests, 2026-11-09).
         (
             "native_mmv_mw",
             "native_mmv_mw_q5k_w4",
