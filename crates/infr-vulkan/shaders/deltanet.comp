@@ -1,19 +1,31 @@
 #version 460
-// Gated-DeltaNet linear-attention recurrence (qwen35/Qwen3.5). One workgroup per (value head, block of
-// COL_BLOCK columns of the state S[kd,vd]); the columns of S are independent, so a thread owns one
-// column d and runs the whole `rows`-token recurrence for it. Per head: L2-normalize q,k (q also
-// ×1/√kd), beta=sigmoid(b), decay=exp(a_coef·softplus(alpha+dt_bias)); per token: S*=decay, kv=kᵀS,
+// Gated-DeltaNet linear-attention recurrence (qwen35/Qwen3.5), the decode / verify path (`rows`
+// tokens in sequence, state carried across them). Per head: L2-normalize q,k (q also ×1/√kd),
+// beta=sigmoid(b), decay=exp(a_coef·softplus(alpha+dt_bias)); per token: S*=decay, kv=kᵀS,
 // delta=(v−kv)·beta, S+=k⊗delta, out=qᵀS. GQA: nk q/k heads tile to nv value heads → head h uses
-// q/k head h % nk.
+// q/k head h % nk. State layout S[h][kk][d] (kk = key row, d = value column, d fastest).
 //
-// KEY PERF: the state column is cached in SHARED memory for the whole `rows` scan — the recurrence
-// re-reads+writes S[:,d] every timestep, and doing that against GLOBAL VRAM (2·kd accesses/token) was
-// the bottleneck (latency-bound: the sequential dependency can't hide ~300-cycle loads). Blocking to
-// COL_BLOCK columns keeps `kd·COL_BLOCK` floats of state in LDS; global traffic drops to ONE load +
-// ONE store of the block. qn/kn are normalized into shared once per token (shared by all columns).
-layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+// LAYOUT. One workgroup per (value head, block of COLS=16 columns). Its 128 threads are COLS
+// columns × GROUPS=8 row groups: thread (grp, col) owns column d = block·16 + col and the key rows
+// [grp·rpg, grp·rpg + rpg), rpg = kd/8 (16 at kd=128), and keeps those state values in REGISTERS
+// for the whole `rows` loop — one coalesced load and one coalesced store of the block (the 16
+// lanes of a row group read 16 adjacent floats of one S row). Each column's kᵀS and qᵀS sum is 8
+// partials of `rpg` rows combined in shared memory in group order 0..7, the same order for every
+// `rows`, so decode (rows=1) and a verify window (rows>1) stay bit-identical at the same position.
+//
+// WHY. The previous kernel gave one thread a whole column (a serial 128-row loop over LDS-cached
+// state) in 32-thread workgroups: 4096 threads for a Qwen3.5-4B layer. On an Arc Pro B70 that was
+// 79 µs per layer against llama.cpp's 5.9 µs (docs/intel-b70.md). llama.cpp spreads each column's
+// reduction across 16 lanes instead; its state is k-contiguous, infr's is d-contiguous, so here the
+// lanes run along d (coalesced) and the reduction is split across row groups.
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_control_flow_attributes : require
 
-#define COL_BLOCK 32u
+#define COLS 16u    // state columns per workgroup (adjacent lanes = adjacent d)
+#define GROUPS 8u   // key-row groups per workgroup
+#define RPG_MAX 16u // rows per group at the kd ≤ 128 limit
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in; // COLS * GROUPS
 
 layout(push_constant) uniform PC {
     uint rows;   // tokens to process in sequence (state carried across)
@@ -33,69 +45,62 @@ layout(binding = 4) readonly buffer AB  { float alpha[]; };   // [rows, nv]
 layout(binding = 5) readonly buffer ACB { float acoef[]; };   // [nv]  (ssm_a weight)
 layout(binding = 6) readonly buffer DTB { float dtbias[]; };  // [nv]
 layout(binding = 7) buffer SB { float state[]; };             // [nv*kd*vd] in/out
-layout(binding = 8) writeonly buffer OB { float outp[]; };    // [nv*vd]
+layout(binding = 8) writeonly buffer OB { float outp[]; };    // [rows, nv*vd]
 
-shared float ss[128u * COL_BLOCK]; // state block [kd, COL_BLOCK] cached in LDS (kd ≤ 128)
-shared float qn[128];              // normalized q for the current token (kd ≤ 128)
-shared float kn[128];              // normalized k
-shared float red[32];
+shared float qn[128];             // normalized q for the current token (kd ≤ 128)
+shared float kn[128];             // normalized k
+shared float sq[2][32];           // per-subgroup partial sums of q², k² (≥ 4-lane subgroups)
+shared float pkv[GROUPS * COLS];  // per-group partials of kᵀS
+shared float po[GROUPS * COLS];   // per-group partials of qᵀS
 
 void main() {
-    uint t = gl_LocalInvocationID.x;             // column within the block, and reduction lane
-    uint nblk = (pc.vd + COL_BLOCK - 1u) / COL_BLOCK;
-    uint h = gl_WorkGroupID.x / nblk;            // value head
-    uint blk = gl_WorkGroupID.x % nblk;          // column block within the head
-    uint d0 = blk * COL_BLOCK;                   // first column of this block
-    uint d = d0 + t;                             // this thread's column (may be ≥ vd → inactive)
+    uint t = gl_LocalInvocationID.x;
+    uint col = t % COLS;
+    uint grp = t / COLS;
+    uint nblk = (pc.vd + COLS - 1u) / COLS;
+    uint h = gl_WorkGroupID.x / nblk;                 // value head
+    uint d = (gl_WorkGroupID.x % nblk) * COLS + col;  // this thread's column
     bool live = d < pc.vd;
+    uint rpg = (pc.kd + GROUPS - 1u) / GROUPS;
+    uint k0 = grp * rpg;                              // this thread's first key row
 
     uint khid = h % pc.nk;
     uint hqbase = khid * pc.kd;   // this head's q/k offset WITHIN a token row
     uint hvbase = h * pc.vd;      // this head's v/out offset within a token row
     uint sbase = h * pc.kd * pc.vd;
 
-    // Load this block's state columns [kd, t] into shared: ss[kk*COL_BLOCK + t] = S[kk, d0+t].
-    if (live) {
-        for (uint kk = 0u; kk < pc.kd; kk++) {
-            ss[kk * COL_BLOCK + t] = state[sbase + kk * pc.vd + d];
-        }
+    float sreg[RPG_MAX];
+    [[unroll]] for (uint r = 0u; r < RPG_MAX; r++) {
+        uint kk = k0 + r;
+        sreg[r] = (live && r < rpg && kk < pc.kd) ? state[sbase + kk * pc.vd + d] : 0.0;
     }
-    barrier();
 
     for (uint tk = 0u; tk < pc.rows; tk++) {
         uint qbase = tk * pc.nk * pc.kd + hqbase;
         uint vbase = tk * pc.nv * pc.vd + hvbase;
         uint ga = tk * pc.nv + h;
 
-        // ── L2-normalize q,k over kd into shared (all threads cooperate; 32 lanes) ──
-        float qs = 0.0, ks = 0.0;
-        for (uint i = t; i < pc.kd; i += 32u) {
-            float qv = q[qbase + i];
-            float kv = k[qbase + i];
-            qn[i] = qv;
-            kn[i] = kv;
-            qs += qv * qv;
-            ks += kv * kv;
+        // ── L2-normalize q,k over kd into shared (thread t < kd holds element t) ──
+        float qv = 0.0, kv = 0.0;
+        if (t < pc.kd) {
+            qv = q[qbase + t];
+            kv = k[qbase + t];
         }
-        red[t] = qs;
-        barrier();
-        for (uint s = 16u; s > 0u; s >>= 1) {
-            if (t < s) { red[t] += red[t + s]; }
-            barrier();
+        float qs = subgroupAdd(qv * qv);
+        float ks = subgroupAdd(kv * kv);
+        if (subgroupElect()) {
+            sq[0][gl_SubgroupID] = qs;
+            sq[1][gl_SubgroupID] = ks;
         }
-        float qnorm = sqrt(red[0] + pc.eps);
         barrier();
-        red[t] = ks;
-        barrier();
-        for (uint s = 16u; s > 0u; s >>= 1) {
-            if (t < s) { red[t] += red[t + s]; }
-            barrier();
+        float qsum = 0.0, ksum = 0.0;
+        for (uint i = 0u; i < gl_NumSubgroups; i++) {
+            qsum += sq[0][i];
+            ksum += sq[1][i];
         }
-        float knorm = sqrt(red[0] + pc.eps);
-        barrier();
-        for (uint i = t; i < pc.kd; i += 32u) {
-            qn[i] = qn[i] / qnorm * pc.qscale;
-            kn[i] = kn[i] / knorm;
+        if (t < pc.kd) {
+            qn[t] = qv / sqrt(qsum + pc.eps) * pc.qscale;
+            kn[t] = kv / sqrt(ksum + pc.eps);
         }
         barrier();
 
@@ -105,30 +110,48 @@ void main() {
         float sp = max(zsp, 0.0) + log(1.0 + exp(-abs(zsp))); // softplus
         float decay = exp(acoef[h] * sp);
 
-        // ── recurrence for this thread's column d, all in shared state ──
-        if (live) {
-            float kvv = 0.0;
-            for (uint kk = 0u; kk < pc.kd; kk++) {
-                float sval = ss[kk * COL_BLOCK + t] * decay;
-                ss[kk * COL_BLOCK + t] = sval;
-                kvv += kn[kk] * sval;
+        // ── kv = kᵀ(S·decay) for this column: this thread's rows, then the 8 group partials ──
+        float pk = 0.0;
+        [[unroll]] for (uint r = 0u; r < RPG_MAX; r++) {
+            if (r < rpg && k0 + r < pc.kd) {
+                sreg[r] *= decay;
+                pk += kn[k0 + r] * sreg[r];
             }
-            float delta = (v[vbase + d] - kvv) * beta;
+        }
+        pkv[grp * COLS + col] = pk;
+        barrier();
+        float kvv = 0.0;
+        [[unroll]] for (uint g = 0u; g < GROUPS; g++) {
+            kvv += pkv[g * COLS + col];
+        }
+        float delta = live ? (v[vbase + d] - kvv) * beta : 0.0;
+
+        // ── S += k⊗delta, out = qᵀS ──
+        float pq = 0.0;
+        [[unroll]] for (uint r = 0u; r < RPG_MAX; r++) {
+            if (r < rpg && k0 + r < pc.kd) {
+                sreg[r] += kn[k0 + r] * delta;
+                pq += qn[k0 + r] * sreg[r];
+            }
+        }
+        po[grp * COLS + col] = pq;
+        barrier();
+        if (grp == 0u && live) {
             float o = 0.0;
-            for (uint kk = 0u; kk < pc.kd; kk++) {
-                float sval = ss[kk * COL_BLOCK + t] + kn[kk] * delta;
-                ss[kk * COL_BLOCK + t] = sval;
-                o += qn[kk] * sval;
+            [[unroll]] for (uint g = 0u; g < GROUPS; g++) {
+                o += po[g * COLS + col];
             }
             outp[vbase + d] = o;
         }
-        barrier(); // finish reading qn/kn before the next token overwrites them
+        // The next token's first shared write (sq) comes after this token's last sq read; its
+        // qn/kn, pkv and po writes each sit behind a barrier every reader here has passed.
     }
 
     // Persist the updated state block back to global.
-    if (live) {
-        for (uint kk = 0u; kk < pc.kd; kk++) {
-            state[sbase + kk * pc.vd + d] = ss[kk * COL_BLOCK + t];
+    [[unroll]] for (uint r = 0u; r < RPG_MAX; r++) {
+        uint kk = k0 + r;
+        if (live && r < rpg && kk < pc.kd) {
+            state[sbase + kk * pc.vd + d] = sreg[r];
         }
     }
 }

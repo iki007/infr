@@ -1822,6 +1822,19 @@ fn main() {
             "native_mmv_mrow_iq4xs_o4_m4",
             &["-DFMT_IQ4XS", "-DOUTS4", "-DMRV=4"],
         ),
+        // The fused-residual decode twins (rows=1 Linear+Add), the same pair IQ4_NL has: IQ4_XS
+        // reaches the int8 decode tier on Intel Xe2, where the f32-exact GEMV it otherwise rides
+        // runs at ~176 GB/s against the mrow kernel's ~410 (docs/intel-b70.md).
+        (
+            "native_mmv_mrow",
+            "native_mmv_mrow_iq4xs_m4_res",
+            &["-DFMT_IQ4XS", "-DMRV=4", "-DUSE_RES"],
+        ),
+        (
+            "native_mmv_mrow",
+            "native_mmv_mrow_iq4xs_o4_m4_res",
+            &["-DFMT_IQ4XS", "-DOUTS4", "-DMRV=4", "-DUSE_RES"],
+        ),
         // Q2_K / Q3_K multi-row (m=2..8): symmetric-decode partners for `mmv_mw_choice`'s Q2_K/Q3_K
         // decode tier (adapter.rs) — without these the MTP verify batch would keep the f32-exact
         // dequant mrow for a dtype whose m=1 decode already went int8, exactly the asymmetry that

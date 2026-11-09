@@ -1220,6 +1220,9 @@ pub(crate) fn generate_dense_backend(
         let logits_buf = be
             .alloc(c.vocab * 4, BufferUsage::Readback)
             .map_err(|e| anyhow!("{e}"))?;
+        let logits_dev = be
+            .alloc(c.vocab * 4, BufferUsage::Activations)
+            .map_err(|e| anyhow!("{e}"))?;
         *state = Some(SeamKv {
             weights: std::sync::Arc::new(SeamWeights {
                 wbufs,
@@ -1237,6 +1240,7 @@ pub(crate) fn generate_dense_backend(
             pos_buf,
             ipl_buf,
             logits_buf,
+            logits_dev,
             max_ctx: want_ctx,
             kv_ring,
             cached: Vec::new(),
@@ -1262,6 +1266,7 @@ pub(crate) fn generate_dense_backend(
         pos_buf,
         ipl_buf,
         logits_buf,
+        logits_dev,
         max_ctx,
         cached,
         denoise_cache,
@@ -1445,6 +1450,15 @@ pub(crate) fn generate_dense_backend(
         && !penalize
         && caps.gpu_sample
         && ec.spec.gpu_sample;
+    // Where the decode graph writes its [vocab] logits for this call: VRAM when the step samples
+    // on the GPU and nothing downloads the row (see `SeamKv::logits_dev`), else the host-visible
+    // `logits_buf` the per-step download below reads. Chosen once per call because the replay plan
+    // binds it once; the same condition gates that download.
+    let step_logits: &dyn Buffer = if (gpu_argmax || gpu_sample) && logits_out.is_none() {
+        logits_dev.as_ref()
+    } else {
+        logits_buf.as_ref()
+    };
 
     // DeepSeek V4: the `compress_ratio == 0` tier emits (hyper-connections, MQA attention with
     // sinks and the grouped output projection, MoE with the per-layer SwiGLU clamp under EITHER
@@ -5566,10 +5580,7 @@ pub(crate) fn generate_dense_backend(
             &vbufs[..],
             &wbufs[..],
         );
-        b.bind(
-            h.logits.expect("decode build has logits"),
-            logits_buf.as_ref(),
-        );
+        b.bind(h.logits.expect("decode build has logits"), step_logits);
         if let Some(tid) = h.tok_id {
             b.bind(tid, id_out);
         }
@@ -5830,10 +5841,7 @@ pub(crate) fn generate_dense_backend(
                 &vbufs[..],
                 &wbufs[..],
             );
-            b.bind(
-                h.logits.expect("decode build has logits"),
-                logits_buf.as_ref(),
-            );
+            b.bind(h.logits.expect("decode build has logits"), step_logits);
             if let Some(tid) = h.tok_id {
                 b.bind(tid, id_out);
             }

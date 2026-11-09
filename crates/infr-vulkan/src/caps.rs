@@ -125,8 +125,9 @@ pub(crate) const VENDOR_NVIDIA: u32 = 0x10de;
 
 /// The GPU architecture generation, bucketed the way llama.cpp's `get_device_architecture` buckets
 /// it (`ggml/src/ggml-vulkan/ggml-vulkan.cpp:404`, read at pin 030ebb5) — from PROBES, never from
-/// PCI device ids. infr uses it for one thing today: deciding whether a driver's cooperative-matrix
-/// enumeration can be believed ([`coopmat_trust`]).
+/// PCI device ids. infr uses it for two things: deciding whether a driver's cooperative-matrix
+/// enumeration can be believed ([`coopmat_trust`]), and the measured Xe2 int8 decode set
+/// (`adapter::mmv_int8_decode_dtypes`).
 ///
 /// `AmdRdna3` is upstream's `AMD_RDNA3` and means "RDNA3 **or newer**": the discriminator is the
 /// mixed-signedness packed-dot bit, which RDNA4 also sets, and there is no RDNA4 bucket upstream.

@@ -684,6 +684,8 @@ pub(crate) fn native_mmv_mrow_variant_spv(
         (Iq4Xs, false, true, false) => v!("native_mmv_mrow_iq4xs_m4"),
         (Iq4Xs, true, false, false) => v!("native_mmv_mrow_iq4xs_o4"),
         (Iq4Xs, true, true, false) => v!("native_mmv_mrow_iq4xs_o4_m4"),
+        (Iq4Xs, false, true, true) => v!("native_mmv_mrow_iq4xs_m4_res"),
+        (Iq4Xs, true, true, true) => v!("native_mmv_mrow_iq4xs_o4_m4_res"),
         (Q2K, false, false, false) => v!("native_mmv_mrow_q2k"),
         (Q2K, false, true, false) => v!("native_mmv_mrow_q2k_m4"),
         (Q2K, true, false, false) => v!("native_mmv_mrow_q2k_o4"),

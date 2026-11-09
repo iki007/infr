@@ -263,6 +263,10 @@ struct VulkanShared {
     /// Must be dropped before the device is destroyed.
     allocator: ManuallyDrop<Mutex<Allocator>>,
     caps: Capabilities,
+    /// The architecture bucket `caps::device_architecture` put this device in. Read by the two
+    /// arch-keyed rules: the coopmat trust filter (at construction) and the Xe2 int8 decode set
+    /// (`adapter::mmv_int8_decode_dtypes`).
+    device_arch: crate::caps::DeviceArch,
     /// VK_EXT_memory_budget enabled → `vram()` can report live free bytes (else total only).
     has_mem_budget: bool,
     /// `maxMemoryAllocationSize` — the largest single `vkAllocateMemory` this device accepts
@@ -1191,6 +1195,11 @@ impl VulkanBackend {
     /// copies the `name: String`) — safe to call per-op inside the adapter's hot lowering loop.
     pub(crate) fn caps(&self) -> &Capabilities {
         &self.shared.caps
+    }
+
+    /// See `VulkanShared::device_arch`.
+    pub(crate) fn device_arch(&self) -> crate::caps::DeviceArch {
+        self.shared.device_arch
     }
 
     /// Borrowed engine configuration — every knob this backend (and the seam code holding it)
@@ -2518,6 +2527,7 @@ impl VulkanBackend {
                 cmd_pool: Mutex::new(cmd_pool),
                 allocator: ManuallyDrop::new(Mutex::new(allocator)),
                 caps,
+                device_arch,
                 has_mem_budget,
                 max_mem_alloc_size,
                 max_push_constants: props.limits.max_push_constants_size,
@@ -5086,68 +5096,66 @@ mod ssm_tests {
         assert!(e < 1e-4, "softcap err {e}");
     }
 
-    #[test]
-    fn deltanet_matches_cpu() {
-        let be = match VulkanBackend::new() {
-            Ok(b) => b,
-            Err(_) => {
-                eprintln!("skip: no Vulkan GPU");
-                return;
-            }
-        };
-        let (nv, nk, kd, vd) = (4usize, 2usize, 8usize, 8usize);
+    /// One `Recorder::deltanet` case against the CPU recurrence (mirrors the qwen35 CPU mixer),
+    /// `rows` tokens in sequence with the state carried across them.
+    fn deltanet_case(be: &VulkanBackend, nv: usize, nk: usize, kd: usize, vd: usize, rows: usize) {
         let eps = 1e-6f32;
-        let q = det(nk * kd, 0.1);
-        let k = det(nk * kd, 0.7);
-        let v = det(nv * vd, 1.3);
-        let blog = det(nv, 2.0);
-        let alpha = det(nv, 0.5);
+        let q = det(rows * nk * kd, 0.1);
+        let k = det(rows * nk * kd, 0.7);
+        let v = det(rows * nv * vd, 1.3);
+        let blog = det(rows * nv, 2.0);
+        let alpha = det(rows * nv, 0.5);
         let acoef: Vec<f32> = (0..nv).map(|i| -(0.2 + 0.1 * i as f32)).collect();
         let dtbias = det(nv, -0.3);
         let state0 = det(nv * kd * vd, 0.05);
 
-        // CPU reference (mirrors shaders/deltanet.comp + the qwen35 CPU mixer).
         let qscale = 1.0 / (kd as f32).sqrt();
         let mut s = state0.clone();
-        let mut out_cpu = vec![0f32; nv * vd];
-        for h in 0..nv {
-            let khid = h % nk;
-            let mut qh = q[khid * kd..khid * kd + kd].to_vec();
-            let mut kh = k[khid * kd..khid * kd + kd].to_vec();
-            let qn = (qh.iter().map(|x| x * x).sum::<f32>() + eps).sqrt();
-            let kn = (kh.iter().map(|x| x * x).sum::<f32>() + eps).sqrt();
-            for x in qh.iter_mut() {
-                *x = *x / qn * qscale;
-            }
-            for x in kh.iter_mut() {
-                *x /= kn;
-            }
-            let beta = sigmoid(blog[h]);
-            let decay = (acoef[h] * softplus(alpha[h] + dtbias[h])).exp();
-            let sb = h * kd * vd;
-            for d in 0..vd {
-                let mut kvv = 0.0;
-                for kk in 0..kd {
-                    let sv = s[sb + kk * vd + d] * decay;
-                    s[sb + kk * vd + d] = sv;
-                    kvv += kh[kk] * sv;
+        let mut out_cpu = vec![0f32; rows * nv * vd];
+        for tk in 0..rows {
+            for h in 0..nv {
+                let khid = h % nk;
+                let qk0 = tk * nk * kd + khid * kd;
+                let mut qh = q[qk0..qk0 + kd].to_vec();
+                let mut kh = k[qk0..qk0 + kd].to_vec();
+                let qn = (qh.iter().map(|x| x * x).sum::<f32>() + eps).sqrt();
+                let kn = (kh.iter().map(|x| x * x).sum::<f32>() + eps).sqrt();
+                for x in qh.iter_mut() {
+                    *x = *x / qn * qscale;
                 }
-                let delta = (v[h * vd + d] - kvv) * beta;
-                let mut o = 0.0;
-                for kk in 0..kd {
-                    let sv = s[sb + kk * vd + d] + kh[kk] * delta;
-                    s[sb + kk * vd + d] = sv;
-                    o += qh[kk] * sv;
+                for x in kh.iter_mut() {
+                    *x /= kn;
                 }
-                out_cpu[h * vd + d] = o;
+                let g = tk * nv + h;
+                let beta = sigmoid(blog[g]);
+                let decay = (acoef[h] * softplus(alpha[g] + dtbias[h])).exp();
+                let sb = h * kd * vd;
+                for d in 0..vd {
+                    let mut kvv = 0.0;
+                    for kk in 0..kd {
+                        let sv = s[sb + kk * vd + d] * decay;
+                        s[sb + kk * vd + d] = sv;
+                        kvv += kh[kk] * sv;
+                    }
+                    let delta = (v[tk * nv * vd + h * vd + d] - kvv) * beta;
+                    let mut o = 0.0;
+                    for kk in 0..kd {
+                        let sv = s[sb + kk * vd + d] + kh[kk] * delta;
+                        s[sb + kk * vd + d] = sv;
+                        o += qh[kk] * sv;
+                    }
+                    out_cpu[tk * nv * vd + h * vd + d] = o;
+                }
             }
         }
 
-        let (qb, kb, vb) = (dev(&be, &q), dev(&be, &k), dev(&be, &v));
-        let (bb, ab) = (dev(&be, &blog), dev(&be, &alpha));
-        let (acb, dtb) = (dev(&be, &acoef), dev(&be, &dtbias));
-        let sbuf = dev(&be, &state0);
-        let ob = be.alloc(nv * vd * 4, BufferUsage::Activations).unwrap();
+        let (qb, kb, vb) = (dev(be, &q), dev(be, &k), dev(be, &v));
+        let (bb, ab) = (dev(be, &blog), dev(be, &alpha));
+        let (acb, dtb) = (dev(be, &acoef), dev(be, &dtbias));
+        let sbuf = dev(be, &state0);
+        let ob = be
+            .alloc(rows * nv * vd * 4, BufferUsage::Activations)
+            .unwrap();
         let rec = be.recorder().unwrap();
         rec.deltanet(
             qb.as_ref(),
@@ -5159,7 +5167,7 @@ mod ssm_tests {
             dtb.as_ref(),
             sbuf.as_ref(),
             ob.as_ref(),
-            1, // rows: single-token bespoke path
+            rows,
             nv,
             nk,
             kd,
@@ -5167,18 +5175,30 @@ mod ssm_tests {
             eps,
         );
         rec.finish().unwrap();
-        let out_gpu = read(&be, ob.as_ref(), nv * vd);
-        let s_gpu = read(&be, sbuf.as_ref(), nv * kd * vd);
-        assert!(
-            maxerr(&out_cpu, &out_gpu) < 1e-4,
-            "deltanet out err {}",
-            maxerr(&out_cpu, &out_gpu)
-        );
-        assert!(
-            maxerr(&s, &s_gpu) < 1e-4,
-            "deltanet state err {}",
-            maxerr(&s, &s_gpu)
-        );
+        let out_gpu = read(be, ob.as_ref(), rows * nv * vd);
+        let s_gpu = read(be, sbuf.as_ref(), nv * kd * vd);
+        let label = format!("nv={nv} nk={nk} kd={kd} vd={vd} rows={rows}");
+        let (eo, es) = (maxerr(&out_cpu, &out_gpu), maxerr(&s, &s_gpu));
+        println!("deltanet {label}: out err {eo:e}, state err {es:e}");
+        assert!(eo < 1e-4, "deltanet {label}: out err {eo}");
+        assert!(es < 1e-4, "deltanet {label}: state err {es}");
+    }
+
+    #[test]
+    fn deltanet_matches_cpu() {
+        let be = match VulkanBackend::new() {
+            Ok(b) => b,
+            Err(_) => {
+                eprintln!("skip: no Vulkan GPU");
+                return;
+            }
+        };
+        // The original tiny shape; the real qwen35 head (kd=vd=128) at decode and a 3-token
+        // verify window; and a head whose vd is not a multiple of the column block.
+        deltanet_case(&be, 4, 2, 8, 8, 1);
+        deltanet_case(&be, 4, 2, 128, 128, 1);
+        deltanet_case(&be, 6, 2, 128, 128, 3);
+        deltanet_case(&be, 3, 1, 64, 40, 2);
     }
 
     #[test]

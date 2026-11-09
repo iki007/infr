@@ -11,9 +11,10 @@ infr builds and runs on Xe2 and generates coherent text on both cards (Qwen3.5-4
 and Qwen3.8-27B checked by hand). The first run was **2–3.4x behind llama.cpp's
 Vulkan backend on prefill and ~1.7x behind on decode**. The causes are measured
 (below), and every one of them is inside the existing Vulkan backend. Plan
-slices 1 and 2 have landed: the GPU suite is clean, and prefill runs on XMX
-through an 8x16x16 coopmat tile (+53% / +71% pp512), but it is still 1.3x / 2x
-behind llama.cpp's Vulkan prefill. Decode is unchanged so far. A native Intel
+slices 1–3 have landed. The GPU suite is clean. Prefill runs on XMX through an
+8x16x16 coopmat tile (+53% / +71% pp512), still 1.3x / 2x behind llama.cpp's
+Vulkan prefill. Decode on Qwen3.5-4B is now **ahead of llama.cpp's Vulkan
+backend** (120 vs 111 t/s). On Qwen3.8-27B it is 18.8 vs 23.1 t/s. A native Intel
 backend (Level Zero) is deferred until the Vulkan work is done (`backlog.md`
 B102).
 
@@ -38,16 +39,17 @@ INFR_DEV=Vulkan1 cargo test --release -p infr-vulkan --no-fail-fast -- --include
 
 ## Numbers (2026-11-09, `Vulkan1`, `-fa 1` for llama.cpp)
 
-| model                       | infr first run | infr `_cm816` | llama.cpp Vulkan | llama.cpp SYCL |
-| --------------------------- | -------------- | ------------- | ---------------- | -------------- |
-| Qwen3.5-4B Q4_K_M pp512     | 1571           | 2406          | 3165             | 7031           |
-| Qwen3.5-4B Q4_K_M tg128     | 62.6           | —             | 111.2            | 148.5          |
-| Qwen3.8-27B UD-Q4_K_M pp512 | 220            | 376           | 746              | 1087           |
-| Qwen3.8-27B UD-Q4_K_M tg64  | 13.8           | —             | 23.1             | 29.9           |
+| model                       | infr first run | infr now  | llama.cpp Vulkan | llama.cpp SYCL |
+| --------------------------- | -------------- | --------- | ---------------- | -------------- |
+| Qwen3.5-4B Q4_K_M pp512     | 1571           | 2380      | 3165             | 7031           |
+| Qwen3.5-4B Q4_K_M tg128     | 62.6           | **120.0** | 111.2            | 148.5          |
+| Qwen3.8-27B UD-Q4_K_M pp512 | 220            | 376       | 746              | 1087           |
+| Qwen3.8-27B UD-Q4_K_M tg128 | 13.8           | 18.8      | 23.1             | 29.9           |
 
-llama.cpp at `0f236bc21`. "infr first run" is `f568ff7`; the `_cm816` column is
-plan slice 2 (decode is not touched by it). `INFR_NO_COOPMAT=1` still gives the
-first-run prefill numbers, which is how the A/B was taken. infr's 27B prefill
+llama.cpp at `0f236bc21`; its 27B decode row is tg64. "infr first run" is
+`f568ff7`. "infr now" is after plan slice 3. Prefill moved in slice 2,
+`INFR_NO_COOPMAT=1` still gives the first-run prefill numbers, and that is how
+the A/B was taken. infr's 27B prefill
 arms the submit splitter (`split/185`, `split/244`). That is a symptom of the
 slow forward, not a cause: the splitter's cap is measured from forward time.
 
@@ -128,7 +130,7 @@ because C is padded to 64 rows, not 128. Still open: the remaining 1.3x / 2x to
 llama.cpp. Candidates are an f16-A (`A_GLOBAL`) variant to drop the As stage, the
 attention and DeltaNet prefill kernels, and the formats without a build.
 
-### Decode: three ops are the whole gap
+### Decode: three ops were the whole gap
 
 Qwen3.5-4B, one decoded token. infr from `INFR_SEAM_NO_REPLAY=1
 INFR_PROF_OPS=1 INFR_PROF_OP_SHAPES=1`; llama.cpp from `GGML_VK_PERF_LOGGER=1`.
@@ -144,20 +146,38 @@ Same card.
 The first three sum to ~7.9 ms of a ~15.9 ms token, more than the whole gap to
 llama.cpp's 10.1 ms.
 
-- **lm_head.** The same mrow kernel reads the 9216x2560 Q6_K `ffn_down` at
-  ~450 GB/s, so the dtype is not the problem; the 248k-row, 2560-wide shape is.
-  Two cheap hypotheses are ruled out by measurement: forcing the 4-outputs
-  OUTS4 layout (`o4`) for `out_f >= 65536` made tg128 **worse** (62.6 → 51.7),
-  and lifting `Recorder::MAX_GROUP_COUNT_X` to the device's real 2^31−1 (no 2-D
-  split) changed nothing (60.8, within noise). Next step is an isolated kernel
-  bench at this shape.
-- **DeltaNet.** `deltanet.comp` gives one thread a whole state column and loops
-  over `kd` serially, in 32-thread workgroups. llama.cpp's
-  `gated_delta_net.comp` on Intel pins subgroup 16 and spreads each column's
-  `kd` reduction over all 16 lanes. Its source records that as ~10x over its
-  generic `COLS_PER_WG = 8` rule on Xe.
-- **attn_qkv** goes through `gemv_streamed` (the dequant GEMV), not the int8
-  mrow tier that the other projections use.
+- **lm_head — not the kernel, its output.** Isolated, the same GEMV at the same
+  shape runs in 1152 µs (452 GB/s, llama.cpp's speed) into a device buffer, and
+  in **7031 µs into a `Readback` buffer**. The seam bound the decode logits to
+  its host-visible `logits_buf` even when the step samples on the GPU and never
+  downloads them. On this card the LM head's 248k scattered stores into system
+  memory were the whole 5.5 ms. That also explains the 174 µs `argmax_part`:
+  it read the row back over PCIe. **Fixed (slice 3):** the session has a
+  device-local `logits_dev`, bound whenever the call samples on the GPU and
+  nothing wants the row. The host-sampled path still writes `logits_buf`
+  (B106). Ruled out on the way: OUTS4 `o4` for tall shapes (worse, 51.7), the
+  2-D `dispatch_wide` split (no change), 16/32-thread mrow workgroups (no
+  change).
+- **DeltaNet — fixed (slice 3).** The old `deltanet.comp` gave one thread a
+  whole state column and looped over `kd` serially in 32-thread workgroups.
+  llama.cpp spreads each column's reduction over 16 lanes, but its state is
+  k-contiguous and infr's is d-contiguous. The rewrite puts 16 adjacent columns
+  on the lanes (coalesced) and 8 row groups per workgroup. The state stays in
+  registers for the whole `rows` loop, and the 8 group partials combine in
+  fixed order. Result: 79 → 12.6 µs per layer; the same kernel for decode and
+  verify.
+- **attn_qkv — fixed (slice 3).** Q5_K (and, on the 27B, IQ4_XS) rode the f32
+  GEMV, which runs at ~176 GB/s here against the int8 mrow kernel's ~410. The
+  int8 decode set is AMD-measured (`adapter::mmv_int8_decode_dtypes`), and
+  there Q5_K int8 was a −1.4% wash. On `DeviceArch::IntelXe2` the set now also
+  has Q5_K and IQ4_XS (IQ4_XS gained the `_res` mrow twins it lacked). 27B decode
+  15.7 → 18.8, 4B 115.7 → 120.0.
+
+What is left on the 27B (profile after slice 3, ms per token of ~58): the int8
+mrow GEMVs at its larger shapes run ~270–290 GB/s (5120x17408 181 µs,
+17408x5120 175 µs), where Strata measured llama.cpp at 510–537 GB/s on these
+cards. That is the next decode lever, and it is kernel work in
+`native_mmv_mrow.comp`.
 
 Smaller items: the activation quantizer is 144 dispatches per token at ~7 µs
 each (B105). The `argmax_part` row (174 µs) is probably the profiler charging
@@ -229,5 +249,8 @@ Each slice is measured against the numbers above on `Vulkan1`.
    cancellation zeros, and the two-device test no longer compares names.
 2. **Done.** Prefill: the 8x16x16 `_cm816` XMX tile (above). +53% pp512 on
    Qwen3.5-4B, +71% on Qwen3.8-27B.
-3. Decode: subgroup-16 DeltaNet with the reduction spread across lanes; then
-   the lm_head shape; then attn_qkv onto the int8 tier.
+3. **Done.** Decode: the DeltaNet rewrite, device-local decode logits, and the
+   Xe2 int8 decode set. Qwen3.5-4B tg128 62.6 → 120.0, past llama.cpp's 111.2;
+   Qwen3.8-27B 13.8 → 18.8.
+4. Next: the int8 mrow GEMV at large shapes (27B decode), then the remaining
+   prefill gap (an f16-A `_cm816` variant, attention and DeltaNet prefill).

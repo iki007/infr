@@ -479,30 +479,39 @@ mod tests {
         }
     }
 
-    /// AUDIT #2: Iq4Xs is mrow-eligible (`native_mmv_mrow_kernel_name` = Some) but has NO fused-
-    /// residual build — the res-legality predicate must report that, and the variant table must
-    /// agree, so `linear_mmv_mrow_at`'s residual assert catches an illegal residual Iq4Xs decode at
-    /// the boundary instead of panicking in the SPV `expect()`.
+    /// AUDIT #2: the res-legality predicate (`native_mmv_mrow_res_supported`) must agree with the
+    /// variant table for every plain-mrow dtype, so `linear_mmv_mrow_at`'s residual assert catches
+    /// an illegal residual decode at the boundary instead of panicking in the SPV `expect()`. The
+    /// fused-residual builds also come as a PAIR (`m4_res` and `o4_m4_res`): the decode picks
+    /// between them by `in_f`, so half a pair would be a latent panic at one width. IQ4_XS, once
+    /// the one plain-mrow dtype without them, has both since it joined the Intel Xe2 int8 decode
+    /// set (`adapter::mmv_int8_decode_dtypes`).
     #[test]
-    fn iq4xs_reports_no_mrow_residual() {
+    fn mrow_residual_predicate_matches_the_variant_table() {
         use crate::gemm;
         use infr_core::DType::{Iq4Xs, Q4K};
-        assert!(
-            gemm::native_mmv_mrow_kernel_name(Iq4Xs).is_some(),
-            "Iq4Xs should still be plain-mrow eligible"
-        );
-        assert!(
-            !gemm::native_mmv_mrow_res_supported(Iq4Xs),
-            "Iq4Xs has no _res mrow build — predicate must say so"
-        );
-        assert!(
-            gemm::native_mmv_mrow_variant_spv(Iq4Xs, false, true, true).is_none(),
-            "Iq4Xs _res variant must not exist"
-        );
-        // A dtype that DOES have the residual build reports true, so the predicate isn't vacuously
-        // false for everyone.
-        assert!(gemm::native_mmv_mrow_res_supported(Q4K));
-        assert!(gemm::native_mmv_mrow_variant_spv(Q4K, false, true, true).is_some());
+        for &dt in infr_core::decode_spec::WEIGHT_QUANTS {
+            if gemm::native_mmv_mrow_kernel_name(dt).is_none() {
+                continue;
+            }
+            let m4 = gemm::native_mmv_mrow_variant_spv(dt, false, true, true).is_some();
+            let o4 = gemm::native_mmv_mrow_variant_spv(dt, true, true, true).is_some();
+            assert_eq!(
+                m4, o4,
+                "{dt:?}: m4_res and o4_m4_res must both exist or neither"
+            );
+            assert_eq!(
+                gemm::native_mmv_mrow_res_supported(dt),
+                m4,
+                "{dt:?}: res predicate disagrees with the variant table"
+            );
+        }
+        for dt in [Iq4Xs, Q4K] {
+            assert!(
+                gemm::native_mmv_mrow_res_supported(dt),
+                "{dt:?} needs its _res builds"
+            );
+        }
     }
 
     #[test]

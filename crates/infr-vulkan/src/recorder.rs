@@ -7785,12 +7785,12 @@ impl<'a> Recorder<'a> {
         vd: usize,
         eps: f32,
     ) {
-        // The shader caches each column block's state [kd, 32] in shared memory (`ss[128*32]`), so kd
-        // must be ≤ 128. qwen35 uses kd=128; assert so a larger head_k_dim fails loudly instead of
-        // corrupting LDS.
+        // The shader keeps each thread's kd/8 state rows in a 16-entry register array and the
+        // normalized q/k in `qn[128]`/`kn[128]`, so kd must be ≤ 128. qwen35 uses kd=128; assert so
+        // a larger head_k_dim fails loudly instead of corrupting state.
         debug_assert!(
             kd <= 128,
-            "deltanet shared-state block assumes kd ≤ 128, got {kd}"
+            "deltanet register/shared layout assumes kd ≤ 128, got {kd}"
         );
         let kern = self
             .be
@@ -7803,8 +7803,9 @@ impl<'a> Recorder<'a> {
         push[16..20].copy_from_slice(&(vd as u32).to_ne_bytes());
         push[20..24].copy_from_slice(&eps.to_ne_bytes());
         push[24..28].copy_from_slice(&(1.0f32 / (kd as f32).sqrt()).to_ne_bytes());
-        // One workgroup per (value head, block of 32 state columns); local_size_x=32.
-        let n_blk = vd.div_ceil(32);
+        // One workgroup per (value head, block of 16 state columns); local_size_x=128 (16 columns
+        // × 8 key-row groups — see the shader header).
+        let n_blk = vd.div_ceil(16);
         self.dispatch(
             kern,
             &[

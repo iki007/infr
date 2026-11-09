@@ -526,10 +526,10 @@ fn mmv_decode_enabled(vk: &infr_core::config::VulkanCfg) -> bool {
 /// used to defer to, and it is now in place. MTP verify still runs Q5_K f32-exact (matching
 /// decode), so token-identity holds; only ordinary prefill takes the win.
 fn mmv_int8_decode_dtypes(
-    _caps: &infr_core::backend::Capabilities,
+    arch: crate::caps::DeviceArch,
     vk: &infr_core::config::VulkanCfg,
 ) -> &'static [infr_core::DType] {
-    use infr_core::DType::{Iq4Nl, Q2K, Q3K, Q4K, Q4_0, Q4_1, Q5K, Q5_0, Q5_1, Q6K, Q8_0};
+    use infr_core::DType::{Iq4Nl, Iq4Xs, Q2K, Q3K, Q4K, Q4_0, Q4_1, Q5K, Q5_0, Q5_1, Q6K, Q8_0};
     // `INFR_MMV_MW` is TRI-state — `mmv_mw: Option<bool>`, where `Some(false)` is the exact
     // string `"0"`, `Some(true)` any other value, and `None` (unset) the unified default below.
     match vk.mmv_mw {
@@ -537,7 +537,9 @@ fn mmv_int8_decode_dtypes(
         // Explicit opt-in: every dtype with an int8 decode arm, any vendor (the A/B measurement
         // escape). The legacy 32-block set is included so its decode tier is measurable without a
         // rebuild — none of them are on the DEFAULT set (see the `None` arm).
-        Some(true) => &[Q4K, Q6K, Q2K, Q3K, Q5K, Q8_0, Q4_0, Q5_0, Q4_1, Q5_1, Iq4Nl],
+        Some(true) => &[
+            Q4K, Q6K, Q2K, Q3K, Q5K, Q8_0, Q4_0, Q5_0, Q4_1, Q5_1, Iq4Nl, Iq4Xs,
+        ],
         // Unified default: the safe intersection of the old per-vendor sets — every dtype here is a
         // measured win on AMD (7900 XTX, Qwen3-14B). Unmeasured on Intel/NVIDIA but the kernels exist
         // for all vendors (unified rows=1 path) and `INFR_MMV_MW=1`/`INFR_MMV_MW=0` override for A/B.
@@ -547,6 +549,15 @@ fn mmv_int8_decode_dtypes(
         // Q5_K is OFF: decode -1.4% (noise) on AMD, prefill +45% is banked via mrow_int8_prefill_dtypes.
         // Q8_0 is OFF: -4.2% decode loss, structural (8-bit weight already fits dp4a, no ALU to save).
         // Q4_1 is OFF: ±0% wash on AMD decode.
+        //
+        // Intel Xe2 (MEASURED, Arc Pro B70, 2026-11-10) adds Q5_K and IQ4_XS: there the f32-exact
+        // GEMV they otherwise ride runs at ~176 GB/s against the int8 mrow kernel's ~410, so the
+        // AMD trade-off inverts. Qwen3.8-27B UD-Q4_K_M (4.5 GB Q5_K + 4.4 GB IQ4_XS) decode 15.7 ->
+        // 18.9 t/s; Qwen3.5-4B Q4_K_M 115.7 -> 119.8 (its Q5_K attn_qkv). The second arch-keyed
+        // rule in the backend (see `caps::DeviceArch`); every other device keeps the AMD set.
+        None if arch == crate::caps::DeviceArch::IntelXe2 => {
+            &[Q2K, Q4K, Q6K, Q4_0, Q5_0, Q5_1, Iq4Nl, Q5K, Iq4Xs]
+        }
         None => &[Q2K, Q4K, Q6K, Q4_0, Q5_0, Q5_1, Iq4Nl],
     }
 }
@@ -622,13 +633,13 @@ fn mrow_int8_prefill_dtypes(dt: infr_core::DType) -> bool {
 /// verify batch on either dtype could flip a greedy token vs plain decode. After this split, their
 /// MTP verify lands on the f32-exact path (matching decode) while ordinary prefill keeps the win.
 fn mrow_int8_dtype_ok(
-    caps: &infr_core::backend::Capabilities,
+    arch: crate::caps::DeviceArch,
     vk: &infr_core::config::VulkanCfg,
     dt: infr_core::DType,
     verify: bool,
 ) -> bool {
     if verify {
-        mmv_int8_decode_dtypes(caps, vk).contains(&dt)
+        mmv_int8_decode_dtypes(arch, vk).contains(&dt)
     } else {
         mrow_int8_prefill_dtypes(dt)
     }
@@ -650,12 +661,13 @@ fn unified_mmv_row1(_caps: &infr_core::backend::Capabilities) -> bool {
 
 fn mmv_mw_choice(
     caps: &infr_core::backend::Capabilities,
+    arch: crate::caps::DeviceArch,
     vk: &infr_core::config::VulkanCfg,
     dt: infr_core::DType,
     in_f: usize,
     out_f: usize,
 ) -> Option<u32> {
-    if !caps.i8_dot || !mmv_int8_decode_dtypes(caps, vk).contains(&dt) {
+    if !caps.i8_dot || !mmv_int8_decode_dtypes(arch, vk).contains(&dt) {
         return None;
     }
     // Skip tiny GEMVs where per-dispatch overhead dominates (k/v projections); the projection band
@@ -1222,9 +1234,14 @@ fn lower_op(
                 if native_dense_supported(dt) {
                     // Multi-warp dp4a decode GEMV (wave32-native GPUs) takes precedence — see
                     // `mmv_mw_choice`. AMD returns None here and falls to the scalar/old-mmv path.
-                    if let Some(warps) =
-                        mmv_mw_choice(be_.caps(), &be_.cfg().kernels.vulkan, dt, in_f, out_f)
-                    {
+                    if let Some(warps) = mmv_mw_choice(
+                        be_.caps(),
+                        be_.device_arch(),
+                        &be_.cfg().kernels.vulkan,
+                        dt,
+                        in_f,
+                        out_f,
+                    ) {
                         // FUSE_QUANT opt-in: inline activation quantization, skip the
                         // separate quant_q8 dispatch.
                         if be_.cfg().kernels.vulkan.mmv_fuse_quant {
@@ -1338,7 +1355,12 @@ fn lower_op(
                 && in_f * out_f >= 8 << 20
                 && out_f < 65536
                 && crate::gemm::native_mmv_mrow_kernel_name(dt).is_some()
-                && mrow_int8_dtype_ok(be_.caps(), &be_.cfg().kernels.vulkan, dt, graph.mtp_verify)
+                && mrow_int8_dtype_ok(
+                    be_.device_arch(),
+                    &be_.cfg().kernels.vulkan,
+                    dt,
+                    graph.mtp_verify,
+                )
                 && be_.cfg().kernels.vulkan.mmv;
             // rows 9..=16 int8 mrow tier (INFR_NO_MROW16 A/B escape): the MTP spec-verify batch
             // once its rollback window carries a few committed rows on top of the n_max drafts.
@@ -1806,7 +1828,14 @@ fn lower_op(
                         out_f,
                         &be_.cfg().kernels.vulkan,
                     ) {
-                    mmv_mw_choice(be_.caps(), &be_.cfg().kernels.vulkan, dt, in_f, out_f)
+                    mmv_mw_choice(
+                        be_.caps(),
+                        be_.device_arch(),
+                        &be_.cfg().kernels.vulkan,
+                        dt,
+                        in_f,
+                        out_f,
+                    )
                 } else {
                     None
                 };
@@ -6817,11 +6846,11 @@ mod tests {
 
     #[test]
     fn int8_decode_and_mrow_tiers_agree_on_policy_dtypes() {
-        let amd = infr_core::backend::Capabilities {
-            i8_dot: true,
-            ..Default::default()
-        };
-        let intel = infr_core::backend::Capabilities {
+        // The decode policy keys on the architecture bucket (`caps::DeviceArch`), not on caps:
+        // RDNA3 stands for the AMD-measured default every non-Xe2 device takes.
+        let amd = crate::caps::DeviceArch::AmdRdna3;
+        let intel = crate::caps::DeviceArch::IntelXe2;
+        let caps0 = infr_core::backend::Capabilities {
             i8_dot: true,
             ..Default::default()
         };
@@ -6834,10 +6863,10 @@ mod tests {
         };
         for mmv_mw in [None, Some(true), Some(false)] {
             let vk = vkcfg(mmv_mw);
-            for (caps, vendor) in [(&amd, "amd"), (&intel, "intel")] {
+            for (arch, vendor) in [(amd, "amd"), (intel, "intel")] {
                 for dt in POLICY_DTYPES {
-                    let decode_int8 = mmv_int8_decode_dtypes(caps, &vk).contains(&dt);
-                    let verify_int8 = mrow_int8_dtype_ok(caps, &vk, dt, true);
+                    let decode_int8 = mmv_int8_decode_dtypes(arch, &vk).contains(&dt);
+                    let verify_int8 = mrow_int8_dtype_ok(arch, &vk, dt, true);
                     assert_eq!(
                         decode_int8, verify_int8,
                         "{vendor} mmv_mw={mmv_mw:?} {dt:?}: decode int8={decode_int8} but \
@@ -6846,7 +6875,7 @@ mod tests {
                     // Ordinary prefill is NEVER more conservative than MTP-verify (the decode set
                     // is always a subset of the prefill set) — prefill has no partner to protect,
                     // so it can only be equal or more permissive.
-                    let prefill_int8 = mrow_int8_dtype_ok(caps, &vk, dt, false);
+                    let prefill_int8 = mrow_int8_dtype_ok(arch, &vk, dt, false);
                     assert!(
                         prefill_int8 || !verify_int8,
                         "{vendor} mmv_mw={mmv_mw:?} {dt:?}: verify int8={verify_int8} but \
@@ -6865,42 +6894,58 @@ mod tests {
         // Q3_K: OFF on every vendor — coherence cliff on mixed GGUFs (see
         // mmv_int8_decode_dtypes). Intel previously had it default-on; the unified set
         // drops it for safety. INFR_MMV_MW=1 still enables it for A/B.
-        assert!(!mmv_int8_decode_dtypes(&amd, &vk).contains(&DType::Q3K));
-        assert!(!mrow_int8_dtype_ok(&amd, &vk, DType::Q3K, true));
-        assert!(!mmv_int8_decode_dtypes(&intel, &vk).contains(&DType::Q3K));
+        assert!(!mmv_int8_decode_dtypes(amd, &vk).contains(&DType::Q3K));
+        assert!(!mrow_int8_dtype_ok(amd, &vk, DType::Q3K, true));
+        assert!(!mmv_int8_decode_dtypes(intel, &vk).contains(&DType::Q3K));
         // Q4_K is ON in the unified decode default: the throughput win (README footnote 3) is real.
-        assert!(mmv_int8_decode_dtypes(&amd, &vk).contains(&DType::Q4K));
-        assert!(mrow_int8_dtype_ok(&amd, &vk, DType::Q4K, true));
-        assert!(mmv_int8_decode_dtypes(&intel, &vk).contains(&DType::Q4K));
-        assert!(unified_mmv_row1(&amd), "rows=1 unified path must be on");
+        assert!(mmv_int8_decode_dtypes(amd, &vk).contains(&DType::Q4K));
+        assert!(mrow_int8_dtype_ok(amd, &vk, DType::Q4K, true));
+        assert!(mmv_int8_decode_dtypes(intel, &vk).contains(&DType::Q4K));
+        assert!(unified_mmv_row1(&caps0), "rows=1 unified path must be on");
         // Q2_K is ON in the unified decode default (+20.4% measured win on AMD).
-        assert!(mmv_int8_decode_dtypes(&amd, &vk).contains(&DType::Q2K));
-        assert!(mrow_int8_dtype_ok(&amd, &vk, DType::Q2K, true));
-        assert!(mmv_int8_decode_dtypes(&intel, &vk).contains(&DType::Q2K));
+        assert!(mmv_int8_decode_dtypes(amd, &vk).contains(&DType::Q2K));
+        assert!(mrow_int8_dtype_ok(amd, &vk, DType::Q2K, true));
+        assert!(mmv_int8_decode_dtypes(intel, &vk).contains(&DType::Q2K));
         // Q5_K: decode measured a small LOSS on AMD (66.8 int8 vs 67.8 f32, -1.4%; see
         // mmv_int8_decode_dtypes's doc) — OFF the decode/verify default on every vendor.
         // Its ordinary-prefill win (+45%) IS banked below regardless.
-        assert!(!mmv_int8_decode_dtypes(&amd, &vk).contains(&DType::Q5K));
-        assert!(!mrow_int8_dtype_ok(&amd, &vk, DType::Q5K, true));
+        assert!(!mmv_int8_decode_dtypes(amd, &vk).contains(&DType::Q5K));
+        assert!(!mrow_int8_dtype_ok(amd, &vk, DType::Q5K, true));
         // Q6_K: decode-ON since the word-parallel `wdec` rewrite (see `mmv_int8_decode_dtypes`).
         // Unified across all vendors.
-        assert!(mmv_int8_decode_dtypes(&amd, &vk).contains(&DType::Q6K));
-        assert!(mmv_int8_decode_dtypes(&intel, &vk).contains(&DType::Q6K));
-        assert!(!mrow_int8_dtype_ok(&amd, &vk, DType::Iq4Xs, true));
+        assert!(mmv_int8_decode_dtypes(amd, &vk).contains(&DType::Q6K));
+        assert!(mmv_int8_decode_dtypes(intel, &vk).contains(&DType::Q6K));
+        assert!(!mrow_int8_dtype_ok(amd, &vk, DType::Iq4Xs, true));
+        // Intel Xe2 adds Q5_K and IQ4_XS to decode AND verify (measured on an Arc Pro B70 — see
+        // `mmv_int8_decode_dtypes`); both stay off on every other architecture.
+        for dt in [DType::Q5K, DType::Iq4Xs] {
+            assert!(
+                mmv_int8_decode_dtypes(intel, &vk).contains(&dt),
+                "{dt:?} Xe2 decode"
+            );
+            assert!(
+                mrow_int8_dtype_ok(intel, &vk, dt, true),
+                "{dt:?} Xe2 verify"
+            );
+            assert!(
+                !mmv_int8_decode_dtypes(amd, &vk).contains(&dt),
+                "{dt:?} non-Xe2 decode"
+            );
+        }
         // The legacy 32-block set's decode default is a MEASURED split (see
         // `mmv_int8_decode_dtypes`): Q4_0/Q5_0/Q5_1/IQ4_NL win at m=1 and are ON; Q8_0 LOSES
         // (−4.2%) and Q4_1 washes, so both are decode-OFF and prefill-ONLY. Unified across all
         // vendors — spelled out so a "finish the set" edit has to face the numbers.
-        for caps in [&amd, &intel] {
+        for arch in [amd, intel] {
             for dt in [DType::Q4_0, DType::Q5_0, DType::Q5_1, DType::Iq4Nl] {
                 assert!(
-                    mmv_int8_decode_dtypes(caps, &vk).contains(&dt),
+                    mmv_int8_decode_dtypes(arch, &vk).contains(&dt),
                     "{dt:?} decode"
                 );
             }
             for dt in [DType::Q8_0, DType::Q4_1] {
                 assert!(
-                    !mmv_int8_decode_dtypes(caps, &vk).contains(&dt),
+                    !mmv_int8_decode_dtypes(arch, &vk).contains(&dt),
                     "{dt:?}: decode measured a loss/wash — prefill-only, do not flip without a number"
                 );
                 assert!(mrow_int8_prefill_dtypes(dt), "{dt:?} prefill win must stay");
@@ -6909,17 +6954,17 @@ mod tests {
         // Every dtype's ORDINARY PREFILL is unconditionally on regardless of the decode/verify
         // policy above — this is the actual point of the split: prefill has no partner to protect.
         // Unified across all vendors.
-        for caps in [&amd, &intel] {
+        for arch in [amd, intel] {
             for dt in POLICY_DTYPES {
                 assert!(
-                    mrow_int8_dtype_ok(caps, &vk, dt, false),
+                    mrow_int8_dtype_ok(arch, &vk, dt, false),
                     "{dt:?} ordinary-prefill mrow must stay on"
                 );
             }
         }
         // Intel now takes the same unified rows=1 path (unconditional, part of the
         // capability-first architecture).
-        assert!(unified_mmv_row1(&intel));
+        assert!(unified_mmv_row1(&caps0));
     }
 
     /// The drift guard the SSOT lists promise (`infr_core::tensor::MOE_MMQ_DTYPES`'s doc): every

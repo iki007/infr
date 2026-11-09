@@ -3409,3 +3409,21 @@ of a ~16 ms token, mostly fixed per-dispatch cost. TensorFold's XPU port fuses
 residual add + RMSNorm + activation quantization into one kernel. The
 `quant_q8` that follows a norm is the obvious first fusion. Bit-identical if the
 fused kernel keeps the same per-block `amax` and rounding.
+
+### B106 — host-sampled decode still writes the [vocab] logits into host memory (2026-11-10)
+
+**Tag:** vulkan · perf · decode · Intel · **Blocked on:** nothing; scoped out of
+the B70 decode slice
+
+The seam binds the decode graph's logits to the device-local `SeamKv::logits_dev`
+only when the call samples on the GPU (`Op::Argmax`/`Op::Sample`) and nothing
+downloads the row. Every other call still binds the host-visible `logits_buf`
+(`Readback`). That covers grammar-constrained decodes, penalties, `top_k == 0`,
+logprobs, and the `logits_out` hook, which read the row every step. On an Arc
+Pro B70 the LM head's scattered stores into system memory cost ~5.5 ms per token
+(Qwen3.5-4B: 62.8 t/s host-sampled against 120 GPU-sampled;
+`docs/intel-b70.md`). The fix is to always write `logits_dev`, then copy it to
+`logits_buf` with one recorded `vkCmdCopyBuffer` at the end of the step when the
+host wants the row: a 1 MB DMA instead of 248k PCIe stores. It needs a copy op
+in the decode graph or the replay tape. `be.download` from a device buffer would
+also work, but it allocates a staging buffer and does a blocking submit per call.

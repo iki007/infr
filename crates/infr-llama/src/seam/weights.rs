@@ -304,6 +304,12 @@ pub(crate) struct SeamKv {
     pub(super) pos_buf: Box<dyn Buffer>,
     pub(super) ipl_buf: Option<Box<dyn Buffer>>,
     pub(super) logits_buf: Box<dyn Buffer>,
+    /// Device-local twin of `logits_buf`: the decode graph's logits go HERE whenever the call
+    /// samples on the GPU (`Op::Argmax`/`Op::Sample`) and nothing downloads the row, so the LM head
+    /// writes VRAM. `logits_buf` is host memory (`Readback`), and on an Intel Arc Pro B70 the LM
+    /// head's scattered stores into system memory cost ~5.5 ms per token (a 248k-vocab Q6_K head:
+    /// 1.15 ms into VRAM, 7.0 ms into `Readback` — docs/intel-b70.md).
+    pub(super) logits_dev: Box<dyn Buffer>,
     /// The context this slot's KV cache was ACTUALLY allocated for. Usually the `want_ctx` the
     /// caller asked for; smaller when the cold init's live-room re-clamp shrank it (see
     /// `crate::seam::reclamp_ctx_to_live_room`), which is why callers holding a `want_ctx` of
@@ -587,6 +593,9 @@ impl SeamKv {
             },
             logits_buf: be
                 .alloc(cfg.vocab * 4, BufferUsage::Readback)
+                .map_err(|e| anyhow!("{e}"))?,
+            logits_dev: be
+                .alloc(cfg.vocab * 4, BufferUsage::Activations)
                 .map_err(|e| anyhow!("{e}"))?,
             max_ctx: self.max_ctx,
             kv_ring: self.kv_ring,
