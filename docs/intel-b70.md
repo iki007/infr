@@ -42,9 +42,9 @@ INFR_DEV=Vulkan1 cargo test --release -p infr-vulkan --no-fail-fast -- --include
 
 | model                       | infr first run | infr now  | llama.cpp Vulkan | llama.cpp SYCL |
 | --------------------------- | -------------- | --------- | ---------------- | -------------- |
-| Qwen3.5-4B Q4_K_M pp512     | 1571           | **3504**  | 3165             | 7031           |
+| Qwen3.5-4B Q4_K_M pp512     | 1571           | **3611**  | 3165             | 7031           |
 | Qwen3.5-4B Q4_K_M tg128     | 62.6           | **149.2** | 111.2            | 148.5          |
-| Qwen3.8-27B UD-Q4_K_M pp512 | 220            | 624       | 746              | 1087           |
+| Qwen3.8-27B UD-Q4_K_M pp512 | 220            | 634       | 746              | 1087           |
 | Qwen3.8-27B UD-Q4_K_M tg128 | 13.8           | **28.8**  | 23.1             | 29.9           |
 
 llama.cpp at `0f236bc21`; its 27B decode row is tg64. "infr first run" is
@@ -177,14 +177,16 @@ hd=128. At 512 tokens it took 3.8 ms per hd=256 layer on Qwen3.5-4B (llama.cpp:
 `attn_xmx_fa.comp` is its drop-in on an 8x16x16 coopmat device (same push,
 bindings and semantics: causal, sliding window, ring KV rows, GQA), selected
 inside `Recorder::attention_prefill_nc_fa` for hd 128/256. 32 query rows x 32
-keys per block, 128 threads; S and P go through shared memory for the mask and
-the online softmax (4 lanes per row, clustered reductions); O stays in
-registers for the whole kv loop. A coopmat's element-to-row mapping is
-implementation-defined, so the kernel reads it once from a probe matrix
-(element (r, c) = r, resp. c) and uses it for the per-row rescale and the
-final bounded write. The recorder's CPU-reference test
-(`attention_prefill_nc_fa_matches_cpu`, windows and ring caches included)
-passes on it. 0.96 ms per 4B layer at 512 tokens.
+keys per block, 256 threads (QK on 8 warps, PV on all 16); S and P go through
+shared memory for the mask and the online softmax (8 lanes per row, clustered
+reductions); O stays in registers for the whole kv loop, 4 fragments per warp.
+A coopmat's element-to-row mapping is implementation-defined, so the kernel
+reads it once from a probe matrix into a per-lane row/column table in shared
+memory, used for the per-row rescale and the final bounded write. The first
+version (128 threads, 8 O fragments per warp, the maps in registers) spilled
+164 registers per Mesa's compile stats; this one 6. The recorder's
+CPU-reference test (`attention_prefill_nc_fa_matches_cpu`, windows and ring
+caches included) passes on it.
 
 Also in this slice: consecutive `_x256` GEMMs on the same activation reuse its
 f16 copy (`mmv_memo`; 396 → 253 `store_f16` per 27B pp512), the IQ4_XS/IQ4_NL
@@ -192,11 +194,16 @@ f16 copy (`mmv_memo`; 396 → 253 `store_f16` per 27B pp512), the IQ4_XS/IQ4_NL
 (`-DIQ4_LUT`; IQ4_XS gate/up 2.6 → 2.3 ms, now level with Q4_K), and IQ3_S
 gets an `_x256` build (it had only the int8 mmq GEMM: 7.2 ms per 17408x5120).
 
-| prefill t/s    | before | after | llama.cpp Vulkan |
-| -------------- | ------ | ----- | ---------------- |
-| 4B pp512       | 3070   | 3504  | 3165             |
-| 4B pp2048      | 2365   | 3342  | 2802             |
-| 27B pp512      | 558    | 624   | 746              |
+| prefill t/s    | before | 128 threads | 256 threads | llama.cpp Vulkan |
+| -------------- | ------ | ----------- | ----------- | ---------------- |
+| 4B pp512       | 3070   | 3504        | 3611        | 3165             |
+| 4B pp2048      | 2365   | 3342        | 3609        | 2802             |
+| 27B pp512      | 558    | 624         | 634         | 746              |
+
+The `_x256` GEMMs still spill (117 registers): the 64 accumulator registers of
+the 32x32 warp tile plus the 32-float block decode buffer. A 1024-thread
+32x16-warp variant (4B pp512 3370) and a non-unrolled k loop (2752) were both
+slower; the fix would be a half-block decode per format.
 
 What is left on the 27B (846 ms of GPU per pp512): the GEMMs at ~40 TFLOPS
 against llama.cpp's ~53 (5120x17408 2.3 vs 1.70 ms) are ~80% of it; then
@@ -456,8 +463,8 @@ Each slice is measured against the numbers above on `Vulkan1`.
 9. **Done.** Prefill: the `_x256` tile, above. Qwen3.5-4B pp512 2380 → 3070,
    Qwen3.8-27B 376 → 558.
 10. **Done.** XMX flash attention, the f16 conversion memo, the IQ4 table in
-    the GEMM decode, IQ3_S `_x256` (above). Qwen3.5-4B pp512 3070 → 3504,
-    pp2048 2365 → 3342; Qwen3.8-27B pp512 558 → 624.
+    the GEMM decode, IQ3_S `_x256` (above). Qwen3.5-4B pp512 3070 → 3611,
+    pp2048 2365 → 3609; Qwen3.8-27B pp512 558 → 634.
 11. Next: the `_x256` GEMM's remaining gap to llama.cpp (~40 vs ~53 TFLOPS),
     the m>1 alpha/beta projections, then the IQ4_XS decode lookup and the
     attention output → `o_proj` quant on dense models.

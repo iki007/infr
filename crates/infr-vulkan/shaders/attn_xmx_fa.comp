@@ -5,20 +5,22 @@
 // q/dst rows NOT padded). The 16x16x16 flash kernels (attn_flash*.comp) need a fragment shape and
 // a 32-lane subgroup this device does not have, and hd=256 (qwen35) exceeds their fixed hd=128.
 //
-// Tile: BM=32 query rows of one head per workgroup, BN=32 keys per block, 128 threads = 8
-// subgroups. Per block:
+// Tile: BM=32 query rows of one head per workgroup, BN=32 keys per block, 256 threads = 16
+// subgroups (QK on warps 0..7, PV on all 16). Per block:
 //   1. K block -> KVs (f16, zero-filled past kv_len), barrier.
 //   2. S = Q·Kᵀ: 8 warps x one 8x16 S fragment each (HD/16 k-steps, Q from Qs staged once),
 //      stored to Ss (f32), barrier.
 //   3. V block -> KVs; one thread per row: mask, online softmax, P (f16) -> Ps, rescale factor.
 //      barrier.
-//   4. O += P·V: each warp owns rows [mi*8, +8) x HD/2 dims as HD/32 accumulator fragments, in
+//   4. O += P·V: each warp owns rows [mi*8, +8) x HD/4 dims as HD/64 accumulator fragments, in
 //      REGISTERS for the whole kv loop. The per-row rescale needs each accumulator element's row:
 //      the element mapping of a coopmat is implementation-defined, so it is read once at the top
-//      from a probe matrix (element (r, c) = r, resp. c) loaded into an accumulator.
+//      from a probe matrix (element (r, c) = r*16 + c) into a per-lane row/col table in shared
+//      memory (`rowcol`).
 //      barrier.
-// Rows and columns of the output come from the same probe, so the final normalized O is written
-// element-wise straight to global with the q_len bound.
+// The final normalized O is written element-wise straight to global through the same table,
+// with the q_len bound. 256 threads with 4 O fragments per warp: at 128 threads x 8 fragments
+// the hd=256 build spilled 164 registers (Arc Pro B70, Mesa ANV); now 6.
 //
 // Requires requiredSubgroupSize=16 and the 8x16x16 f16 coopmat shape. -DHD=128|256.
 #extension GL_KHR_cooperative_matrix : require
@@ -35,12 +37,12 @@
 #endif
 const uint BM = 32u;
 const uint BN = 32u;
-const uint THREADS = 128u;
-const uint DPW = HD / 2u;           // dims per warp in the PV phase
-const uint NF = DPW / 16u;          // O fragments per warp (8 at hd=256, 4 at hd=128)
+const uint THREADS = 256u;
+const uint DPW = HD / 4u;           // dims per warp in the PV phase (4 warps per 8-row group)
+const uint NF = DPW / 16u;          // O fragments per warp (4 at hd=256, 2 at hd=128)
 const uint QS4 = HD / 4u + 2u;      // Qs/KVs row pitch in f16vec4s (+2: de-conflict)
 
-layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
 layout(push_constant) uniform PC {
     uint q_len;
@@ -66,6 +68,10 @@ shared float mrow[BM];
 shared float lrow[BM];
 shared float corr[BM];
 shared float probe[8u * 16u];
+// Accumulator element -> (row, col) for each lane, read off a probe matrix once (see the header):
+// rowcol[lane * 8 + e] = row | col << 8. Kept in shared memory, not in two probe coopmats' worth
+// of registers.
+shared uint rowcol[16u * 8u];
 
 void main() {
     uint qt = gl_WorkGroupID.x / pc.nh;
@@ -90,22 +96,27 @@ void main() {
         mrow[li] = -1e30;
         lrow[li] = 0.0;
     }
-    probe[li] = float(li / 16u); // row index of element (li/16, li%16) of an 8x16 matrix
+    if (li < 128u) {
+        probe[li] = float(li); // element (r, c) of an 8x16 matrix holds r * 16 + c
+    }
     barrier();
-    coopmat<float, gl_ScopeSubgroup, 8, 16, gl_MatrixUseAccumulator> rmapm;
-    coopMatLoad(rmapm, probe, 0, 16, gl_CooperativeMatrixLayoutRowMajor);
+    if (warp == 0u) {
+        coopmat<float, gl_ScopeSubgroup, 8, 16, gl_MatrixUseAccumulator> pm;
+        coopMatLoad(pm, probe, 0, 16, gl_CooperativeMatrixLayoutRowMajor);
+        for (uint e = 0u; e < uint(pm.length()); e++) {
+            uint rc = uint(pm[e]);
+            rowcol[gl_SubgroupInvocationID * 8u + e] = (rc / 16u) | ((rc % 16u) << 8u);
+        }
+    }
     barrier();
-    probe[li] = float(li % 16u);
-    barrier();
-    coopmat<float, gl_ScopeSubgroup, 8, 16, gl_MatrixUseAccumulator> cmapm;
-    coopMatLoad(cmapm, probe, 0, 16, gl_CooperativeMatrixLayoutRowMajor);
 
-    // This warp's QK fragment (S rows si*8.., keys sj*16..) and PV slice (rows mi*8.., dims
-    // dh*DPW..).
-    uint si = warp / 2u;
+    // QK: warps 0..7 each own one S fragment (rows si*8.., keys sj*16..). PV: all 16 warps, rows
+    // mi*8.. x dims dh*DPW...
+    uint si = (warp % 8u) / 2u;
     uint sj = warp % 2u;
-    uint mi = warp / 2u;
-    uint dh = warp % 2u;
+    uint mi = warp / 4u;
+    uint dh = warp % 4u;
+    uint lane8 = gl_SubgroupInvocationID * 8u;
     coopmat<float, gl_ScopeSubgroup, 8, 16, gl_MatrixUseAccumulator> oacc[NF];
     [[unroll]] for (uint f = 0u; f < NF; f++) {
         oacc[f] = coopmat<float, gl_ScopeSubgroup, 8, 16, gl_MatrixUseAccumulator>(0.0);
@@ -127,7 +138,8 @@ void main() {
                                                    : f16vec4(0.0);
         }
         barrier();
-        // 2. S fragment
+        // 2. S fragment (warps 0..7)
+        if (warp < 8u) {
         coopmat<float, gl_ScopeSubgroup, 8, 16, gl_MatrixUseAccumulator> sacc =
             coopmat<float, gl_ScopeSubgroup, 8, 16, gl_MatrixUseAccumulator>(0.0);
         [[unroll]] for (uint kf = 0u; kf < HD; kf += 16u) {
@@ -139,6 +151,7 @@ void main() {
             sacc = coopMatMulAdd(qf, kf_, sacc);
         }
         coopMatStore(sacc, Ss, si * 8u * BN + sj * 16u, BN, gl_CooperativeMatrixLayoutRowMajor);
+        }
         barrier();
         // 3. V block (K is consumed) + online softmax, one thread per row
         for (uint idx = li; idx < BN * hd4; idx += THREADS) {
@@ -149,34 +162,34 @@ void main() {
                                                    : f16vec4(0.0);
         }
         {
-            // 4 adjacent lanes per row, 8 keys each; the row max and sum reduce over the 4-lane
+            // 8 adjacent lanes per row, 4 keys each; the row max and sum reduce over the 8-lane
             // cluster.
-            uint row = li / 4u;
-            uint j0 = (li % 4u) * 8u;
+            uint row = li / 8u;
+            uint j0 = (li % 8u) * 4u;
             uint qpos = pc.pos + qr0 + row;
             uint lo_r = (pc.window > 0u && qpos + 1u > pc.window) ? qpos + 1u - pc.window : 0u;
-            float sv[8];
+            float sv[4];
             float lmax = -1e30;
-            [[unroll]] for (uint j = 0u; j < 8u; j++) {
+            [[unroll]] for (uint j = 0u; j < 4u; j++) {
                 uint kpos = b0 + j0 + j;
                 bool dead = kpos >= pc.kv_len || kpos > qpos || kpos < lo_r;
                 sv[j] = dead ? -1e30 : Ss[row * BN + j0 + j] * scale;
                 lmax = max(lmax, sv[j]);
             }
             float mold = mrow[row];
-            float rmax = max(mold, subgroupClusteredMax(lmax, 4u));
+            float rmax = max(mold, subgroupClusteredMax(lmax, 8u));
             float lsum = 0.0;
-            [[unroll]] for (uint j = 0u; j < 8u; j++) {
+            [[unroll]] for (uint j = 0u; j < 4u; j++) {
                 float p = (sv[j] > -1e29) ? exp(sv[j] - rmax) : 0.0;
                 Ps[row * BN + j0 + j] = float16_t(p);
                 lsum += p;
             }
-            float rsum = subgroupClusteredAdd(lsum, 4u);
+            float rsum = subgroupClusteredAdd(lsum, 8u);
             float cf = exp(mold - rmax);
             // Every lane of the cluster read mrow[row] above; the barrier-free write is safe
             // because only lane 0 writes and the other three no longer read it.
             subgroupBarrier();
-            if ((li % 4u) == 0u) {
+            if ((li % 8u) == 0u) {
                 lrow[row] = lrow[row] * cf + rsum;
                 mrow[row] = rmax;
                 corr[row] = cf;
@@ -186,7 +199,7 @@ void main() {
         // 4. rescale this warp's O rows, then O += P·V
         [[unroll]] for (uint f = 0u; f < NF; f++) {
             for (uint e = 0u; e < uint(oacc[f].length()); e++) {
-                oacc[f][e] *= corr[mi * 8u + uint(rmapm[e])];
+                oacc[f][e] *= corr[mi * 8u + (rowcol[lane8 + e] & 0xFFu)];
             }
         }
         [[unroll]] for (uint kk = 0u; kk < BN; kk += 16u) {
@@ -206,11 +219,12 @@ void main() {
     // cmap[e].
     [[unroll]] for (uint f = 0u; f < NF; f++) {
         for (uint e = 0u; e < uint(oacc[f].length()); e++) {
-            uint r = mi * 8u + uint(rmapm[e]);
+            uint rc = rowcol[lane8 + e];
+            uint r = mi * 8u + (rc & 0xFFu);
             uint gr = qr0 + r;
             if (gr < pc.q_len) {
                 float l = lrow[r];
-                uint d = dh * DPW + f * 16u + uint(cmapm[e]);
+                uint d = dh * DPW + f * 16u + (rc >> 8u);
                 o[(gr * pc.nh + h) * HD + d] = (l > 0.0) ? oacc[f][e] / l : 0.0;
             }
         }
