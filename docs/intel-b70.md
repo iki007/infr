@@ -42,13 +42,13 @@ INFR_DEV=Vulkan1 cargo test --release -p infr-vulkan --no-fail-fast -- --include
 
 | model                       | infr first run | infr now  | llama.cpp Vulkan | llama.cpp SYCL |
 | --------------------------- | -------------- | --------- | ---------------- | -------------- |
-| Qwen3.5-4B Q4_K_M pp512     | 1571           | 2380      | 3165             | 7031           |
+| Qwen3.5-4B Q4_K_M pp512     | 1571           | 3070      | 3165             | 7031           |
 | Qwen3.5-4B Q4_K_M tg128     | 62.6           | **149.2** | 111.2            | 148.5          |
-| Qwen3.8-27B UD-Q4_K_M pp512 | 220            | 376       | 746              | 1087           |
+| Qwen3.8-27B UD-Q4_K_M pp512 | 220            | 558       | 746              | 1087           |
 | Qwen3.8-27B UD-Q4_K_M tg128 | 13.8           | **28.8**  | 23.1             | 29.9           |
 
 llama.cpp at `0f236bc21`; its 27B decode row is tg64. "infr first run" is
-`f568ff7`. "infr now" is prefill after plan slice 3 and decode after slice 8. Prefill moved in slice 2,
+`f568ff7`. "infr now" is after plan slice 9. Prefill moved in slices 2 and 9,
 `INFR_NO_COOPMAT=1` still gives the first-run prefill numbers, and that is how
 the A/B was taken. infr's 27B prefill
 arms the submit splitter (`split/185`, `split/244`). That is a symptom of the
@@ -130,6 +130,41 @@ Both use the shader's new `XE_WM`/`XE_WN` per-warp overrides and a `ROW_GUARD`,
 because C is padded to 64 rows, not 128. Still open: the remaining 1.3x / 2x to
 llama.cpp. Candidates are an f16-A (`A_GLOBAL`) variant to drop the As stage, the
 attention and DeltaNet prefill kernels, and the formats without a build.
+
+### Prefill: the 256-row XMX tile (plan slice 9)
+
+The `_cm816` tile (128 rows x 256 columns, 1024 threads, BK=32) decoded each
+weight block once per 128-row tile, with one thread per 32-element block: a
+quarter of the threads did all the decoding while the rest waited at the
+barrier. llama.cpp's Xe2 config (512 threads, 128 weight rows x 256 tokens,
+32x32 warp tiles) reached ~53 TFLOPS on the same shapes against our ~19–23.
+
+`_x256` (`gemm::native_gemm_warp_x256`, m >= 256): 256 rows x 128 columns,
+BK=128, 512 threads as 32 warps of 32x32 (4x2 8x16 fragments), A converted to
+f16 once and read from global (A_GLOBAL), so LDS holds only the 34 KB weight
+tile. Every thread decodes exactly one block per stage, each block serves 256
+rows, and there are a quarter of the barriers. Each output still accumulates
+over K in 16-wide steps in order, so the generated text is byte-identical to
+the old tile (checked on a 400-token prompt); `shared_decode_parity` gains an
+m=300 case.
+
+| m=512 GEMM (Qwen3.8-27B)    | `_cm816` | `_x256` | llama.cpp |
+| --------------------------- | -------- | ------- | --------- |
+| IQ4_XS 5120x17408           | 4.9 ms   | 2.3 ms  | 1.70 ms   |
+| Q4_K 5120x17408             | 3.9 ms   | 2.2 ms  | 1.70 ms   |
+| Q5_K 17408x5120             | 4.5 ms   | 2.7 ms  | 2.31 ms   |
+
+| Qwen3.5-4B | pp128 | pp256 | pp512 | pp1024 | pp2048 |
+| ---------- | ----- | ----- | ----- | ------ | ------ |
+| before     | 1734  | 2411  | 2380  | 2319   | 1977   |
+| `_x256`    | 1738  | 2952  | 3070  | 2874   | 2365   |
+| llama.cpp  | 1394  | 3131  | 3165  | 3030   | 2802   |
+
+Qwen3.8-27B pp512 376 → 558 (llama.cpp 746). What its pp512 spends now
+(918 ms of GPU): the GEMMs ~65%, the 16 hd256 flash-attention layers 91 ms
+(5.7 ms each), `deltanet_seq` 37 ms, the 5120x48 alpha/beta GEMVs 32 ms (the
+per-row GEMV at m=512), IQ3_S's mmq GEMM 21 ms, and 396 `store_f16` A
+conversions 18 ms.
 
 ### Decode: three ops were the whole gap
 
@@ -380,8 +415,11 @@ Each slice is measured against the numbers above on `Vulkan1`.
    measured and is not the limit; the mrow GEMV is at ~560 GB/s on big shapes.
 8. **Done.** The IQ3_S int8 mrow build, and the 27B decode attribution above.
    Qwen3.8-27B tg128 28.4 → 28.8.
-9. Next: the IQ4_XS lookup (~0.8 ms per 27B token), the attention output →
-   `o_proj` quant on dense models, then prefill.
+9. **Done.** Prefill: the `_x256` tile, above. Qwen3.5-4B pp512 2380 → 3070,
+   Qwen3.8-27B 376 → 558.
+10. Next: prefill's hd256 flash attention, the m=512 alpha/beta GEMVs and the
+    repeated `store_f16`; then the IQ4_XS decode lookup (~0.8 ms per 27B
+    token) and the attention output → `o_proj` quant on dense models.
 
 ## MTP (speculative decode, `INFR_MTP=1`)
 

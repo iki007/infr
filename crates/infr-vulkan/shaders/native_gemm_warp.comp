@@ -90,7 +90,12 @@ const uint THREADS = WG_THREADS;
 #else
 #define WN_DEF(x) x
 #endif
-#ifdef BM128
+#ifdef BM256
+// -DBM256 (the Intel Xe2 `_x256` builds, always with XE_WM/XE_WN, A_GLOBAL and BK128): 256 rows
+// per tile, so each staged weight tile serves twice the rows the 128-row tile does.
+const uint BM = 256u;
+const uint WM = WM_DEF(64u);
+#elif defined(BM128)
 const uint BM = 128u;
 const uint WM = WM_DEF(64u);
 #elif defined(BM32)
@@ -107,6 +112,11 @@ const uint WM = WM_DEF(32u);
 const uint BN = 128u;
 #ifdef BK32
 const uint BK = 32u;
+#elif defined(BK128)
+// -DBK128 (`_x256`): 128 columns x 4 k-blocks = 512 decode slots per stage, one per thread of a
+// 512-thread workgroup, and a quarter of the 32-deep stages' barriers. LDS is Bs only (A_GLOBAL):
+// 128 x 136 halves = 34 KB.
+const uint BK = 128u;
 #else
 const uint BK = 64u;
 #endif

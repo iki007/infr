@@ -1729,7 +1729,29 @@ fn lower_op(
                         && be_.caps().bf16_coopmat()
                         && (bf16cm_wide || bf16cm_narrow)
                         && be_.cfg().kernels.vulkan.bf16_coopmat;
-                    if cm8_ok {
+                    // Intel Xe2 at m >= 256: the 256-row `_x256` tile (see
+                    // `gemm::native_gemm_warp_x256`) — half the weight decodes of the 128-row
+                    // `_cm816` tile, spread over every thread. Qwen3.5-4B pp512 2380 -> 3070,
+                    // Qwen3.8-27B 376 -> 558 (Arc Pro B70).
+                    let x256 = cm8_ok
+                        && m >= 256
+                        && be_.caps().f16_coopmat_8x16()
+                        && crate::gemm::native_gemm_warp_x256(dt, out_f, in_f).is_some();
+                    if x256 {
+                        let mpad = m.div_ceil(256) * 256;
+                        let k16 = pooled(pool, be_, "lin_a16_x256", mpad * in_f * 2)?;
+                        rec.store_f16(xb, pool[&k16].as_ref(), m * in_f, 0);
+                        rec.matmul_native_x256(
+                            dt,
+                            pool[&k16].as_ref(),
+                            w,
+                            w_off,
+                            out,
+                            m,
+                            in_f,
+                            out_f,
+                        );
+                    } else if cm8_ok {
                         // `_cm8`/`_cm816` XMX warptile (see the `cm8_ok` doc above). First in the
                         // chain: when it's true, `caps.f16_coopmat()` is false (the shapes are
                         // mutually exclusive), so every 16x16x16 branch below would mis-dispatch —

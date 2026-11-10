@@ -1562,6 +1562,49 @@ pub(crate) struct XmxGemm {
     pub bn: usize,
 }
 
+/// The Intel Xe2 large-m prefill tile (`native_gemm_warp.comp` `_x256`: BM=256 rows x BN=128
+/// columns, BK=128, 512 threads as 32 warps of 32x32, A read from global as f16). `None` for a
+/// dtype without the build or `n % 128 != 0` / `k % 128 != 0`; the caller then keeps
+/// [`native_gemm_warp_xmx`]'s tiles.
+pub(crate) fn native_gemm_warp_x256(
+    dtype: infr_core::DType,
+    n: usize,
+    k: usize,
+) -> Option<XmxGemm> {
+    use infr_core::DType::*;
+    macro_rules! v {
+        ($name:literal) => {{
+            static S: OnceLock<Vec<u32>> = OnceLock::new();
+            (
+                $name,
+                S.get_or_init(|| {
+                    spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))
+                })
+                .as_slice(),
+            )
+        }};
+    }
+    if !n.is_multiple_of(128) || !k.is_multiple_of(128) {
+        return None;
+    }
+    let (name, spv) = match dtype {
+        Q4K => v!("native_gemm_warp_q4k_x256"),
+        Q5K => v!("native_gemm_warp_q5k_x256"),
+        Q6K => v!("native_gemm_warp_q6k_x256"),
+        Q8_0 => v!("native_gemm_warp_q8_0_x256"),
+        Q3K => v!("native_gemm_warp_q3k_x256"),
+        Iq4Xs => v!("native_gemm_warp_iq4xs_x256"),
+        Iq4Nl => v!("native_gemm_warp_iq4nl_x256"),
+        _ => return None,
+    };
+    Some(XmxGemm {
+        name,
+        spv,
+        bm: 256,
+        bn: 128,
+    })
+}
+
 /// The Intel XMX warptile for a GEMM of `n` output columns over `k`, by the device's selected f16
 /// coopmat `shape` (lib.rs `select_coopmat_shape`):
 ///

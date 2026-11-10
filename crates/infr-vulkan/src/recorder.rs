@@ -2197,6 +2197,40 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    /// The Intel Xe2 large-m prefill tile (`gemm::native_gemm_warp_x256`): `a16` is A converted
+    /// to f16 and padded to ceil(m/256)·256 rows (the tile reads whole 256-row blocks; rows past
+    /// `m` only reach output rows past `m`, which ROW_GUARD skips or the caller's padded `c`
+    /// absorbs). Caller guarantees the build exists for `dtype` at this n/k.
+    #[allow(clippy::too_many_arguments)]
+    pub fn matmul_native_x256(
+        &self,
+        dtype: infr_core::DType,
+        a16: &dyn Buffer,
+        w: &dyn Buffer,
+        w_base: usize,
+        c: &dyn Buffer,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) {
+        let t = crate::gemm::native_gemm_warp_x256(dtype, n, k).expect("x256 GEMM spv");
+        self.label_gemm(t.name, m, k, n);
+        let kern = self.be.kernel_sg(t.name, t.spv, 3, 16, 16);
+        let mut push = [0u8; 16];
+        push[0..4].copy_from_slice(&(m as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(n as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(k as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(w_base as u32).to_ne_bytes());
+        let groups = (m.div_ceil(t.bm) * (n / t.bn)) as u32;
+        self.dispatch(
+            kern,
+            &[Self::vkb(a16), Self::vkb(w), Self::vkb(c)],
+            1,
+            &push,
+            groups,
+        );
+    }
+
     /// [`matmul_native_off`](Self::matmul_native_off) with A already converted to f16 (padded to
     /// ceil(m/64)·64 rows) — the A_GLOBAL warptiles coopMatLoad A straight from global, dropping
     /// the As stage/LDS (occupancy 2→3 wgs/WGP: ~1.5x on the 8B shapes). Same tile pick as the

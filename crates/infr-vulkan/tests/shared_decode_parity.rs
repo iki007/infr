@@ -73,6 +73,8 @@ fn vulkan_linear_all_weight_quants_m4_match_the_host_oracle() {
 /// * m=40, 512x256: under one 128-row Xe2 tile (its `ROW_GUARD` skips the fragments past `m`),
 ///   n%256 == 0 (the wide `_cm816` build).
 /// * m=200, 512x384: two row tiles with a partial last one, n%256 != 0 (the `_cm816_n128` build).
+/// * m=300, 512x384: m >= 256 takes the 256-row `_x256` tile on Xe2 (A converted to f16 and
+///   padded to 512 rows, BK=128), a partial second row tile.
 ///
 /// f16 activations (coopmat) or int8 activations (`nc_mmq`) put the error in the same ~5e-3 band
 /// the m=4 tier documents, well under [`VK_TOL`]; a mis-decoded format or a wrong fragment layout
@@ -88,6 +90,8 @@ fn vulkan_linear_all_weight_quants_gemm_tier_match_the_host_oracle() {
     sweep_linear_on("vulkan Linear m=40", &be, &cases, |_| VK_TOL).assert_ok();
     let cases = weight_quant_cases(200, 512, 384);
     sweep_linear_on("vulkan Linear m=200", &be, &cases, |_| VK_TOL).assert_ok();
+    let cases = weight_quant_cases(300, 512, 384);
+    sweep_linear_on("vulkan Linear m=300", &be, &cases, |_| VK_TOL).assert_ok();
 }
 
 /// The dense float weight paths, which take no quant decode — the oracle reads the SAME bytes the
