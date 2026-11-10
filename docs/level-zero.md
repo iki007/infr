@@ -274,12 +274,32 @@ INFR_ZE_VK=1 cargo test --release -p infr-vulkan --lib ze_attention -- --ignored
 INFR_ZE_PCI=03:00.0 cargo test --release -p infr-ze --test probe attn_fa256_probe -- --ignored --nocapture --test-threads=1
 ```
 
+### Decode attention at depth (measured, not shipped)
+
+27B decode at d32768 spends 10.9 ms per token in `attn_decode_hd256` (16 layers x 0.68 ms; Vulkan
+device time is 50.6 ms per token, the GEMVs ~31 ms). 0.68 ms for the layer's 128 MB of K/V is
+~188 GB/s; SYCL's attention costs ~0.23 ms per layer (its tg128 goes 29.9 -> 27.0 from d0 to
+d32768, ours 28.8 -> 20.4). Two experiments on the Vulkan kernel, both reverted:
+
+- **GQA-batched workgroups** (`-DGQA -DG=g`: one 64·g-thread workgroup per kv head and chunk
+  running the g query heads' unchanged per-head blocks, so each K/V row is fetched once per kv
+  head): bit-identical to `attn_partial` for g = 2/4/6 (`attn_decode_parity`), but **0.97 ms**
+  per call against the plain kernel's 0.68. The plain grid already keeps a kv group's heads
+  consecutive, so they share K/V through L1/L2; coupling 12 subgroups to workgroup barriers and
+  cutting the workgroup count 6x only cost latency hiding. K/V re-reads are not the limit.
+- **Smaller decode chunks** (the shared split-K policy's 512-key cap, mirrored in
+  `attn_live`/`attn_decode`/`attn_partial`): a 256-key cap gives 21.4 t/s at d32768 (+5%, no
+  change at <= 16k where the cap is not reached); 128 is worse at both 8k and 32k. Real, but small,
+  and it moves every GPU's long-context numerics (RDNA was tuned at 512).
+
+The kernel is latency-bound (2 keys in flight per subgroup, one cross-lane reduction per key and
+head). Keeping its bit-identity with `attn_partial` (which MTP verify shares) means restructuring
+both together — more keys in flight per subgroup, or a Level Zero flash-decode with the g query
+heads as DPAS rows (whose handoffs the record-once decode replay would then have to carry).
+
 ### Next
 
-- Further prefill attention tuning and the decode KV read — the remaining long-context gap.
-- Default-context placement: the earlier 27B run clamped its unpinned context to 50640 and
-  reduced the prefill chunk to 128 rows to fit it, below the L0 GEMMs' 256-row floor. The explicit
-  context/chunk settings above avoid that policy tradeoff; it is unchanged by this slice.
+- The decode KV read at depth (above), and further prefill attention tuning.
 - IQ4_XS: fewer SLM gathers — e.g. a byte-indexed table (k-pairs `(j, j+16)`, one index per byte)
   with the producer writing A in the matching k order.
 - IQ3_S, Q8_0, Q2_K (not in the 27B/4B's GEMM paths).
