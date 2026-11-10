@@ -3535,8 +3535,13 @@ impl<'a> Recorder<'a> {
         let (name, spv) = if rows > 8 {
             crate::gemm::native_mmv_mrow_m16_spv(dtype).expect("native mmv mrow m16 streamed spv")
         } else {
-            crate::gemm::native_mmv_mrow_variant_spv(dtype, o4, m4, res)
-                .expect("native mmv mrow streamed spv")
+            let base = crate::gemm::native_mmv_mrow_variant_spv(dtype, o4, m4, res)
+                .expect("native mmv mrow streamed spv");
+            if o4 && crate::caps::mrow_cluster(self.be.device_arch()) {
+                crate::gemm::native_mmv_mrow_cl_twin(base.0).expect("OUTS4 build has a _cl twin")
+            } else {
+                base
+            }
         };
         let groups = (out_f as u32).div_ceil(if o4 && rows <= 8 { 4 } else { 2 });
         let nbind = if res { 6 } else { 5 };
@@ -4447,6 +4452,45 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    /// Decode RMSNorm (one row) that also writes `quant_q8(y)` into `qa`/`dact`/`sact`, so the
+    /// int8 GEMV reading `y` next skips its own `quant_q8` dispatch (`rmsnorm_q8.comp`: dim/128
+    /// workgroups, each reducing the whole row itself, then normalizing and quantizing its own
+    /// slice). Caller guarantees `dim % 128 == 0`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rmsnorm_q8(
+        &self,
+        x: &dyn Buffer,
+        w: &dyn Buffer,
+        y: &dyn Buffer,
+        qa: &dyn Buffer,
+        dact: &dyn Buffer,
+        sact: &dyn Buffer,
+        dim: usize,
+        eps: f32,
+    ) {
+        debug_assert!(dim.is_multiple_of(128));
+        let k = self
+            .be
+            .kernel_sg("rmsnorm_q8", crate::gemm::rmsnorm_q8_spv(), 6, 8, 32);
+        let mut push = [0u8; 8];
+        push[0..4].copy_from_slice(&(dim as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&eps.to_ne_bytes());
+        self.dispatch(
+            k,
+            &[
+                Self::vkb(x),
+                Self::vkb(w),
+                Self::vkb(y),
+                Self::vkb(qa),
+                Self::vkb(dact),
+                Self::vkb(sact),
+            ],
+            4,
+            &push,
+            (dim / 128) as u32,
+        );
+    }
+
     /// WEIGHTLESS RMSNorm: `y[i] = x[i] * inversesqrt(mean(x²) + eps)`, one workgroup per row
     /// (`rmsnorm.comp`'s -DNO_WEIGHT build) — `Op::QkNorm { weight: None }`, deepseek4's bare
     /// per-head `ggml_rms_norm` on Q. Same reduction as [`Self::rmsnorm`], one binding fewer.
@@ -4557,6 +4601,52 @@ impl<'a> Recorder<'a> {
             1,
             &push,
             rows as u32, // one workgroup per row (cooperative reduction)
+        );
+    }
+
+    /// [`Self::rmsnorm_gate`] that also writes `quant_q8` of the flattened `[rows * dim]` output
+    /// into `qa`/`dact`/`sact`, so the int8 GEMV reading `y` next skips its own `quant_q8`
+    /// dispatch. Caller guarantees `dim % 32 == 0`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rmsnorm_gate_q8(
+        &self,
+        x: &dyn Buffer,
+        w: &dyn Buffer,
+        z: &dyn Buffer,
+        y: &dyn Buffer,
+        qa: &dyn Buffer,
+        dact: &dyn Buffer,
+        sact: &dyn Buffer,
+        rows: usize,
+        dim: usize,
+        eps: f32,
+    ) {
+        debug_assert!(dim.is_multiple_of(32));
+        let k = self.be.kernel_sg(
+            "rmsnorm_gate_q8",
+            crate::gemm::rmsnorm_gate_q8_spv(),
+            7,
+            12,
+            32,
+        );
+        let mut push = [0u8; 12];
+        push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(dim as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&eps.to_ne_bytes());
+        self.dispatch(
+            k,
+            &[
+                Self::vkb(x),
+                Self::vkb(w),
+                Self::vkb(z),
+                Self::vkb(y),
+                Self::vkb(qa),
+                Self::vkb(dact),
+                Self::vkb(sact),
+            ],
+            4,
+            &push,
+            rows as u32,
         );
     }
 
@@ -7763,6 +7853,86 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    /// [`Self::silu_mul`] at decode (one row of `n` elements) that also writes `quant_q8(y)` into
+    /// `qa`/`dact`/`sact`, so the int8 GEMV reading `y` next skips its own `quant_q8` dispatch.
+    /// Caller guarantees `n % 32 == 0`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn silu_mul_q8(
+        &self,
+        gate: &dyn Buffer,
+        up: &dyn Buffer,
+        y: &dyn Buffer,
+        qa: &dyn Buffer,
+        dact: &dyn Buffer,
+        sact: &dyn Buffer,
+        n: usize,
+        clamp: Option<f32>,
+    ) {
+        debug_assert!(n.is_multiple_of(32));
+        let k = self
+            .be
+            .kernel_sg("silu_mul_q8", crate::gemm::silu_mul_q8_spv(), 6, 36, 32);
+        let mut push = [0u8; 36];
+        push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
+        push[28..32].copy_from_slice(&(u32::from(clamp.is_some())).to_ne_bytes());
+        push[32..36].copy_from_slice(&clamp.unwrap_or(0.0).to_ne_bytes());
+        self.dispatch(
+            k,
+            &[
+                Self::vkb(gate),
+                Self::vkb(up),
+                Self::vkb(y),
+                Self::vkb(qa),
+                Self::vkb(dact),
+                Self::vkb(sact),
+            ],
+            4,
+            &push,
+            (n as u32).div_ceil(64),
+        );
+    }
+
+    /// [`Self::silu_mul_fused`] at decode (one row, `nff` outputs) that also writes `quant_q8(y)`
+    /// into `qa`/`dact`/`sact` — see [`Self::silu_mul_q8`]. Caller guarantees `nff % 32 == 0`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn silu_mul_fused_q8(
+        &self,
+        gu: &dyn Buffer,
+        y: &dyn Buffer,
+        qa: &dyn Buffer,
+        dact: &dyn Buffer,
+        sact: &dyn Buffer,
+        nff: usize,
+        clamp: Option<f32>,
+    ) {
+        debug_assert!(nff.is_multiple_of(32));
+        let k = self.be.kernel_sg(
+            "silu_mul_fused_q8",
+            crate::gemm::silu_mul_fused_q8_spv(),
+            5,
+            16,
+            32,
+        );
+        let mut push = [0u8; 16];
+        push[0..4].copy_from_slice(&1u32.to_ne_bytes());
+        push[4..8].copy_from_slice(&(nff as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(u32::from(clamp.is_some())).to_ne_bytes());
+        push[12..16].copy_from_slice(&clamp.unwrap_or(0.0).to_ne_bytes());
+        self.dispatch(
+            k,
+            &[
+                Self::vkb(gu),
+                Self::vkb(y),
+                Self::vkb(qa),
+                Self::vkb(dact),
+                Self::vkb(sact),
+            ],
+            4,
+            &push,
+            (nff as u32).div_ceil(64),
+        );
+    }
+
     /// Gated-DeltaNet recurrence, one token (qwen35 SSM). The persistent `state` buffer
     /// `[nv*kd*vd]` is updated in place; `out` is `[nv*vd]`. One workgroup per value head; the
     /// `nk` q/k heads are tiled up to `nv`. See shaders/deltanet.comp.
@@ -8381,6 +8551,52 @@ impl<'a> Recorder<'a> {
             kern,
             &[Self::vkb(a), Self::vkb(b), Self::vkb(y)],
             1,
+            &push,
+            (n as u32).div_ceil(64),
+        );
+    }
+
+    /// [`Self::mul_sigmoid`] at decode that also writes `quant_q8(y)` into `qa`/`dact`/`sact`, so
+    /// the int8 GEMV reading `y` next skips its own `quant_q8` dispatch. Caller guarantees
+    /// `n % 32 == 0`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mul_sigmoid_q8(
+        &self,
+        a: &dyn Buffer,
+        b: &dyn Buffer,
+        y: &dyn Buffer,
+        qa: &dyn Buffer,
+        dact: &dyn Buffer,
+        sact: &dyn Buffer,
+        n: usize,
+        gate_stride_el: usize,
+        gate_row_width: usize,
+        gate_block_width: usize,
+    ) {
+        debug_assert!(n.is_multiple_of(32));
+        let kern = self.be.kernel_sg(
+            "mul_sigmoid_q8",
+            crate::gemm::mul_sigmoid_q8_spv(),
+            6,
+            16,
+            32,
+        );
+        let mut push = [0u8; 16];
+        push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(gate_stride_el as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(gate_row_width as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(gate_block_width as u32).to_ne_bytes());
+        self.dispatch(
+            kern,
+            &[
+                Self::vkb(a),
+                Self::vkb(b),
+                Self::vkb(y),
+                Self::vkb(qa),
+                Self::vkb(dact),
+                Self::vkb(sact),
+            ],
+            4,
             &push,
             (n as u32).div_ceil(64),
         );

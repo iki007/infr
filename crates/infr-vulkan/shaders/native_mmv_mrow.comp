@@ -41,6 +41,9 @@
 #extension GL_EXT_integer_dot_product : require
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
+#ifdef SG_CLUSTER
+#extension GL_KHR_shader_subgroup_clustered : require
+#endif
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
 // Same push layout as native_gemv/native_mmv (w_base = element offset for fused-QKV slices).
@@ -625,7 +628,9 @@ void fuse_quant(uint row, uint s, out int aw[8], out float da, out float sa) {
 // (grid = ceil(out_f/4)). The 2-output layout leaves 64 − nsub lanes IDLE when nsub < 64 (E2B's
 // in_f=1536 gate_up: 48 sub-blocks → 25% of the wg dead, one loop iteration); splitting the wg
 // 4×16 keeps every lane on a sub-block. Reduction: shared tree over each output's 16 lanes.
+#ifndef SG_CLUSTER
 shared float part4[4u * MR * 16u];   // [out, row, lane]
+#endif
 
 void main() {
     // Flat-index recovery for a possibly-2-D dispatch grid — see native_gemv_rm.comp's main() for
@@ -714,6 +719,24 @@ void main() {
             }
         }
     }
+#ifdef SG_CLUSTER
+    // Each output's 16 lanes are one aligned 16-lane cluster of a >=16-wide subgroup, so a
+    // clustered add replaces the shared tree and its 5 barriers. Intel Xe2 only (`caps::
+    // mrow_cluster`, measured there); the reduction order differs from the tree's, so every
+    // OUTS4 build a device dispatches must agree on it — the selection is per device, not per op.
+    for (uint r = 0u; r < MR; r++) {
+        if (r < pc.rows) { acc[r] = subgroupClusteredAdd(acc[r], 16u); }
+    }
+    if (sl < pc.rows && live) {
+        float tot = 0.0;
+        for (uint r = 0u; r < MR; r++) { if (r == sl) { tot = acc[r]; } }
+#ifdef USE_RES
+        y_buf[sl * pc.out_f + o0 + ot] = r_buf[o0 + ot] + tot;
+#else
+        y_buf[sl * pc.out_f + o0 + ot] = tot;
+#endif
+    }
+#else
     for (uint r = 0u; r < MR; r++) {
         if (r < pc.rows) { part4[(ot * MR + r) * 16u + sl] = acc[r]; }
     }
@@ -738,6 +761,7 @@ void main() {
         y_buf[sl * pc.out_f + o0 + ot] = part4[(ot * MR + sl) * 16u];
 #endif
     }
+#endif
 }
 #else
 void main() {

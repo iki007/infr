@@ -571,9 +571,16 @@ fn mmv_int8_decode_dtypes(
         // AMD trade-off inverts. Qwen3.8-27B UD-Q4_K_M (4.5 GB Q5_K + 4.4 GB IQ4_XS) decode 15.7 ->
         // 18.9 t/s; Qwen3.5-4B Q4_K_M 115.7 -> 119.8 (its Q5_K attn_qkv). The second arch-keyed
         // rule in the backend (see `caps::DeviceArch`); every other device keeps the AMD set.
-        None if arch == crate::caps::DeviceArch::IntelXe2 => {
-            &[Q2K, Q4K, Q6K, Q4_0, Q5_0, Q5_1, Iq4Nl, Q5K, Iq4Xs]
-        }
+        //
+        // Xe2 also adds Q3_K and Q8_0, but only for weights of at least 8M elements (the floor is
+        // in `mmv_mw_choice`), so small models such as the 0.6B Q2_K mix behind Q3_K's
+        // coherence note above stay on the f32 GEMV. Measured on the B70 (Qwen3.8-27B
+        // UD-Q4_K_M, 2026-11-10): its Q3_K FFN GEMVs ran at ~165 GB/s on the f32 path against
+        // ~540 int8, and decode went 27.6 -> 28.1 t/s; the greedy output is unchanged for ~190 of
+        // 200 tokens, then diverges at a near-tie ("Extra memory" vs "Memory").
+        None if arch == crate::caps::DeviceArch::IntelXe2 => &[
+            Q2K, Q3K, Q4K, Q6K, Q8_0, Q4_0, Q5_0, Q5_1, Iq4Nl, Q5K, Iq4Xs,
+        ],
         None => &[Q2K, Q4K, Q6K, Q4_0, Q5_0, Q5_1, Iq4Nl],
     }
 }
@@ -691,6 +698,14 @@ fn mmv_mw_choice(
     if !in_f.is_multiple_of(32) || in_f * out_f < (2usize << 20) {
         return None;
     }
+    // Q3_K and Q8_0 are on the default set only on Xe2, and only for large weights; see
+    // `mmv_int8_decode_dtypes`. An explicit `INFR_MMV_MW=1` skips this floor.
+    if vk.mmv_mw.is_none()
+        && matches!(dt, infr_core::DType::Q3K | infr_core::DType::Q8_0)
+        && in_f * out_f < (8usize << 20)
+    {
+        return None;
+    }
     // Default WARPS is per-dtype: Q4_K defaults to 1 (llama.cpp's rm_kq_int=1 shape — one output
     // row per workgroup / single-subgroup reduce, the dispatch-shape sweep winner on AMD). Every
     // other dtype defaults to 8. Q4_K warps=1 beats {4,8} and beats the f32 path. Overrideable
@@ -717,6 +732,44 @@ fn mmv_mw_choice(
     )
     .is_some();
     have_spv.then_some(warps)
+}
+
+/// Does the producer of `x` write the int8 activations of the op after it (its `_q8` build,
+/// handed over through `mmv_memo`)? Yes when the device takes the fusion
+/// (`caps::decode_quant_fusion`) and `graph.ops[op_idx + 1]` is an m=1 Linear on `x`
+/// (`in_f == dim`) that takes an int8 mrow decode GEMV reading the memo — the plain one or the
+/// fused-residual one, both of which then read the `mmvr_*` scratch. Mirrors their gates (a
+/// native dtype, no u32-breaching weight, `mmv_mw_choice`, FUSE_QUANT off). A miss is harmless
+/// either way: a GEMV that ends up elsewhere (e.g. a dense-streamed weight's f32 GEMV) never reads
+/// the memo, and one that needs the int8 activations without the memo quantizes them itself.
+fn decode_int8_linear_next(
+    be_: &VulkanBackend,
+    graph: &Graph,
+    op_idx: usize,
+    x: TensorId,
+    dim: usize,
+) -> bool {
+    let Some(Op::Linear {
+        x: nx,
+        weight,
+        m,
+        in_f,
+        out_f,
+        ..
+    }) = graph.ops.get(op_idx + 1)
+    else {
+        return false;
+    };
+    let (in_f, out_f) = (*in_f as usize, *out_f as usize);
+    if *nx != x || *m != 1 || in_f != dim || !crate::caps::decode_quant_fusion(be_.device_arch()) {
+        return false;
+    }
+    let dt = graph.desc(*weight).dtype;
+    let vk = &be_.cfg().kernels.vulkan;
+    native_dense_supported(dt)
+        && !vk.mmv_fuse_quant
+        && !crate::recorder::bda_weight_breaches(dt, in_f, out_f, vk)
+        && mmv_mw_choice(be_.caps(), be_.device_arch(), vk, dt, in_f, out_f).is_some()
 }
 
 /// Get-or-alloc the pool buffer for (tag, bytes); returns the map key so callers can hold several
@@ -1080,14 +1133,32 @@ fn lower_op(
             dim,
             eps,
         } => {
-            rec.rmsnorm(
-                r(*x)?,
-                r(*weight)?,
-                r(*dst)?,
-                *rows as usize,
-                *dim as usize,
-                *eps,
-            );
+            let (rows, dim) = (*rows as usize, *dim as usize);
+            // Decode norm feeding an int8 GEMV next: write that GEMV's int8 activations here and
+            // hand them over through the quant memo, so it skips its own `quant_q8` dispatch (one
+            // serialized dispatch fewer per norm). See `decode_int8_linear_next`.
+            if rows == 1
+                && dim.is_multiple_of(128)
+                && decode_int8_linear_next(be_, graph, op_idx, *dst, dim)
+            {
+                let nblk = dim / 32;
+                let qa = pooled(pool, be_, "mmvr_qa", dim)?;
+                let dact = pooled(pool, be_, "mmvr_dact", nblk * 2)?;
+                let sact = pooled(pool, be_, "mmvr_sact", nblk * 2)?;
+                rec.rmsnorm_q8(
+                    r(*x)?,
+                    r(*weight)?,
+                    r(*dst)?,
+                    pool[&qa].as_ref(),
+                    pool[&dact].as_ref(),
+                    pool[&sact].as_ref(),
+                    dim,
+                    *eps,
+                );
+                *mmv_memo = Some((*dst, 1, dim));
+                return Ok(());
+            }
+            rec.rmsnorm(r(*x)?, r(*weight)?, r(*dst)?, rows, dim, *eps);
         }
         Op::RmsNormAdd {
             x,
@@ -1269,18 +1340,29 @@ fn lower_op(
                             rec.linear_mmv_mrow_fuseq(dt, w, 0, xb, Some(rr), yf, 1, in_f, out_f);
                             return Ok(());
                         }
+                        // The producer of `x` may already have written its int8 activations
+                        // (the `mmvr_*` scratch, handed over through `mmv_memo`: see
+                        // `decode_int8_linear_next`); otherwise quantize into this branch's own.
                         let nblk = in_f / 32;
-                        let qa = pooled(pool, be_, "mmv_qa", in_f)?;
-                        let dact = pooled(pool, be_, "mmv_dact", nblk * 2)?;
-                        let sact = pooled(pool, be_, "mmv_sact", nblk * 2)?;
-                        rec.quant_q8(
-                            xb,
-                            pool[&qa].as_ref(),
-                            pool[&dact].as_ref(),
-                            pool[&sact].as_ref(),
-                            1,
-                            in_f,
-                        );
+                        let hit = memo_prev == Some((*x, 1, in_f));
+                        let (tq, td, ts) = if hit {
+                            ("mmvr_qa", "mmvr_dact", "mmvr_sact")
+                        } else {
+                            ("mmv_qa", "mmv_dact", "mmv_sact")
+                        };
+                        let qa = pooled(pool, be_, tq, in_f)?;
+                        let dact = pooled(pool, be_, td, nblk * 2)?;
+                        let sact = pooled(pool, be_, ts, nblk * 2)?;
+                        if !hit {
+                            rec.quant_q8(
+                                xb,
+                                pool[&qa].as_ref(),
+                                pool[&dact].as_ref(),
+                                pool[&sact].as_ref(),
+                                1,
+                                in_f,
+                            );
+                        }
                         if unified_mmv_row1(be_.caps()) {
                             // Decode (m=1) dispatches the SAME kernel/reduction as the m>=3 verify
                             // tier (`linear_mmv_mrow`, rows=1) — see `unified_mmv_row1`'s doc. This
@@ -2186,6 +2268,29 @@ fn lower_op(
                             "vulkan adapter: GatedAct Silu gate_stride/gate_block_width!=0 unsupported",
                         ));
                     }
+                    // Decode activation feeding an int8 GEMV next (the FFN down projection):
+                    // quantize here and hand over through the memo, as the RmsNorm arm does.
+                    if *rows == 1
+                        && n.is_multiple_of(32)
+                        && decode_int8_linear_next(be_, graph, op_idx, *dst, n)
+                    {
+                        let nblk = n / 32;
+                        let qa = pooled(pool, be_, "mmvr_qa", n)?;
+                        let dact = pooled(pool, be_, "mmvr_dact", nblk * 2)?;
+                        let sact = pooled(pool, be_, "mmvr_sact", nblk * 2)?;
+                        rec.silu_mul_q8(
+                            g_,
+                            u_,
+                            y,
+                            pool[&qa].as_ref(),
+                            pool[&dact].as_ref(),
+                            pool[&sact].as_ref(),
+                            n,
+                            *swiglu_clamp,
+                        );
+                        *mmv_memo = Some((*dst, 1, n));
+                        return Ok(());
+                    }
                     rec.silu_mul(g_, u_, y, n, *swiglu_clamp);
                 }
                 Activation::Sigmoid => {
@@ -2198,6 +2303,30 @@ fn lower_op(
                         return Err(be(
                             "vulkan adapter: GatedAct Sigmoid swiglu_clamp unsupported",
                         ));
+                    }
+                    // Decode gate feeding an int8 GEMV next (the attention output projection):
+                    // quantize here and hand over through the memo, as the RmsNorm arm does.
+                    if *rows == 1
+                        && n.is_multiple_of(32)
+                        && decode_int8_linear_next(be_, graph, op_idx, *dst, n)
+                    {
+                        let qa = pooled(pool, be_, "mmvr_qa", n)?;
+                        let dact = pooled(pool, be_, "mmvr_dact", n / 32 * 2)?;
+                        let sact = pooled(pool, be_, "mmvr_sact", n / 32 * 2)?;
+                        rec.mul_sigmoid_q8(
+                            u_,
+                            g_,
+                            y,
+                            pool[&qa].as_ref(),
+                            pool[&dact].as_ref(),
+                            pool[&sact].as_ref(),
+                            n,
+                            *gate_stride as usize,
+                            *nff as usize,
+                            *gate_block_width as usize,
+                        );
+                        *mmv_memo = Some((*dst, 1, n));
+                        return Ok(());
                     }
                     rec.mul_sigmoid(
                         u_,
@@ -2243,6 +2372,28 @@ fn lower_op(
         } => {
             let (rows, nff) = (*rows as usize, *nff as usize);
             let (gu_, y) = (r(*gu)?, r(*dst)?);
+            // Decode activation feeding an int8 GEMV next: see the `Op::GatedAct` Silu arm.
+            if matches!(act, Activation::Silu)
+                && rows == 1
+                && nff.is_multiple_of(32)
+                && decode_int8_linear_next(be_, graph, op_idx, *dst, nff)
+            {
+                let nblk = nff / 32;
+                let qa = pooled(pool, be_, "mmvr_qa", nff)?;
+                let dact = pooled(pool, be_, "mmvr_dact", nblk * 2)?;
+                let sact = pooled(pool, be_, "mmvr_sact", nblk * 2)?;
+                rec.silu_mul_fused_q8(
+                    gu_,
+                    y,
+                    pool[&qa].as_ref(),
+                    pool[&dact].as_ref(),
+                    pool[&sact].as_ref(),
+                    nff,
+                    *swiglu_clamp,
+                );
+                *mmv_memo = Some((*dst, 1, nff));
+                return Ok(());
+            }
             match act {
                 Activation::Silu => rec.silu_mul_fused(gu_, y, rows, nff, *swiglu_clamp),
                 Activation::Gelu => rec.gelu_mul_fused(gu_, y, rows, nff, *swiglu_clamp),
@@ -3612,15 +3763,33 @@ fn lower_op(
             head_dim,
             eps,
         } => {
-            rec.rmsnorm_gate(
-                r(*x)?,
-                r(*weight)?,
-                r(*gate)?,
-                r(*dst)?,
-                (*rows * *n_head) as usize,
-                *head_dim as usize,
-                *eps,
-            );
+            let (nrow, hd) = ((*rows * *n_head) as usize, *head_dim as usize);
+            // Decode gate feeding an int8 GEMV next (the DeltaNet out projection): quantize here
+            // and hand over through the memo, as the RmsNorm arm does.
+            if *rows == 1
+                && hd.is_multiple_of(32)
+                && decode_int8_linear_next(be_, graph, op_idx, *dst, nrow * hd)
+            {
+                let n = nrow * hd;
+                let qa = pooled(pool, be_, "mmvr_qa", n)?;
+                let dact = pooled(pool, be_, "mmvr_dact", n / 32 * 2)?;
+                let sact = pooled(pool, be_, "mmvr_sact", n / 32 * 2)?;
+                rec.rmsnorm_gate_q8(
+                    r(*x)?,
+                    r(*weight)?,
+                    r(*gate)?,
+                    r(*dst)?,
+                    pool[&qa].as_ref(),
+                    pool[&dact].as_ref(),
+                    pool[&sact].as_ref(),
+                    nrow,
+                    hd,
+                    *eps,
+                );
+                *mmv_memo = Some((*dst, 1, n));
+                return Ok(());
+            }
+            rec.rmsnorm_gate(r(*x)?, r(*weight)?, r(*gate)?, r(*dst)?, nrow, hd, *eps);
         }
         // Qwen3-Next SSM: depthwise causal conv + SiLU (rolling conv `state` mutated in place).
         Op::Conv1dSilu {
@@ -6963,12 +7132,31 @@ mod tests {
         // off despite the accuracy isolation (see `mrow_int8_prefill_dtypes`'s doc) finding the
         // cliff was decode-side, not prefill-side — decode was never proven safe, just not (yet)
         // re-attempted, so it stays conservatively off pending its own measurement.
-        // Q3_K: OFF on every vendor — coherence cliff on mixed GGUFs (see
-        // mmv_int8_decode_dtypes). Intel previously had it default-on; the unified set
-        // drops it for safety. INFR_MMV_MW=1 still enables it for A/B.
+        // Q3_K: OFF on AMD — coherence cliff on mixed GGUFs (see mmv_int8_decode_dtypes).
+        // INFR_MMV_MW=1 still enables it for A/B. Xe2 takes it (and Q8_0) for weights of at
+        // least 8M elements only: below that floor `mmv_mw_choice` keeps the f32 GEMV.
         assert!(!mmv_int8_decode_dtypes(amd, &vk).contains(&DType::Q3K));
         assert!(!mrow_int8_dtype_ok(amd, &vk, DType::Q3K, true));
-        assert!(!mmv_int8_decode_dtypes(intel, &vk).contains(&DType::Q3K));
+        assert!(mmv_int8_decode_dtypes(intel, &vk).contains(&DType::Q3K));
+        let caps_i8 = infr_core::backend::Capabilities {
+            i8_dot: true,
+            ..Default::default()
+        };
+        for dt in [DType::Q3K, DType::Q8_0] {
+            // 1024x3072 (a 0.6B FFN) stays f32; 5120x17408 (a 27B FFN) goes int8.
+            assert!(
+                mmv_mw_choice(&caps_i8, intel, &vk, dt, 1024, 3072).is_none(),
+                "{dt:?}"
+            );
+            assert!(
+                mmv_mw_choice(&caps_i8, intel, &vk, dt, 5120, 17408).is_some(),
+                "{dt:?}"
+            );
+            assert!(
+                mmv_mw_choice(&caps_i8, amd, &vk, dt, 5120, 17408).is_none(),
+                "{dt:?}"
+            );
+        }
         // Q4_K is ON in the unified decode default: the throughput win (README footnote 3) is real.
         assert!(mmv_int8_decode_dtypes(amd, &vk).contains(&DType::Q4K));
         assert!(mrow_int8_dtype_ok(amd, &vk, DType::Q4K, true));
@@ -7006,8 +7194,10 @@ mod tests {
         }
         // The legacy 32-block set's decode default is a MEASURED split (see
         // `mmv_int8_decode_dtypes`): Q4_0/Q5_0/Q5_1/IQ4_NL win at m=1 and are ON; Q8_0 LOSES
-        // (−4.2%) and Q4_1 washes, so both are decode-OFF and prefill-ONLY. Unified across all
-        // vendors — spelled out so a "finish the set" edit has to face the numbers.
+        // (−4.2%) on AMD and Q4_1 washes, so both are decode-OFF and prefill-ONLY there —
+        // spelled out so a "finish the set" edit has to face the numbers. Xe2 is the exception
+        // for Q8_0: there the f32 GEMV is the slow side (Arc Pro B70, 5120x17408: 238 us f32 vs
+        // 173 us int8; 4096x12288: 134 vs 99), so Xe2 takes it above the 8M-element floor.
         for arch in [amd, intel] {
             for dt in [DType::Q4_0, DType::Q5_0, DType::Q5_1, DType::Iq4Nl] {
                 assert!(
@@ -7016,8 +7206,10 @@ mod tests {
                 );
             }
             for dt in [DType::Q8_0, DType::Q4_1] {
-                assert!(
-                    !mmv_int8_decode_dtypes(arch, &vk).contains(&dt),
+                let on = arch == intel && dt == DType::Q8_0;
+                assert_eq!(
+                    mmv_int8_decode_dtypes(arch, &vk).contains(&dt),
+                    on,
                     "{dt:?}: decode measured a loss/wash — prefill-only, do not flip without a number"
                 );
                 assert!(mrow_int8_prefill_dtypes(dt), "{dt:?} prefill win must stay");

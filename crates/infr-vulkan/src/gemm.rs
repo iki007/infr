@@ -641,6 +641,62 @@ pub(crate) fn native_mmv_spv(
         _ => None,
     }
 }
+/// The clustered-reduction (`-DSG_CLUSTER`) twin of an OUTS4 int8 mrow build, by the base build's
+/// name (`build.rs` compiles one `<name>_cl` per OUTS4 build). Selected on Intel Xe2 only — see
+/// `caps::mrow_cluster`. `None` for a non-OUTS4 name.
+pub(crate) fn native_mmv_mrow_cl_twin(name: &str) -> Option<(&'static str, &'static [u32])> {
+    macro_rules! v {
+        ($name:literal) => {{
+            static S: OnceLock<Vec<u32>> = OnceLock::new();
+            let s = S
+                .get_or_init(|| {
+                    spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))
+                })
+                .as_slice();
+            Some(($name, s))
+        }};
+    }
+    match name {
+        "native_mmv_mrow_q4k_o4_m4" => v!("native_mmv_mrow_q4k_o4_m4_cl"),
+        "native_mmv_mrow_q6k_o4_m4" => v!("native_mmv_mrow_q6k_o4_m4_cl"),
+        "native_mmv_mrow_q4k_o4" => v!("native_mmv_mrow_q4k_o4_cl"),
+        "native_mmv_mrow_q6k_o4" => v!("native_mmv_mrow_q6k_o4_cl"),
+        "native_mmv_mrow_q4k_o4_m4_res" => v!("native_mmv_mrow_q4k_o4_m4_res_cl"),
+        "native_mmv_mrow_q6k_o4_m4_res" => v!("native_mmv_mrow_q6k_o4_m4_res_cl"),
+        "native_mmv_mrow_iq4xs_o4" => v!("native_mmv_mrow_iq4xs_o4_cl"),
+        "native_mmv_mrow_iq4xs_o4_m4" => v!("native_mmv_mrow_iq4xs_o4_m4_cl"),
+        "native_mmv_mrow_iq4xs_o4_m4_res" => v!("native_mmv_mrow_iq4xs_o4_m4_res_cl"),
+        "native_mmv_mrow_q2k_o4" => v!("native_mmv_mrow_q2k_o4_cl"),
+        "native_mmv_mrow_q2k_o4_m4" => v!("native_mmv_mrow_q2k_o4_m4_cl"),
+        "native_mmv_mrow_q3k_o4" => v!("native_mmv_mrow_q3k_o4_cl"),
+        "native_mmv_mrow_q3k_o4_m4" => v!("native_mmv_mrow_q3k_o4_m4_cl"),
+        "native_mmv_mrow_q2k_o4_m4_res" => v!("native_mmv_mrow_q2k_o4_m4_res_cl"),
+        "native_mmv_mrow_q3k_o4_m4_res" => v!("native_mmv_mrow_q3k_o4_m4_res_cl"),
+        "native_mmv_mrow_q5k_o4" => v!("native_mmv_mrow_q5k_o4_cl"),
+        "native_mmv_mrow_q5k_o4_m4" => v!("native_mmv_mrow_q5k_o4_m4_cl"),
+        "native_mmv_mrow_q5k_o4_m4_res" => v!("native_mmv_mrow_q5k_o4_m4_res_cl"),
+        "native_mmv_mrow_q8_0_o4" => v!("native_mmv_mrow_q8_0_o4_cl"),
+        "native_mmv_mrow_q8_0_o4_m4" => v!("native_mmv_mrow_q8_0_o4_m4_cl"),
+        "native_mmv_mrow_q8_0_o4_m4_res" => v!("native_mmv_mrow_q8_0_o4_m4_res_cl"),
+        "native_mmv_mrow_q4_0_o4" => v!("native_mmv_mrow_q4_0_o4_cl"),
+        "native_mmv_mrow_q4_0_o4_m4" => v!("native_mmv_mrow_q4_0_o4_m4_cl"),
+        "native_mmv_mrow_q4_0_o4_m4_res" => v!("native_mmv_mrow_q4_0_o4_m4_res_cl"),
+        "native_mmv_mrow_q5_0_o4" => v!("native_mmv_mrow_q5_0_o4_cl"),
+        "native_mmv_mrow_q5_0_o4_m4" => v!("native_mmv_mrow_q5_0_o4_m4_cl"),
+        "native_mmv_mrow_q5_0_o4_m4_res" => v!("native_mmv_mrow_q5_0_o4_m4_res_cl"),
+        "native_mmv_mrow_q4_1_o4" => v!("native_mmv_mrow_q4_1_o4_cl"),
+        "native_mmv_mrow_q4_1_o4_m4" => v!("native_mmv_mrow_q4_1_o4_m4_cl"),
+        "native_mmv_mrow_q4_1_o4_m4_res" => v!("native_mmv_mrow_q4_1_o4_m4_res_cl"),
+        "native_mmv_mrow_q5_1_o4" => v!("native_mmv_mrow_q5_1_o4_cl"),
+        "native_mmv_mrow_q5_1_o4_m4" => v!("native_mmv_mrow_q5_1_o4_m4_cl"),
+        "native_mmv_mrow_q5_1_o4_m4_res" => v!("native_mmv_mrow_q5_1_o4_m4_res_cl"),
+        "native_mmv_mrow_iq4nl_o4" => v!("native_mmv_mrow_iq4nl_o4_cl"),
+        "native_mmv_mrow_iq4nl_o4_m4" => v!("native_mmv_mrow_iq4nl_o4_m4_cl"),
+        "native_mmv_mrow_iq4nl_o4_m4_res" => v!("native_mmv_mrow_iq4nl_o4_m4_res_cl"),
+        _ => None,
+    }
+}
+
 /// `-DSTREAMED` twin of [`native_mmv_mrow_variant_kernel_name`] (kernel-cache name + SPIR-V), covering the
 /// rows<=8 layout matrix (`o4`/`m4`/`res`). `res` mirrors [`native_mmv_mrow_variant_kernel_name`]'s residual
 /// arm — build-declared ONLY at `m4 = true` (the decode Linear+Add fusion always dispatches this
@@ -2304,6 +2360,26 @@ pub(crate) fn rmsnorm_wide_spv() -> &'static [u32] {
         )))
     })
 }
+/// SPIR-V for the decode RMSNorm fused with the next int8 GEMV's activation quantization
+/// (`rmsnorm_q8.comp`, the recorder's `rmsnorm_q8`).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn rmsnorm_q8_spv() -> &'static [u32] {
+    static RMSNORM_Q8_SPV: OnceLock<Vec<u32>> = OnceLock::new();
+    RMSNORM_Q8_SPV
+        .get_or_init(|| spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/rmsnorm_q8.spv"))))
+}
+/// SPIR-V for `rmsnorm_gate`'s decode twin that also writes the next int8 GEMV's activations
+/// (`rmsnorm.comp`'s -DGATE -DQ8 build, the recorder's `rmsnorm_gate_q8`).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn rmsnorm_gate_q8_spv() -> &'static [u32] {
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| {
+        spv_words(include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/rmsnorm_gate_q8.spv"
+        )))
+    })
+}
 /// SPIR-V for the fused per-head RMSNorm + SiLU gate multiply (`rmsnorm.comp`'s -DGATE build,
 /// `Op::GatedRmsNorm`) — the qwen35 DeltaNet z-gate, one dispatch instead of `rmsnorm`+`silu_mul`.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
@@ -2971,6 +3047,25 @@ pub(crate) fn silu_mul_spv() -> &'static [u32] {
     static SILU_MUL_SPV: OnceLock<Vec<u32>> = OnceLock::new();
     SILU_MUL_SPV.get_or_init(|| spv_words(SILU_MUL_SPV_BYTES))
 }
+/// SPIR-V for `silu_mul`'s decode twin that also writes the next int8 GEMV's activations
+/// (`silu_mul.comp`'s -DQ8 build, the recorder's `silu_mul_q8`).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn silu_mul_q8_spv() -> &'static [u32] {
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/silu_mul_q8.spv"))))
+}
+/// SPIR-V for `silu_mul_fused`'s decode twin that also writes the next int8 GEMV's activations
+/// (`silu_mul_fused.comp`'s -DQ8 build, the recorder's `silu_mul_fused_q8`).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn silu_mul_fused_q8_spv() -> &'static [u32] {
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| {
+        spv_words(include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/silu_mul_fused_q8.spv"
+        )))
+    })
+}
 /// SPIR-V for the gated-DeltaNet recurrence step (qwen35/Qwen3.5 SSM).
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn deltanet_spv() -> &'static [u32] {
@@ -3051,6 +3146,18 @@ pub(crate) fn conv1d_silu_par_spv() -> &'static [u32] {
 pub(crate) fn copy_strided_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(COPY_STRIDED_SPV_BYTES))
+}
+/// SPIR-V for `mul_sigmoid`'s decode twin that also writes the next int8 GEMV's activations
+/// (`mul_sigmoid.comp`'s -DQ8 build, the recorder's `mul_sigmoid_q8`).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn mul_sigmoid_q8_spv() -> &'static [u32] {
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| {
+        spv_words(include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/mul_sigmoid_q8.spv"
+        )))
+    })
 }
 /// SPIR-V for the elementwise sigmoid gate `y = a * sigmoid(b)`.
 #[cfg_attr(infr_profile, infr_prof::instrument)]

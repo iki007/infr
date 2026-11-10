@@ -23,9 +23,21 @@
 // it to rows==1 && dim>=2048 && dim%4==0 — prefill (rows>1, already fills the GPU with row-
 // workgroups) and the per-head V/Q/K norms (rows=n_head, small dim) keep the 256-thread build.
 // Mutually exclusive with GATE/ADD/F16IO.
+//
+// -DGATE -DQ8 build (`rmsnorm_gate_q8`, decode): also writes quant_q8 of the flattened
+// [rows * dim] output into qa/dact/sact for the int8 GEMV that reads it next (the qwen35 DeltaNet
+// out projection), which then skips its own `quant_q8` dispatch. Host gates dim % 32 == 0, so
+// each wave32 of an iteration of the store loop holds one whole 32-element block (or none), and
+// it runs quant_q8's math on the 32 values it just stored.
 // Requires requiredSubgroupSize=32 (wave32 → 8 subgroups, or 32 under WIDE).
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
+#ifdef Q8
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_16bit_storage : require
+#endif
 #ifdef F16IO
 #extension GL_EXT_shader_16bit_storage : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
@@ -62,6 +74,11 @@ layout(binding = 1) readonly buffer WB { float w[]; };
 #ifdef GATE
 layout(binding = 2) readonly buffer ZB { float z[]; };
 layout(binding = 3) buffer YB { float y[]; };
+#ifdef Q8
+layout(binding = 4) writeonly buffer QBuf { int8_t qa[]; };      // [rows * dim]
+layout(binding = 5) writeonly buffer DBuf { float16_t dact[]; }; // [rows * dim / 32]
+layout(binding = 6) writeonly buffer SBuf { float16_t sact[]; }; // [rows * dim / 32]
+#endif
 #elif defined(ADD)
 layout(binding = 2) buffer DB { float dst[]; };
 #elif defined(F16IO)
@@ -117,7 +134,25 @@ void main() {
     for (uint i = t; i < pc.dim; i += NTHREAD) {
         float zv = z[base + i];
         float gate = zv / (1.0 + exp(-zv));
+#ifdef Q8
+        float v = x[base + i] * scale * w[i] * gate;
+        y[base + i] = v;
+        // quant_q8.comp's per-block math (element e = block * 32 + lane).
+        uint e = base + i;
+        float amax = subgroupMax(abs(v));
+        float d = amax / 127.0;
+        float inv = (amax > 0.0) ? 1.0 / d : 0.0;
+        int q = int(round(v * inv));
+        q = clamp(q, -127, 127);
+        qa[e] = int8_t(q);
+        float sq = subgroupAdd(d * float(q));
+        if (subgroupElect()) {
+            dact[e >> 5u] = float16_t(d);
+            sact[e >> 5u] = float16_t(sq);
+        }
+#else
         y[base + i] = x[base + i] * scale * w[i] * gate;
+#endif
     }
 #elif defined(ADD)
     for (uint i = t; i < pc.dim; i += NTHREAD) { dst[base + i] += x[base + i] * scale * w[i]; }

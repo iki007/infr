@@ -3422,6 +3422,12 @@ residual add + RMSNorm + activation quantization into one kernel. The
 `quant_q8` that follows a norm is the obvious first fusion. Bit-identical if the
 fused kernel keeps the same per-block `amax` and rounding.
 
+**Mostly done (2026-11-10, `docs/intel-b70.md` plan slice 7).** The decode norm,
+both SwiGLU forms, the DeltaNet gated norm and the attention sigmoid gate write
+the next int8 GEMV's activations themselves (`_q8` builds, handed over through
+`mmv_memo`). One `quant_q8` per layer is left on dense models: the attention
+output into `o_proj`, whose producer is the attention combine kernel.
+
 ### B106 — host-sampled decode still writes the [vocab] logits into host memory (2026-11-10)
 
 **Tag:** vulkan · perf · decode · Intel · **Blocked on:** nothing; scoped out of

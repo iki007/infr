@@ -12,6 +12,19 @@
 // every other arch clamps post-SiLU); `up` is clamped symmetrically. `do_clamp == 0` (every model
 // but V4) takes the identical instruction sequence this kernel had before the field existed — the
 // branch is uniform across the whole dispatch (a push constant).
+// -DQ8 build (`silu_mul_q8`, rows == 1 decode, SiLU only): also writes quant_q8(y) into qa/dact/sact
+// (`quant_q8.comp`'s layout) for the int8 GEMV that reads y next, which then skips its own
+// `quant_q8` dispatch. Each wave32 (requiredSubgroupSize=32; the host gates n % 32 == 0, so a wave
+// is one whole 32-element block, entirely in or out of range) runs quant_q8's math on the 32
+// values it just stored.
+#ifdef Q8
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#endif
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
 layout(push_constant) uniform PC {
@@ -22,6 +35,27 @@ layout(push_constant) uniform PC {
 layout(binding = 0) readonly buffer GB { float gate[]; };
 layout(binding = 1) readonly buffer UB { float up[]; };
 layout(binding = 2) buffer YB { float y[]; };
+#ifdef Q8
+layout(binding = 3) writeonly buffer QBuf { int8_t qa[]; };
+layout(binding = 4) writeonly buffer DBuf { float16_t dact[]; };
+layout(binding = 5) writeonly buffer SBuf { float16_t sact[]; };
+#endif
+#ifdef Q8
+// quant_q8.comp's per-block math on this wave's 32 values (element i = block * 32 + lane).
+void quant_block(uint i, float v) {
+    float amax = subgroupMax(abs(v));
+    float d = amax / 127.0;
+    float inv = (amax > 0.0) ? 1.0 / d : 0.0;
+    int q = int(round(v * inv));
+    q = clamp(q, -127, 127);
+    qa[i] = int8_t(q);
+    float s = subgroupAdd(d * float(q));
+    if (subgroupElect()) {
+        dact[i >> 5u] = float16_t(d);
+        sact[i >> 5u] = float16_t(s);
+    }
+}
+#endif
 
 void main() {
     uint i = gl_GlobalInvocationID.x;
@@ -61,5 +95,9 @@ void main() {
     }
     float u = up[up_idx];
     if (pc.do_clamp != 0u) { u = clamp(u, -pc.limit, pc.limit); }
-    y[i] = a * u;
+    float v = a * u;
+    y[i] = v;
+#ifdef Q8
+    quant_block(i, v);
+#endif
 }

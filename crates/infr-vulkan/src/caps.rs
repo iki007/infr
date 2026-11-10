@@ -126,8 +126,9 @@ pub(crate) const VENDOR_NVIDIA: u32 = 0x10de;
 /// The GPU architecture generation, bucketed the way llama.cpp's `get_device_architecture` buckets
 /// it (`ggml/src/ggml-vulkan/ggml-vulkan.cpp:404`, read at pin 030ebb5) — from PROBES, never from
 /// PCI device ids. infr uses it for two things: deciding whether a driver's cooperative-matrix
-/// enumeration can be believed ([`coopmat_trust`]), and the measured Xe2 int8 decode set
-/// (`adapter::mmv_int8_decode_dtypes`).
+/// enumeration can be believed ([`coopmat_trust`]), and the rules measured on Xe2 — the int8
+/// decode set (`adapter::mmv_int8_decode_dtypes`), [`mrow_outs4`], [`mrow_cluster`] and
+/// [`decode_quant_fusion`].
 ///
 /// `AmdRdna3` is upstream's `AMD_RDNA3` and means "RDNA3 **or newer**": the discriminator is the
 /// mixed-signedness packed-dot bit, which RDNA4 also sets, and there is no RDNA4 bucket upstream.
@@ -298,6 +299,26 @@ fn intel_shader_core_count(device_id: u32) -> u32 {
 }
 
 // ── decode GEMV layout ───────────────────────────────────────────────────────────────────────────
+
+/// Whether a decode producer (the norm, SwiGLU, the DeltaNet gated norm, the attention sigmoid
+/// gate) writes the next int8 GEMV's activations itself — its `_q8` build — instead of leaving
+/// them to a separate `quant_q8` dispatch (`adapter::decode_int8_linear_next`). Intel Xe2 only,
+/// where it was measured (Arc Pro B70 tg128: Qwen3.5-4B 142.1 -> 146.6, Qwen3-8B 92.1 -> 93.9).
+/// The fused decode norm reduces its sum of squares in a different order than `rmsnorm`, so the
+/// rule is per architecture: other devices keep their bits until measured there.
+pub(crate) fn decode_quant_fusion(arch: DeviceArch) -> bool {
+    arch == DeviceArch::IntelXe2
+}
+
+/// Whether the OUTS4 int8 mrow GEMV dispatches its clustered-reduction twin (`-DSG_CLUSTER`: one
+/// `subgroupClusteredAdd` over each output's 16 lanes instead of the shared-memory tree and its
+/// barriers). Intel Xe2 only, where it was measured (Arc Pro B70, cold weights, 5120x17408:
+/// IQ4_XS 105 -> 98 µs, Q8_0 173 -> 167, Q6_K 137 -> 132; Qwen3.5-4B tg128 +2%). The twin sums in
+/// a different order, so it is chosen per device for every OUTS4 build at once — decode and the
+/// MTP verify rows keep the same kernel at each weight.
+pub(crate) fn mrow_cluster(arch: DeviceArch) -> bool {
+    arch == DeviceArch::IntelXe2
+}
 
 /// Whether the multi-row int8 GEMV (`native_mmv_mrow.comp`) takes its OUTS4 layout — 4 outputs per
 /// workgroup × 16 K-lanes each — instead of the default 2 outputs × 64 K-lanes, for a weight of

@@ -1,0 +1,71 @@
+#version 460
+// Decode RMSNorm (one row) fused with the int8 activation quantization of the GEMV that reads it:
+// y = x * inversesqrt(mean(x²) + eps) * w, plus quant_q8(y) into qa/dact/sact (`quant_q8.comp`'s
+// layout), so that GEMV skips its own `quant_q8` dispatch.
+//
+// LAYOUT. dim/128 workgroups of 128 threads (requiredSubgroupSize=32: four wave32s). Every
+// workgroup first reduces the WHOLE row's sum of squares itself — the row is ~20 KB and
+// L2-resident, so the redundant reads are cheap, and it avoids both a second dispatch and the
+// single-workgroup latency wall the one-workgroup-per-row `rmsnorm_wide` build has at decode.
+// Each thread sums a fixed strided set of vec4s in order, then subgroupAdd, then the four wave
+// partials in order: the same scale in every workgroup. Then each thread normalizes ONE element
+// of its workgroup's 128-element slice, and each wave32 — exactly one 32-element block — runs
+// quant_q8's math on its 32 values: amax by subgroupMax, d = amax/127, q = round(v/d) clamped to
+// ±127, Σ(d·q) by subgroupAdd.
+//
+// Host gate: rows == 1, dim % 32 == 0 (whole blocks), dim % 4 == 0 (vec4 pass 1).
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+#define NT 128u
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC { uint dim; float eps; } pc;
+layout(binding = 0) readonly buffer XB { vec4 x4[]; };
+layout(binding = 1) readonly buffer WB { float w[]; };
+layout(binding = 2) writeonly buffer YB { float y[]; };
+layout(binding = 3) writeonly buffer QBuf { int8_t qa[]; };      // [dim]
+layout(binding = 4) writeonly buffer DBuf { float16_t dact[]; }; // [dim/32]
+layout(binding = 5) writeonly buffer SBuf { float16_t sact[]; }; // [dim/32]
+
+shared float part[NT / 16u]; // one partial per wave (>= 16-wide waves)
+
+float x_at(uint e) { return x4[e >> 2u][e & 3u]; }
+
+void main() {
+    uint t = gl_LocalInvocationID.x;
+    uint n4 = pc.dim >> 2u;
+    float ss = 0.0;
+    for (uint i = t; i < n4; i += NT) {
+        vec4 v = x4[i];
+        ss += dot(v, v);
+    }
+    ss = subgroupAdd(ss);
+    if (subgroupElect()) { part[gl_SubgroupID] = ss; }
+    barrier();
+    float tot = 0.0;
+    for (uint s = 0u; s < gl_NumSubgroups; s++) { tot += part[s]; }
+    float scale = inversesqrt(tot / float(pc.dim) + pc.eps);
+
+    uint e = gl_WorkGroupID.x * NT + t;
+    uint b = e >> 5u; // this wave's block (waves are 32-wide and 32-aligned)
+    if (b < (pc.dim >> 5u)) {
+        float v = x_at(e) * scale * w[e];
+        y[e] = v;
+        float amax = subgroupMax(abs(v));
+        float d = amax / 127.0;
+        float inv = (amax > 0.0) ? 1.0 / d : 0.0;
+        int q = int(round(v * inv));
+        q = clamp(q, -127, 127);
+        qa[e] = int8_t(q);
+        float sq = subgroupAdd(d * float(q));
+        if (subgroupElect()) {
+            dact[b] = float16_t(d);
+            sact[b] = float16_t(sq);
+        }
+    }
+}

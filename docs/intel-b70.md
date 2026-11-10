@@ -14,7 +14,8 @@ Vulkan backend on prefill and ~1.7x behind on decode**. The causes are measured
 slices 1–3 have landed. The GPU suite is clean. Prefill runs on XMX through an
 8x16x16 coopmat tile (+53% / +71% pp512), still 1.3x / 2x behind llama.cpp's
 Vulkan prefill. Decode on Qwen3.5-4B is now **ahead of llama.cpp's Vulkan
-backend** (120 vs 111 t/s), and so is Qwen3.8-27B (25.3 vs 23.1 t/s). A native Intel
+backend and level with its SYCL one** (149.2 vs 111.2 and 148.5 t/s), and
+Qwen3.8-27B is ahead of Vulkan (28.4 vs 23.1; SYCL 29.9). A native Intel
 backend (Level Zero) is deferred until the Vulkan work is done (`backlog.md`
 B102).
 
@@ -42,12 +43,12 @@ INFR_DEV=Vulkan1 cargo test --release -p infr-vulkan --no-fail-fast -- --include
 | model                       | infr first run | infr now  | llama.cpp Vulkan | llama.cpp SYCL |
 | --------------------------- | -------------- | --------- | ---------------- | -------------- |
 | Qwen3.5-4B Q4_K_M pp512     | 1571           | 2380      | 3165             | 7031           |
-| Qwen3.5-4B Q4_K_M tg128     | 62.6           | **141.8** | 111.2            | 148.5          |
+| Qwen3.5-4B Q4_K_M tg128     | 62.6           | **149.2** | 111.2            | 148.5          |
 | Qwen3.8-27B UD-Q4_K_M pp512 | 220            | 376       | 746              | 1087           |
-| Qwen3.8-27B UD-Q4_K_M tg128 | 13.8           | **27.1**  | 23.1             | 29.9           |
+| Qwen3.8-27B UD-Q4_K_M tg128 | 13.8           | **28.4**  | 23.1             | 29.9           |
 
 llama.cpp at `0f236bc21`; its 27B decode row is tg64. "infr first run" is
-`f568ff7`. "infr now" is after plan slice 3. Prefill moved in slice 2,
+`f568ff7`. "infr now" is prefill after plan slice 3 and decode after slice 7. Prefill moved in slice 2,
 `INFR_NO_COOPMAT=1` still gives the first-run prefill numbers, and that is how
 the A/B was taken. infr's 27B prefill
 arms the submit splitter (`split/185`, `split/244`). That is a symptom of the
@@ -188,6 +189,75 @@ each (B105). The `argmax_part` row (174 µs) is probably the profiler charging
 the lm_head tail to the next stamp; it is a 1 MB scan, so confirm it before
 working on it.
 
+### Decode: the GEMVs were already at bandwidth; the gaps between them were not
+
+Measuring a GEMV by host wall time over N recorded dispatches overstates it on
+this backend: the recorder writes the whole command buffer before it submits,
+about 20 µs of host time per dispatch, and that lands in the per-dispatch
+figure. Decode replays a recorded tape, so it never pays it. Timing only the
+submit and GPU wait (cold weights: six copies, 75+ MB, past L2) gives the real
+mrow GEMV:
+
+| GEMV (m=1)        | infr               | llama.cpp Vulkan |
+| ----------------- | ------------------ | ---------------- |
+| Q4_K 5120x17408   | 89.5 µs (560 GB/s) | 92.6 µs          |
+| Q5_K 5120x17408   | 110 µs (555 GB/s)  | 118 µs           |
+| IQ4_XS 5120x17408 | 98 µs (480 GB/s)   | 148 µs           |
+| Q4_K 4096x14336   | 53.1 µs            | 54.4 µs          |
+| Q4_K 14336x4096   | 58.9 µs            | 53.3 µs          |
+
+(llama.cpp's figure is `test-backend-ops perf`, which reuses one buffer.) The
+big shapes run at ~92% of the 608 GB/s spec. The earlier ~460 GB/s figures in
+this file were host-inflated. Smaller shapes lose ~15 µs to the
+last, partial wave: a 5120x5120 Q4_K GEMV is ~1.25 waves of 4-output
+workgroups, and the tail wave is latency-bound (10 dependent load rounds per
+lane). The 2x64 layout, SIMD16 and one-pass nibble loads did not move that
+tail. A 2x-unrolled OUTS4 loop did (Q4_K 5120x5120 38.4 → 34.3 µs) but cost
+Qwen3.5-4B 1.6% end to end (its in_f=2560 rows leave half an unrolled step
+idle), so it was not kept; nor was the 256-thread skinny-GEMV build for the
+5120x48 DeltaNet alpha/beta (~1 µs saved).
+
+What decode did pay for was serialization: 453 barriers for ~558 dispatches
+per Qwen3.5-4B token, ~10 of them small latency-floor kernels per layer. Plan
+slice 7 removed some and cheapened others:
+
+- **Activation quantization fused into its producer.** Every int8 GEMV input
+  was a separate `quant_q8` dispatch between the producing op and the GEMV.
+  Skipping it outright (wrong output, same work otherwise) measured the
+  ceiling: 4B 142.1 → 148.3, Qwen3-8B 92.1 → 95.6. The decode norm, both
+  SwiGLU forms, the DeltaNet gated norm and the attention sigmoid gate now have
+  `_q8` builds that also write `qa`/`dact`/`sact` (quant_q8's math, one wave32
+  per 32-element block) and hand them over through `mmv_memo`
+  (`adapter::decode_int8_linear_next`); the fused-residual GEMV honors the
+  memo too. Xe2 only (`caps::decode_quant_fusion`): the fused norm sums its
+  squares in a different order, so other devices keep their bits until
+  measured. The decode norm itself is `rmsnorm_q8.comp`: dim/128 workgroups
+  that each reduce the L2-resident row instead of the single latency-bound
+  `rmsnorm_wide` workgroup (a single-workgroup norm+quant was slower than the
+  two dispatches). What is left is one `quant_q8` per layer on dense models,
+  the attention output into `o_proj`. `tests/rmsnorm_q8_parity.rs` checks the
+  int8 output is bit-exactly `quant_q8` of the norm's own f32 row.
+- **Clustered OUTS4 reduction on Xe2.** `subgroupClusteredAdd` over each
+  output's 16 lanes instead of the shared tree and its barriers: IQ4_XS
+  5120x17408 105 → 98 µs, Q8_0 173 → 167, Q6_K 137 → 132 (`caps::mrow_cluster`;
+  every OUTS4 build has a `_cl` twin, so decode and verify stay on one kernel).
+- **Q3_K and Q8_0 on the int8 decode set on Xe2**, above 8M elements. The f32
+  GEMV is the slow side here (Q8_0 5120x17408 238 vs 173 µs; Q3_K ~165 vs
+  ~540 GB/s). The floor keeps small models such as the 0.6B Q2_K mix on f32.
+
+tg128 on `Vulkan1`, each step on top of the previous:
+
+| step                                    | Qwen3.5-4B | Qwen3-8B | Qwen3.8-27B |
+| --------------------------------------- | ---------- | -------- | ----------- |
+| slice 6                                 | 142.1      | 92.1     | 27.2        |
+| Q3_K/Q8_0 int8, norm/SwiGLU/gate `_q8`  | 146.6      | 93.9     | 28.1        |
+| clustered OUTS4 reduction               | 149.2      | 94.7     | 28.4        |
+
+(Only the 27B carries Q3_K/Q8_0 weights large enough for the int8 floor.)
+
+The 27B UD mix still has 4 IQ3_S FFN weights on the f32 GEMV (195–233 µs each
+against ~70 int8; ~0.5 ms per token) — IQ3_S has no int8 mrow build yet.
+
 ### Detection
 
 - `cores:?`: the B70 (`0xE223`, 32 Xe cores) and B65 (`0xE222`, 20) are missing
@@ -267,9 +337,14 @@ Each slice is measured against the numbers above on `Vulkan1`.
    (`caps::mrow_outs4`). Qwen3.5-4B 120.0 → 141.8 t/s, Qwen3.8-27B 25.3 → 27.1.
    The spec bandwidth (608 GB/s) puts the single-card ceilings at ~243 and
    ~40 t/s; the cold-weight mrow GEMV still runs 220–475 GB/s.
-7. Next: the mrow GEMV's load shape (Q4_K/Q5_K lanes reload the 32-byte qs
-   pair and the super-block header per 32-element sub-block), then dispatch
-   count, then prefill.
+7. **Done.** Decode dispatch count, above: `quant_q8` fused into its
+   producers, the clustered OUTS4 reduction, Q3_K/Q8_0 int8 on Xe2.
+   Qwen3.5-4B 142.1 → 149.2 t/s, Qwen3-8B 92.1 → 94.7, Qwen3.8-27B 27.2 → 28.4.
+   The load-shape idea this item listed (Q4_K lanes reload the qs pair) was
+   measured and is not the limit; the mrow GEMV is at ~560 GB/s on big shapes.
+8. Next: the remaining serial chain (attention output → `o_proj` quant, the
+   per-layer small ops), an IQ3_S int8 mrow build, the small-shape tail wave,
+   then prefill.
 
 ## MTP (speculative decode, `INFR_MTP=1`)
 

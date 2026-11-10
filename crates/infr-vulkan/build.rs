@@ -528,9 +528,11 @@ fn main() {
         // Decode twin of `rmsnorm`: 1024 threads + vec4 loads in the single rows==1 workgroup, to
         // buy back the memory-level parallelism the 256-thread build lacks (see rmsnorm.comp).
         ("rmsnorm", "rmsnorm_wide", &["-DWIDE"]),
+        ("rmsnorm_q8", "rmsnorm_q8", &[]),
         // Fused per-head RMSNorm + SiLU gate multiply (qwen35 DeltaNet z-gate, Op::GatedRmsNorm) —
         // same reduction as `rmsnorm`, one extra buffer + the gate multiply on store.
         ("rmsnorm", "rmsnorm_gate", &["-DGATE"]),
+        ("rmsnorm", "rmsnorm_gate_q8", &["-DGATE", "-DQ8"]),
         ("rmsnorm", "rmsnorm_add", &["-DADD"]),
         // f16-in/f16-out RMSNorm (llama4's post-rope weightless Q/K L2-norm, `Op::QkNorm` on the
         // f16 rope scratch — `w` stays f32).
@@ -576,6 +578,7 @@ fn main() {
         ("conv1d_shift", "conv1d_shift", &[]),
         ("copy_strided", "copy_strided", &[]),
         ("mul_sigmoid", "mul_sigmoid", &[]),
+        ("mul_sigmoid", "mul_sigmoid_q8", &["-DQ8"]),
         ("add", "add", &[]),
         ("add_bias", "add_bias", &[]),
         ("mul_vec", "mul_vec", &[]),
@@ -587,6 +590,8 @@ fn main() {
         ("silu_mul", "gelu_mul", &["-DGELU"]),
         ("silu_mul_fused", "silu_mul_fused", &[]),
         ("silu_mul_fused", "gelu_mul_fused", &["-DGELU"]),
+        ("silu_mul", "silu_mul_q8", &["-DQ8"]),
+        ("silu_mul_fused", "silu_mul_fused_q8", &["-DQ8"]),
         ("store_f16", "store_f16", &[]),
         ("store_f16", "store_f16_dyn", &["-DUSE_PARAMS"]),
         // Quantize a KV row into the Q8_0 cache. f32 source (V) + f16 source (un-fused roped K),
@@ -3567,6 +3572,18 @@ fn main() {
                 vec![
                     base.clone(),
                     (src_stem.to_string(), format!("{dst_stem}_sg16"), sg_defines),
+                ]
+            } else if *src_stem == "native_mmv_mrow"
+                && defines.contains(&"-DOUTS4")
+                && !defines.contains(&"-DFUSE_QUANT")
+            {
+                // Clustered-reduction twin of every OUTS4 int8 mrow build (`<stem>_cl`, see the
+                // shader's -DSG_CLUSTER doc), selected on Intel Xe2 only (`caps::mrow_cluster`).
+                let mut cl_defines = base.2.clone();
+                cl_defines.push("-DSG_CLUSTER".to_string());
+                vec![
+                    base.clone(),
+                    (src_stem.to_string(), format!("{dst_stem}_cl"), cl_defines),
                 ]
             } else {
                 vec![base]

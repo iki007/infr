@@ -514,6 +514,27 @@ mod tests {
         }
     }
 
+    /// Every OUTS4 int8 mrow build has its clustered-reduction twin: on Intel Xe2 the recorder
+    /// swaps EVERY OUTS4 dispatch to the twin (`caps::mrow_cluster`), so a build without one would
+    /// panic there, and a dtype half on the twin and half on the tree would break decode/verify
+    /// bit-identity.
+    #[test]
+    fn every_outs4_mrow_build_has_a_cluster_twin() {
+        use crate::gemm;
+        for &dt in infr_core::decode_spec::WEIGHT_QUANTS {
+            for (m4, res) in [(false, false), (true, false), (true, true)] {
+                if let Some((name, _)) = gemm::native_mmv_mrow_variant_spv(dt, true, m4, res) {
+                    let twin = gemm::native_mmv_mrow_cl_twin(name);
+                    assert_eq!(
+                        twin.map(|(n, _)| n),
+                        Some(format!("{name}_cl")).as_deref(),
+                        "{dt:?} {name}: no _cl twin"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn moe_mmq_dtypes_have_id_gemv_coverage() {
         for &d in infr_core::tensor::MOE_MMQ_DTYPES {
