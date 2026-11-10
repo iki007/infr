@@ -42,9 +42,9 @@ INFR_DEV=Vulkan1 cargo test --release -p infr-vulkan --no-fail-fast -- --include
 
 | model                       | infr first run | infr now  | llama.cpp Vulkan | llama.cpp SYCL |
 | --------------------------- | -------------- | --------- | ---------------- | -------------- |
-| Qwen3.5-4B Q4_K_M pp512     | 1571           | **3686**  | 3165             | 7031           |
+| Qwen3.5-4B Q4_K_M pp512     | 1571           | **4138**  | 3165             | 7031           |
 | Qwen3.5-4B Q4_K_M tg128     | 62.6           | **149.2** | 111.2            | 148.5          |
-| Qwen3.8-27B UD-Q4_K_M pp512 | 220            | 645       | 746              | 1087           |
+| Qwen3.8-27B UD-Q4_K_M pp512 | 220            | 735       | 746              | 1087           |
 | Qwen3.8-27B UD-Q4_K_M tg128 | 13.8           | **28.8**  | 23.1             | 29.9           |
 
 llama.cpp at `0f236bc21`; its 27B decode row is tg64. "infr first run" is
@@ -216,6 +216,33 @@ when the grid is under two waves (`Recorder::matmul_native_x256_splitk`,
 partial planes + the fixed-order `splitk_reduce`): 17408x5120 2.32 → 2.01 ms,
 6144x5120 0.91 → 0.83; three or four splits lose it to the partial traffic.
 4B pp512 3611 → 3686, pp2048 3609 → 3657; 27B pp512 634 → 645, pp2048 649.
+
+**16x64 warp tiles.** The spills came from the A side: each 32x32 warp loaded
+4 A fragments from global per k-step, and the fully unrolled loop hoisted all
+32 of them. A 16-row x 64-column warp tile (16 x 2 warps over the same 256x128
+tile, 2x4 fragments) halves the global A fragments per step and takes the
+extra operand traffic from the LDS weight tile instead: spills 117 → 100, and
+the m=512 5120x17408 GEMM Q4_K 1.95 → 1.62 ms (56.5 TFLOPS, past llama.cpp's
+1.70), Q5_K 1.97 → 1.77, IQ4_XS 2.00 → 1.78; Q5_K 17408x5120 split in two
+2.01 → 1.80 (llama.cpp 2.31). An 8x128 tile spills less (84) but is slower
+(Q4_K 2.19 ms). Qwen3.5-4B pp512 3686 → 4026, pp2048 3657 → 3967;
+Qwen3.8-27B pp512 645 → 707, pp2048 706.
+
+**Narrow weights at prefill.** The 5120x48 DeltaNet alpha/beta (32-wide on the
+4B) miss every GEMM tile (`gemm_ok` needs out_f % 64 == 0) and ran the per-row
+GEMV: m x out_f workgroups each re-decoding the weight, ~340 µs each, 96 per
+27B pp512. Two paths now, Xe2 only:
+
+- m >= 256 (out_f % 16 == 0, under one 128-column tile): the `_x256` tile with
+  a column guard (`_x256_cg`: columns past n stage zeros and are not stored),
+  split 16 ways along K since its grid is only ceil(m/256) workgroups.
+- 16 < m < 256: the multi-row f32 GEMV in 8-row blocks over one dispatch
+  (`native_gemv_mrow.comp -DROWBLK`). A row-block-per-workgroup layout re-reads
+  the activations per output, so at m=512 it only got 340 → 257 µs; the tile
+  path above takes those shapes.
+
+`shared_decode_parity` gains m=40 and m=300 cases at 512x48. Qwen3.5-4B pp512
+4026 → 4138; Qwen3.8-27B pp512 707 → 735, pp2048 731.
 
 What is left on the 27B (846 ms of GPU per pp512): the GEMMs at ~40 TFLOPS
 against llama.cpp's ~53 (5120x17408 2.3 vs 1.70 ms) are ~80% of it; then
@@ -479,10 +506,12 @@ Each slice is measured against the numbers above on `Vulkan1`.
     pp2048 2365 → 3609; Qwen3.8-27B pp512 558 → 634.
 11. **Done.** Split-K for the `_x256` GEMMs whose grid is under two waves.
     Qwen3.5-4B pp512 3611 → 3686; Qwen3.8-27B 634 → 645.
-12. Next: the `_x256` GEMM's register spills (A staged through LDS, or a
-    software-pipelined A load), the m>1 alpha/beta projections, then the
-    IQ4_XS decode lookup and the attention output → `o_proj` quant on dense
-    models.
+12. **Done.** 16x64 warp tiles for `_x256`, and the narrow prefill weights
+    (column-guarded `_x256_cg`, row-blocked multi-row GEMV): Qwen3.5-4B pp512
+    3686 → 4138, Qwen3.8-27B 645 → 735.
+13. Next: the remaining `_x256` spills (100), prefill's `store_f16` /
+    `splitk_reduce` / `silu_mul` passes, then the IQ4_XS decode lookup and the
+    attention output → `o_proj` quant on dense models.
 
 ## MTP (speculative decode, `INFR_MTP=1`)
 

@@ -2133,6 +2133,49 @@ fn lower_op(
                         in_f,
                         out_f,
                     );
+                } else if m >= 256
+                    && out_f < 128
+                    && out_f % 16 == 0
+                    && in_f % 128 == 0
+                    && be_.caps().f16_coopmat_8x16()
+                    && crate::gemm::native_gemm_warp_x256_cg(dt).is_some()
+                {
+                    // Prefill-sized m on a weight narrower than one GEMM column tile (Qwen3.5's
+                    // 48/32-wide DeltaNet alpha/beta): the `_x256` XMX tile with a column guard,
+                    // split 16 ways along K (its grid is ceil(m/256) workgroups). The activation's
+                    // f16 copy is usually already there from the qkv/z GEMMs on the same `x`.
+                    // Qwen3.8-27B pp512: 96 of these at ~340 µs each on the per-row GEMV.
+                    let mpad = m.div_ceil(256) * 256;
+                    let k16 = pooled(pool, be_, "lin_a16_x256", mpad * in_f * 2)?;
+                    if memo_prev != Some((*x, m, in_f)) {
+                        rec.store_f16(xb, pool[&k16].as_ref(), m * in_f, 0);
+                    }
+                    *mmv_memo = Some((*x, m, in_f));
+                    let splits = (in_f / 128).min(16);
+                    let pk = pooled(pool, be_, "x256_part", splits * mpad * out_f * 4)?;
+                    rec.matmul_native_x256_splitk(
+                        dt,
+                        pool[&k16].as_ref(),
+                        w,
+                        w_off,
+                        pool[&pk].as_ref(),
+                        y,
+                        m,
+                        in_f,
+                        out_f,
+                        splits,
+                    );
+                } else if m > 16
+                    && in_f % 32 == 0
+                    && be_.device_arch() == crate::caps::DeviceArch::IntelXe2
+                    && crate::gemm::native_mrow_rb_spv(dt).is_some()
+                {
+                    // Prefill-sized m on a weight the GEMM tiers can't take (out_f % 64 != 0:
+                    // Qwen3.5's DeltaNet alpha/beta): the per-row GEMV below would launch m x
+                    // out_f workgroups that each re-decode the weight. Measured on an Arc Pro B70
+                    // only (Qwen3.8-27B pp512: 96 x 5120x48 at ~340 µs each), hence the arch
+                    // gate. m <= 16 (decode, MTP verify) never reaches here.
+                    rec.linear_native_mrow_rb(dt, w, w_off, xb, y, m, in_f, out_f);
                 } else {
                     rec.linear_native(dt, w, w_off, xb, y, m, in_f, out_f);
                 }

@@ -208,7 +208,14 @@ void main() {
     iq4_lut_init();
 #endif
     GRID_INIT; // grid formats (IQ3_S): stage the codebook in shared; empty otherwise
+#ifdef COL_GUARD
+    // -DCOL_GUARD (`_x256_cg`, n % 16 == 0 but not a multiple of BN — Qwen3.5's 48-wide DeltaNet
+    // alpha/beta): a partial last column tile. Columns past n stage zeros (their weight rows do not
+    // exist) and their fragments are not stored.
+    uint tilesN = (pc.n + BN - 1u) / BN;
+#else
     uint tilesN = pc.n / BN;
+#endif
 #ifdef SPLIT_K
     uint tilesMN = (pc.mpad / BM) * tilesN;
     uint split = gl_WorkGroupID.x / tilesMN;
@@ -254,7 +261,15 @@ void main() {
             uint cc = slot % BN;
             uint kb = (slot / BN) * 32u;
             float v[32];
+#ifdef COL_GUARD
+            if (wgCol + cc < pc.n) {
+                dqblk(pc.w_base + (wgCol + cc) * pc.k + k0 + kb, v);
+            } else {
+                [[unroll]] for (uint kk = 0u; kk < 32u; kk++) { v[kk] = 0.0; }
+            }
+#else
             dqblk(pc.w_base + (wgCol + cc) * pc.k + k0 + kb, v);
+#endif
             [[unroll]] for (uint kk = 0u; kk < 32u; kk++) {
                 Bs[cc * SBK + kb + kk] = CMTYPE(v[kk]);
             }
@@ -295,6 +310,11 @@ void main() {
             // only, so a fragment starting at or past `m` is skipped. One that starts below `m`
             // ends below ceil(m/8)*8 <= the padded height (fragments are CM_M = 8 rows).
             if (cr >= pc.m) {
+                continue;
+            }
+#endif
+#ifdef COL_GUARD
+            if (cc >= pc.n) {
                 continue;
             }
 #endif

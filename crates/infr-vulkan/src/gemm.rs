@@ -132,6 +132,36 @@ pub(crate) fn native_streamed_build_spv(
     }
 }
 
+/// The `-DROWBLK` twin of [`native_mrow_spv`]: any number of rows in 8-row blocks, one dispatch
+/// (`Recorder::linear_native_mrow_rb`).
+pub(crate) fn native_mrow_rb_spv(
+    dtype: infr_core::DType,
+) -> Option<(&'static str, &'static [u32])> {
+    use infr_core::DType::*;
+    macro_rules! v {
+        ($name:literal) => {{
+            static S: OnceLock<Vec<u32>> = OnceLock::new();
+            Some((
+                $name,
+                S.get_or_init(|| {
+                    spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))
+                })
+                .as_slice(),
+            ))
+        }};
+    }
+    match dtype {
+        Q8_0 => v!("native_mrow_q8_0_rb"),
+        Q4K => v!("native_mrow_q4k_rb"),
+        Q5K => v!("native_mrow_q5k_rb"),
+        Q6K => v!("native_mrow_q6k_rb"),
+        Q3K => v!("native_mrow_q3k_rb"),
+        Iq4Xs => v!("native_mrow_iq4xs_rb"),
+        Iq4Nl => v!("native_mrow_iq4nl_rb"),
+        _ => None,
+    }
+}
+
 /// SPIR-V (kernel-cache name + words) for [`native_mrow_kernel_name`]'s pick — the multi-row GEMV's
 /// weight read from a `bufferDeviceAddress` arena; the sole weight build. Production dispatches it
 /// via [`crate::recorder::Recorder::linear_native_mrow`]; parity tests call the streamed entry
@@ -1585,6 +1615,34 @@ pub(crate) struct XmxGemm {
     pub bn: usize,
 }
 
+/// The column-guarded split-K twin of [`native_gemm_warp_x256`] (`_x256_cg`) for a weight
+/// narrower than one 128-column tile (n % 16 == 0): Qwen3.5's DeltaNet alpha/beta.
+pub(crate) fn native_gemm_warp_x256_cg(
+    dtype: infr_core::DType,
+) -> Option<(&'static str, &'static [u32])> {
+    use infr_core::DType::*;
+    macro_rules! v {
+        ($name:literal) => {{
+            static S: OnceLock<Vec<u32>> = OnceLock::new();
+            Some((
+                $name,
+                S.get_or_init(|| {
+                    spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))
+                })
+                .as_slice(),
+            ))
+        }};
+    }
+    match dtype {
+        Q8_0 => v!("native_gemm_warp_q8_0_x256_cg"),
+        Q4K => v!("native_gemm_warp_q4k_x256_cg"),
+        Q5K => v!("native_gemm_warp_q5k_x256_cg"),
+        Q6K => v!("native_gemm_warp_q6k_x256_cg"),
+        Iq4Xs => v!("native_gemm_warp_iq4xs_x256_cg"),
+        _ => None,
+    }
+}
+
 /// The split-K twin of [`native_gemm_warp_x256`] (`_x256_sk`: the same tile, each split storing
 /// a partial plane for `splitk_reduce`), for grids too small to fill the device.
 pub(crate) fn native_gemm_warp_x256_sk(
@@ -1617,7 +1675,7 @@ pub(crate) fn native_gemm_warp_x256_sk(
 }
 
 /// The Intel Xe2 large-m prefill tile (`native_gemm_warp.comp` `_x256`: BM=256 rows x BN=128
-/// columns, BK=128, 512 threads as 32 warps of 32x32, A read from global as f16). `None` for a
+/// columns, BK=128, 512 threads as 32 warps of 16x64, A read from global as f16). `None` for a
 /// dtype without the build or `n % 128 != 0` / `k % 128 != 0`; the caller then keeps
 /// [`native_gemm_warp_xmx`]'s tiles.
 pub(crate) fn native_gemm_warp_x256(

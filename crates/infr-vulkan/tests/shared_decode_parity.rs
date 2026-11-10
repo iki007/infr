@@ -77,6 +77,10 @@ fn vulkan_linear_all_weight_quants_m4_match_the_host_oracle() {
 ///   padded to 512 rows, BK=128), a partial second row tile.
 /// * m=300, 2048x384: the same tile split in two along K (`_x256_sk`, its grid is far under two
 ///   waves) — the split partials and the fixed-order reduce.
+/// * m=40, 512x48: n % 64 != 0 keeps it off every GEMM tile; on Xe2 the row-blocked multi-row
+///   GEMV (`native_mrow_*_rb`, 8-row blocks) takes the formats that have it.
+/// * m=300, 512x48: at m >= 256 the same narrow weight takes the column-guarded `_x256_cg`
+///   tile on Xe2 (columns past n zero-filled, split 4 ways along K here).
 ///
 /// f16 activations (coopmat) or int8 activations (`nc_mmq`) put the error in the same ~5e-3 band
 /// the m=4 tier documents, well under [`VK_TOL`]; a mis-decoded format or a wrong fragment layout
@@ -96,6 +100,10 @@ fn vulkan_linear_all_weight_quants_gemm_tier_match_the_host_oracle() {
     sweep_linear_on("vulkan Linear m=300", &be, &cases, |_| VK_TOL).assert_ok();
     let cases = weight_quant_cases(300, 2048, 384);
     sweep_linear_on("vulkan Linear m=300 k=2048", &be, &cases, |_| VK_TOL).assert_ok();
+    let cases = weight_quant_cases(40, 512, 48);
+    sweep_linear_on("vulkan Linear m=40 n=48", &be, &cases, |_| VK_TOL).assert_ok();
+    let cases = weight_quant_cases(300, 512, 48);
+    sweep_linear_on("vulkan Linear m=300 n=48", &be, &cases, |_| VK_TOL).assert_ok();
 }
 
 /// The dense float weight paths, which take no quant decode — the oracle reads the SAME bytes the

@@ -2249,7 +2249,12 @@ impl<'a> Recorder<'a> {
         n: usize,
         splits: usize,
     ) {
-        let (name, spv) = crate::gemm::native_gemm_warp_x256_sk(dtype).expect("x256 split-k spv");
+        // n % 128 != 0 (a weight narrower than one column tile): the column-guarded build.
+        let (name, spv) = if n.is_multiple_of(128) {
+            crate::gemm::native_gemm_warp_x256_sk(dtype).expect("x256 split-k spv")
+        } else {
+            crate::gemm::native_gemm_warp_x256_cg(dtype).expect("x256 column-guarded spv")
+        };
         self.label_gemm(name, m, k, n);
         let mpad = m.div_ceil(256) * 256;
         let kern = self.be.kernel_sg(name, spv, 3, 24, 16);
@@ -2260,7 +2265,7 @@ impl<'a> Recorder<'a> {
         push[12..16].copy_from_slice(&(w_base as u32).to_ne_bytes());
         push[16..20].copy_from_slice(&(splits as u32).to_ne_bytes());
         push[20..24].copy_from_slice(&(mpad as u32).to_ne_bytes());
-        let groups = ((mpad / 256) * (n / 128) * splits) as u32;
+        let groups = ((mpad / 256) * n.div_ceil(128) * splits) as u32;
         self.dispatch(
             kern,
             &[Self::vkb(a16), Self::vkb(w), Self::vkb(partials)],
@@ -3332,6 +3337,44 @@ impl<'a> Recorder<'a> {
             .device_addr()
             .expect("resident-BDA weight: linear_native_mrow requires a u64 BDA device address");
         self.linear_native_mrow_at(dtype, arena_addr, w_base, x, y, rows, in_f, out_f);
+    }
+
+    /// Multi-row native GEMV for prefill-sized `rows` on a weight too narrow for the GEMM tiles
+    /// (`native_gemv_mrow.comp -DROWBLK`): out_f x ceil(rows/8) workgroups, each decoding its
+    /// output's weight blocks once for an 8-row block. Caller checks `gemm::native_mrow_rb_spv`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn linear_native_mrow_rb(
+        &self,
+        dtype: infr_core::DType,
+        w: &dyn Buffer,
+        w_base: usize,
+        x: &dyn Buffer,
+        y: &dyn Buffer,
+        rows: usize,
+        in_f: usize,
+        out_f: usize,
+    ) {
+        assert_native_k("linear_native_mrow_rb", in_f);
+        let arena_addr = w
+            .device_addr()
+            .expect("resident-BDA weight: linear_native_mrow_rb requires a u64 BDA device address");
+        self.label_gemv("mrow_rb", rows, in_f, out_f);
+        let (name, spv) = crate::gemm::native_mrow_rb_spv(dtype).expect("native mrow rb spv");
+        let k = self.be.kernel(name, spv, 3, 24);
+        let mut push = [0u8; 24];
+        push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(in_f as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(out_f as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(w_base as u32).to_ne_bytes());
+        push[16..20].copy_from_slice(&(arena_addr as u32).to_ne_bytes());
+        push[20..24].copy_from_slice(&((arena_addr >> 32) as u32).to_ne_bytes());
+        self.dispatch_wide(
+            k,
+            &[Self::vkb(x), Self::vkb(x), Self::vkb(y)],
+            1,
+            &push,
+            (out_f * rows.div_ceil(8)) as u32,
+        );
     }
 
     /// `-DSTREAMED` twin of [`Self::linear_native_mrow`] (slice A1 build-variant: see

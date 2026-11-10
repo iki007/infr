@@ -46,8 +46,22 @@ void main() {
     // Flat-index recovery for a possibly-2-D dispatch grid — see native_mmv.comp's main() for why
     // an explicit early return is needed (the final `y_buf[...+o]` write below is unconditional on
     // o, unlike native_gemv_rm/sg's per-output-guarded writes).
+#ifdef ROWBLK
+    // -DROWBLK (prefill-sized m on a weight too narrow for the GEMM tiles, e.g. Qwen3.5's
+    // 5120x48 DeltaNet alpha/beta): the grid is out_f x ceil(rows/8) and each workgroup takes
+    // the 8-row block rb of `pc.rows` — one dispatch instead of the per-row GEMV's rows x out_f
+    // workgroups that each re-decode the weight.
+    uint unit = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
+    uint o = unit % pc.out_f;
+    uint r0 = (unit / pc.out_f) * MR;
+    if (r0 >= pc.rows) { return; }
+    uint nrows = min(MR, pc.rows - r0);
+#else
     uint o = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x; // grid = out_f: one wg/output
     if (o >= pc.out_f) { return; }
+    uint r0 = 0u;
+    uint nrows = pc.rows;
+#endif
     uint t = gl_LocalInvocationID.x;
     w_addr = arena_base(pc.arena_lo, pc.arena_hi); // resident slot base byte address; NO slot multiply
     uint wbase = pc.w_base + o * pc.in_f;
@@ -65,8 +79,8 @@ void main() {
         }
         uint xo4 = s * 8u;
         for (uint r = 0u; r < MR; r++) {
-            if (r < pc.rows) {
-                uint b = r * in_f4 + xo4;
+            if (r < nrows) {
+                uint b = (r0 + r) * in_f4 + xo4;
                 vec4 a = v4[0] * x4[b] + v4[1] * x4[b + 1u];
                 a += v4[2] * x4[b + 2u] + v4[3] * x4[b + 3u];
                 a += v4[4] * x4[b + 4u] + v4[5] * x4[b + 5u];
@@ -76,15 +90,15 @@ void main() {
         }
     }
     for (uint r = 0u; r < MR; r++) {
-        if (r < pc.rows) {
+        if (r < nrows) {
             float sg = subgroupAdd(acc[r]);
             if (subgroupElect()) { part[r * MAX_SG + gl_SubgroupID] = sg; }
         }
     }
     barrier();
-    if (t < pc.rows) {
+    if (t < nrows) {
         float tot = 0.0;
         for (uint s = 0u; s < gl_NumSubgroups; s++) { tot += part[t * MAX_SG + s]; }
-        y_buf[t * pc.out_f + o] = tot;
+        y_buf[(r0 + t) * pc.out_f + o] = tot;
     }
 }
