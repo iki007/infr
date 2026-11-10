@@ -5839,7 +5839,12 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
     // device-specific and stays here, so this path keeps its own loop body rather than an
     // `OpDispatch`. `record_decode_replay` can't even use this much — its skip set is MUTATED
     // mid-walk by the E2B `Linear`+`GatedAct` peephole.
-    for (op_idx, op) in infr_core::exec::live_ops(&graph.ops, &skip_op) {
+    // A run of Level Zero GEMMs on the same input (qkv + z, gate + up, q/k/v) is one chain: Level
+    // Zero waits once and signals once, with no empty Vulkan segment between its GEMMs. `Some(v)`
+    // while inside a chain whose first GEMM waited `v` (then `rec` is `None`).
+    let mut ze_chain: Option<u64> = None;
+    let mut live = infr_core::exec::live_ops(&graph.ops, &skip_op).peekable();
+    while let Some((op_idx, op)) = live.next() {
         // ── shutdown (SIGINT/SIGTERM) ─────────────────────────────────────────────────────────
         // Polled HERE — at the op/submit boundary INSIDE the forward — and not merely between
         // tokens, because on the devices that split (§ the splitter above) a single forward is
@@ -5857,8 +5862,9 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
         //     does. That is the irreducible part of the wait, and it is why the in-flight window
         //     (`MAX_INFLIGHT`) is the real latency bound.
         if shutdown_requested() {
-            let partial = rec.take().expect("segment always Some between ops");
-            partial.discard().map_err(|e| be(e.to_string()))?;
+            if let Some(partial) = rec.take() {
+                partial.discard().map_err(|e| be(e.to_string()))?;
+            }
             for seg in segments {
                 seg.wait().map_err(|e| be(e.to_string()))?;
             }
@@ -5924,27 +5930,40 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
                 Err(e) => return Err(abort_segment(rec.take(), e)),
             };
             // The producer may already have written this `x`'s f16 copy (`mmv_memo`, the same
-            // hand-off the `_x256` arm takes).
+            // hand-off the `_x256` arm takes); inside a chain it always has (same `x`).
             let memo_prev = mmv_memo.take();
             if memo_prev != Some((*x, m, in_f)) {
                 rec.as_ref()
-                    .expect("segment always Some between ops")
+                    .expect("a chain only links GEMMs on the same x")
                     .store_f16(xb, pool[&k16].as_ref(), m * in_f, 0);
             }
             mmv_memo = Some((*x, m, in_f));
-            let v = bridge.reserve();
             let sem = bridge.vk_semaphore();
-            let seg = rec
-                .take()
-                .expect("segment always Some between ops")
-                .finish_nowait_signal(sem, v)
-                .map_err(|e| be(e.to_string()))?;
-            submitted_dispatches += seg.dispatches();
-            segments.push_back(seg);
-            while segments.len() > MAX_INFLIGHT {
-                let old = segments.pop_front().expect("len > MAX_INFLIGHT >= 0");
-                old.wait().map_err(|e| be(e.to_string()))?;
-            }
+            // Start a chain: end the Vulkan segment signalling `v` for Level Zero to wait on.
+            let (v, wait) = match ze_chain {
+                Some(v) => (v, None),
+                None => {
+                    let v = bridge.reserve();
+                    let seg = rec
+                        .take()
+                        .expect("segment always Some between ops")
+                        .finish_nowait_signal(sem, v)
+                        .map_err(|e| be(e.to_string()))?;
+                    submitted_dispatches += seg.dispatches();
+                    segments.push_back(seg);
+                    while segments.len() > MAX_INFLIGHT {
+                        let old = segments.pop_front().expect("len > MAX_INFLIGHT >= 0");
+                        old.wait().map_err(|e| be(e.to_string()))?;
+                    }
+                    (v, Some(v))
+                }
+            };
+            // Continue the chain when the next live op is another Level Zero GEMM on this `x`.
+            let chained = live.peek().is_some_and(|(ni, nop)| {
+                ze_ops.contains(ni)
+                    && matches!(nop, Op::Linear { x: nx, m: nm, in_f: nk, .. }
+                        if nx == x && *nm as usize == m && *nk as usize == in_f)
+            });
             let dt = graph.desc(*weight).dtype;
             bridge.gemm(
                 be_,
@@ -5956,12 +5975,18 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
                 m,
                 in_f,
                 out_f,
-                v,
+                wait,
+                (!chained).then_some(v + 1),
             )?;
-            let fresh = be_.recorder()?;
-            fresh.seed_barrier();
-            fresh.wait_timeline(sem, v + 1);
-            rec = Some(fresh);
+            if chained {
+                ze_chain = Some(v);
+            } else {
+                ze_chain = None;
+                let fresh = be_.recorder()?;
+                fresh.seed_barrier();
+                fresh.wait_timeline(sem, v + 1);
+                rec = Some(fresh);
+            }
             continue;
         }
         // Every error exit below goes through `abort_segment`: the segment being recorded has no

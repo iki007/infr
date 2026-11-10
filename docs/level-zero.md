@@ -167,6 +167,10 @@ L2 across all N tiles. Q4_K, alone: m=512 5120 -> 17408 0.93 ms as one launch, 2
 packets; 17408 -> 5120 1.07 vs 2 x 0.41 (85 -> 112 TFLOPS). End to end it moves the 27B pp2048
 (m=1024 ubatches) 967 -> 1028 t/s (Vulkan only 739) and leaves pp512 at ~1010.
 
+A run of offloaded Linears on the same input (qkv + z, gate + up, q/k/v) is one Level Zero chain:
+one wait, the GEMMs back to back, one signal — no empty Vulkan segment and two handoffs fewer per
+link. 27B pp512 1008 -> 1037, pp2048 1028 -> 1047; 4B pp512 5138 -> 5242 (output unchanged).
+
 Where the 27B pp512 goes now (~508 ms per 512 tokens): with the Level Zero launches skipped (wrong
 output, timing only) it runs at 2198 t/s, so ~233 ms is everything but the offloaded GEMMs —
 attention, DeltaNet, norms, the handoffs, and the ~10% of GEMM work in formats still on Vulkan

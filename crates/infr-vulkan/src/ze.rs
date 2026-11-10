@@ -136,8 +136,9 @@ mod imp {
             g.value - 1
         }
 
-        /// `C[m, out_f] = A16[m, in_f] · Wᵀ` on Level Zero, after the timeline reaches `wait`,
-        /// signalling `wait + 1`. `a16`/`c` are exchange-arena views, `w` a weight in an exportable
+        /// `C[m, out_f] = A16[m, in_f] · Wᵀ` on Level Zero: after the timeline reaches `wait`
+        /// (`None`: right after the previous GEMM of a chain), then signalling `signal` (`None`:
+        /// the chain continues). `a16`/`c` are exchange-arena views, `w` a weight in an exportable
         /// block with `w_off` an ELEMENT offset (row-aligned, as `Op::Linear`'s).
         #[allow(clippy::too_many_arguments)]
         pub(crate) fn gemm(
@@ -151,7 +152,8 @@ mod imp {
             m: usize,
             in_f: usize,
             out_f: usize,
-            wait: u64,
+            wait: Option<u64>,
+            signal: Option<u64>,
         ) -> Result<()> {
             let blk = match dt {
                 DType::Q4K => 144,
@@ -174,7 +176,9 @@ mod imp {
             e(k.arg_buf_at(1, &g.imports[&w_id], w_base + w_off_b))?;
             e(k.arg(4, out_f as i32))?;
             e(k.arg(5, in_f as i32))?;
-            e(g.gpu.wait_semaphore(&g.ze_sem, wait))?;
+            if let Some(v) = wait {
+                e(g.gpu.wait_semaphore(&g.ze_sem, v))?;
+            }
             // One launch per 256-row packet (one workgroup row each): a packet's A stays in L2
             // across all the N tiles. Measured on the B70 (Q4_K): m=512 5120->17408 0.93 ms as one
             // launch vs 2 x 0.42 as packets, 17408->5120 1.07 vs 2 x 0.41 (85 -> 112 TFLOPS).
@@ -186,7 +190,10 @@ mod imp {
                 e(k.arg(3, mc as i32))?;
                 e(g.gpu.launch(k, [1, (out_f / 64) as u32, 1]))?;
             }
-            e(g.gpu.signal_semaphore(&g.ze_sem, wait + 1))
+            match signal {
+                Some(v) => e(g.gpu.signal_semaphore(&g.ze_sem, v)),
+                None => Ok(()),
+            }
         }
 
         /// Drop the import of a retired exportable allocation.
@@ -363,7 +370,8 @@ mod imp {
             _: usize,
             _: usize,
             _: usize,
-            _: u64,
+            _: Option<u64>,
+            _: Option<u64>,
         ) -> Result<()> {
             match *self {}
         }
