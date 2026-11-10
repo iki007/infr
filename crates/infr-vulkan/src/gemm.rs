@@ -2546,6 +2546,31 @@ pub(crate) fn rmsnorm_gate_q8_spv() -> &'static [u32] {
         )))
     })
 }
+/// SPIR-V of a prefill producer's `-DY16` build — `kind` one of `rmsnorm`, `rmsnorm_gate`,
+/// `silu_mul`, `silu_mul_fused`, `mul_sigmoid` — which also writes an f16 copy of its output for
+/// the Intel Xe2 `_x256` GEMM that reads it next (`adapter::prefill_x256_linear_next`).
+pub(crate) fn y16_spv(kind: &str) -> (&'static str, &'static [u32]) {
+    macro_rules! v {
+        ($name:literal) => {{
+            static S: OnceLock<Vec<u32>> = OnceLock::new();
+            (
+                $name,
+                S.get_or_init(|| {
+                    spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))
+                })
+                .as_slice(),
+            )
+        }};
+    }
+    match kind {
+        "rmsnorm" => v!("rmsnorm_y16"),
+        "rmsnorm_gate" => v!("rmsnorm_gate_y16"),
+        "silu_mul" => v!("silu_mul_y16"),
+        "silu_mul_fused" => v!("silu_mul_fused_y16"),
+        "mul_sigmoid" => v!("mul_sigmoid_y16"),
+        _ => unreachable!("no Y16 build for {kind}"),
+    }
+}
 /// SPIR-V for the fused per-head RMSNorm + SiLU gate multiply (`rmsnorm.comp`'s -DGATE build,
 /// `Op::GatedRmsNorm`) — the qwen35 DeltaNet z-gate, one dispatch instead of `rmsnorm`+`silu_mul`.
 #[cfg_attr(infr_profile, infr_prof::instrument)]

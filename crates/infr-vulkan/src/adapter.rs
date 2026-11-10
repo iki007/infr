@@ -778,6 +778,61 @@ fn decode_int8_linear_next(
         && mmv_mw_choice(be_.caps(), be_.device_arch(), vk, dt, in_f, out_f).is_some()
 }
 
+/// Is `graph.ops[op_idx + 1]` a prefill Linear on `x` (`m == rows >= 256`, `in_f == dim`) that
+/// takes one of the Intel Xe2 `_x256` GEMM paths reading its A operand as the f16 copy
+/// `lin_a16_x256` (the wide tile, or the column-guarded narrow one)? Its producer then writes that
+/// copy itself (a `-DY16` build) and hands it over through `mmv_memo`, so the GEMM skips its
+/// `store_f16` pass. Mirrors the two paths' gates; a miss only costs the extra f16 write.
+fn prefill_x256_linear_next(
+    be_: &VulkanBackend,
+    graph: &Graph,
+    op_idx: usize,
+    x: TensorId,
+    dim: usize,
+    rows: usize,
+) -> bool {
+    let Some(Op::Linear {
+        x: nx,
+        weight,
+        m,
+        in_f,
+        out_f,
+        ..
+    }) = graph.ops.get(op_idx + 1)
+    else {
+        return false;
+    };
+    let (m, in_f, out_f) = (*m as usize, *in_f as usize, *out_f as usize);
+    if *nx != x || m != rows || m < 256 || in_f != dim || !be_.caps().f16_coopmat_8x16() {
+        return false;
+    }
+    let dt = graph.desc(*weight).dtype;
+    let wide = out_f % 64 == 0
+        && in_f % 32 == 0
+        && crate::gemm::native_gemm_warp_x256(dt, out_f, in_f).is_some();
+    let narrow = out_f < 128
+        && out_f % 16 == 0
+        && in_f % 128 == 0
+        && crate::gemm::native_gemm_warp_x256_cg(dt).is_some();
+    native_dense_supported(dt) && (wide || narrow)
+}
+
+/// The `_x256` GEMM's f16 A buffer for an `rows x dim` activation (rows padded to the 256-row
+/// tile) — the same pool key the GEMM arm uses.
+fn x256_a16(
+    pool: &mut ScratchPool,
+    be_: &VulkanBackend,
+    rows: usize,
+    dim: usize,
+) -> Result<(&'static str, usize)> {
+    pooled(
+        pool,
+        be_,
+        "lin_a16_x256",
+        rows.div_ceil(256) * 256 * dim * 2,
+    )
+}
+
 /// Get-or-alloc the pool buffer for (tag, bytes); returns the map key so callers can hold several
 /// pool buffers at once via immutable indexing (`pool[&k].as_ref()`).
 #[cfg_attr(infr_profile, infr_prof::instrument)]
@@ -1162,6 +1217,20 @@ fn lower_op(
                     *eps,
                 );
                 *mmv_memo = Some((*dst, 1, dim));
+                return Ok(());
+            }
+            if rows >= 256 && prefill_x256_linear_next(be_, graph, op_idx, *dst, dim, rows) {
+                let k16 = x256_a16(pool, be_, rows, dim)?;
+                rec.rmsnorm_y16(
+                    r(*x)?,
+                    r(*weight)?,
+                    r(*dst)?,
+                    pool[&k16].as_ref(),
+                    rows,
+                    dim,
+                    *eps,
+                );
+                *mmv_memo = Some((*dst, rows, dim));
                 return Ok(());
             }
             rec.rmsnorm(r(*x)?, r(*weight)?, r(*dst)?, rows, dim, *eps);
@@ -2396,6 +2465,13 @@ fn lower_op(
                         *mmv_memo = Some((*dst, 1, n));
                         return Ok(());
                     }
+                    let (m, nffu) = (*rows as usize, *nff as usize);
+                    if m >= 256 && prefill_x256_linear_next(be_, graph, op_idx, *dst, nffu, m) {
+                        let k16 = x256_a16(pool, be_, m, nffu)?;
+                        rec.silu_mul_y16(g_, u_, y, pool[&k16].as_ref(), n, *swiglu_clamp);
+                        *mmv_memo = Some((*dst, m, nffu));
+                        return Ok(());
+                    }
                     rec.silu_mul(g_, u_, y, n, *swiglu_clamp);
                 }
                 Activation::Sigmoid => {
@@ -2431,6 +2507,22 @@ fn lower_op(
                             *gate_block_width as usize,
                         );
                         *mmv_memo = Some((*dst, 1, n));
+                        return Ok(());
+                    }
+                    let (m, nffu) = (*rows as usize, *nff as usize);
+                    if m >= 256 && prefill_x256_linear_next(be_, graph, op_idx, *dst, nffu, m) {
+                        let k16 = x256_a16(pool, be_, m, nffu)?;
+                        rec.mul_sigmoid_y16(
+                            u_,
+                            g_,
+                            y,
+                            pool[&k16].as_ref(),
+                            n,
+                            *gate_stride as usize,
+                            nffu,
+                            *gate_block_width as usize,
+                        );
+                        *mmv_memo = Some((*dst, m, nffu));
                         return Ok(());
                     }
                     rec.mul_sigmoid(
@@ -2497,6 +2589,15 @@ fn lower_op(
                     *swiglu_clamp,
                 );
                 *mmv_memo = Some((*dst, 1, nff));
+                return Ok(());
+            }
+            if matches!(act, Activation::Silu)
+                && rows >= 256
+                && prefill_x256_linear_next(be_, graph, op_idx, *dst, nff, rows)
+            {
+                let k16 = x256_a16(pool, be_, rows, nff)?;
+                rec.silu_mul_fused_y16(gu_, y, pool[&k16].as_ref(), rows, nff, *swiglu_clamp);
+                *mmv_memo = Some((*dst, rows, nff));
                 return Ok(());
             }
             match act {
@@ -3892,6 +3993,22 @@ fn lower_op(
                     *eps,
                 );
                 *mmv_memo = Some((*dst, 1, n));
+                return Ok(());
+            }
+            let (m, width) = (*rows as usize, *n_head as usize * hd);
+            if m >= 256 && prefill_x256_linear_next(be_, graph, op_idx, *dst, width, m) {
+                let k16 = x256_a16(pool, be_, m, width)?;
+                rec.rmsnorm_gate_y16(
+                    r(*x)?,
+                    r(*weight)?,
+                    r(*gate)?,
+                    r(*dst)?,
+                    pool[&k16].as_ref(),
+                    nrow,
+                    hd,
+                    *eps,
+                );
+                *mmv_memo = Some((*dst, m, width));
                 return Ok(());
             }
             rec.rmsnorm_gate(r(*x)?, r(*weight)?, r(*gate)?, r(*dst)?, nrow, hd, *eps);

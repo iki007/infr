@@ -42,9 +42,9 @@ INFR_DEV=Vulkan1 cargo test --release -p infr-vulkan --no-fail-fast -- --include
 
 | model                       | infr first run | infr now  | llama.cpp Vulkan | llama.cpp SYCL |
 | --------------------------- | -------------- | --------- | ---------------- | -------------- |
-| Qwen3.5-4B Q4_K_M pp512     | 1571           | **4138**  | 3165             | 7031           |
+| Qwen3.5-4B Q4_K_M pp512     | 1571           | **4178**  | 3165             | 7031           |
 | Qwen3.5-4B Q4_K_M tg128     | 62.6           | **149.2** | 111.2            | 148.5          |
-| Qwen3.8-27B UD-Q4_K_M pp512 | 220            | 735       | 746              | 1087           |
+| Qwen3.8-27B UD-Q4_K_M pp512 | 220            | 739       | 746              | 1087           |
 | Qwen3.8-27B UD-Q4_K_M tg128 | 13.8           | **28.8**  | 23.1             | 29.9           |
 
 llama.cpp at `0f236bc21`; its 27B decode row is tg64. "infr first run" is
@@ -243,6 +243,22 @@ GEMV: m x out_f workgroups each re-decoding the weight, ~340 µs each, 96 per
 
 `shared_decode_parity` gains m=40 and m=300 cases at 512x48. Qwen3.5-4B pp512
 4026 → 4138; Qwen3.8-27B pp512 707 → 735, pp2048 731.
+
+**The f16 A copy written by its producer.** Every `_x256` GEMM input was a
+separate `store_f16` pass (304 per 27B pp512, ~50 µs each). The prefill norm,
+the DeltaNet gated norm, both SwiGLU forms and the attention sigmoid gate now
+have `-DY16` builds that also write the f16 copy (the same `float16_t()` of the
+same f32 value: a 400-token prompt's greedy output is byte-identical) and hand
+it over through `mmv_memo` (`adapter::prefill_x256_linear_next`). 304 → 48
+conversions. Qwen3.5-4B pp512 4138 → 4178, pp2048 4003 → 4130; Qwen3.8-27B
+pp512 735 → 739, pp2048 731 → 741.
+
+Where the GEMM tile stands: alone, the m=512 5120x17408 GEMM runs ~1.62–1.85
+ms in short bursts and ~2.0 ms under sustained load (the card clocks down:
+1.86 → 2.12 ms over 200 back-to-back runs); llama.cpp holds 1.55–1.60 ms
+in-stream. With f16 weights (nothing to decode) the same tile is no faster
+(1.79 ms), so the limit is the matmul pipeline (A from global, ~100 spills),
+not the decode.
 
 What is left on the 27B (846 ms of GPU per pp512): the GEMMs at ~40 TFLOPS
 against llama.cpp's ~53 (5120x17408 2.3 vs 1.70 ms) are ~80% of it; then
@@ -509,9 +525,11 @@ Each slice is measured against the numbers above on `Vulkan1`.
 12. **Done.** 16x64 warp tiles for `_x256`, and the narrow prefill weights
     (column-guarded `_x256_cg`, row-blocked multi-row GEMV): Qwen3.5-4B pp512
     3686 → 4138, Qwen3.8-27B 645 → 735.
-13. Next: the remaining `_x256` spills (100), prefill's `store_f16` /
-    `splitk_reduce` / `silu_mul` passes, then the IQ4_XS decode lookup and the
-    attention output → `o_proj` quant on dense models.
+13. **Done.** The producers write the `_x256` GEMMs' f16 A copy (`-DY16`):
+    Qwen3.5-4B pp512 4138 → 4178, pp2048 → 4130; Qwen3.8-27B 735 → 739.
+14. Next: the `_x256` matmul pipeline (A through LDS with a partial-block
+    decode, as llama.cpp's mul_mm stages both operands), then the IQ4_XS
+    decode lookup and the attention output → `o_proj` quant on dense models.
 
 ## MTP (speculative decode, `INFR_MTP=1`)
 

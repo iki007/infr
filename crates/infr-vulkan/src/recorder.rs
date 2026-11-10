@@ -4622,6 +4622,34 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    /// Prefill [`Self::rmsnorm`] (rows > 1, the 256-thread build) that also writes an f16 copy of
+    /// `y` into `y16` — the A operand of the `_x256` GEMM that reads `y` next.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rmsnorm_y16(
+        &self,
+        x: &dyn Buffer,
+        w: &dyn Buffer,
+        y: &dyn Buffer,
+        y16: &dyn Buffer,
+        rows: usize,
+        dim: usize,
+        eps: f32,
+    ) {
+        let (name, spv) = crate::gemm::y16_spv("rmsnorm");
+        let k = self.be.kernel_sg(name, spv, 4, 12, 32);
+        let mut push = [0u8; 12];
+        push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(dim as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&eps.to_ne_bytes());
+        self.dispatch(
+            k,
+            &[Self::vkb(x), Self::vkb(w), Self::vkb(y), Self::vkb(y16)],
+            2,
+            &push,
+            rows as u32,
+        );
+    }
+
     /// WEIGHTLESS RMSNorm: `y[i] = x[i] * inversesqrt(mean(x²) + eps)`, one workgroup per row
     /// (`rmsnorm.comp`'s -DNO_WEIGHT build) — `Op::QkNorm { weight: None }`, deepseek4's bare
     /// per-head `ggml_rms_norm` on Q. Same reduction as [`Self::rmsnorm`], one binding fewer.
@@ -4776,6 +4804,41 @@ impl<'a> Recorder<'a> {
                 Self::vkb(sact),
             ],
             4,
+            &push,
+            rows as u32,
+        );
+    }
+
+    /// [`Self::rmsnorm_gate`] that also writes an f16 copy of `y` into `y16` (prefill; see
+    /// [`Self::rmsnorm_y16`]).
+    #[allow(clippy::too_many_arguments)]
+    pub fn rmsnorm_gate_y16(
+        &self,
+        x: &dyn Buffer,
+        w: &dyn Buffer,
+        z: &dyn Buffer,
+        y: &dyn Buffer,
+        y16: &dyn Buffer,
+        rows: usize,
+        dim: usize,
+        eps: f32,
+    ) {
+        let (name, spv) = crate::gemm::y16_spv("rmsnorm_gate");
+        let k = self.be.kernel_sg(name, spv, 5, 12, 32);
+        let mut push = [0u8; 12];
+        push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(dim as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&eps.to_ne_bytes());
+        self.dispatch(
+            k,
+            &[
+                Self::vkb(x),
+                Self::vkb(w),
+                Self::vkb(z),
+                Self::vkb(y),
+                Self::vkb(y16),
+            ],
+            2,
             &push,
             rows as u32,
         );
@@ -8076,6 +8139,59 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    /// [`Self::silu_mul`] that also writes an f16 copy of `y` into `y16` (prefill; see
+    /// [`Self::rmsnorm_y16`]).
+    pub fn silu_mul_y16(
+        &self,
+        gate: &dyn Buffer,
+        up: &dyn Buffer,
+        y: &dyn Buffer,
+        y16: &dyn Buffer,
+        n: usize,
+        clamp: Option<f32>,
+    ) {
+        let (name, spv) = crate::gemm::y16_spv("silu_mul");
+        let k = self.be.kernel(name, spv, 4, 36);
+        let mut push = [0u8; 36];
+        push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
+        push[28..32].copy_from_slice(&(u32::from(clamp.is_some())).to_ne_bytes());
+        push[32..36].copy_from_slice(&clamp.unwrap_or(0.0).to_ne_bytes());
+        self.dispatch(
+            k,
+            &[Self::vkb(gate), Self::vkb(up), Self::vkb(y), Self::vkb(y16)],
+            2,
+            &push,
+            (n as u32).div_ceil(64),
+        );
+    }
+
+    /// [`Self::silu_mul_fused`] that also writes an f16 copy of `y` into `y16` (prefill; see
+    /// [`Self::rmsnorm_y16`]).
+    pub fn silu_mul_fused_y16(
+        &self,
+        gu: &dyn Buffer,
+        y: &dyn Buffer,
+        y16: &dyn Buffer,
+        rows: usize,
+        nff: usize,
+        clamp: Option<f32>,
+    ) {
+        let (name, spv) = crate::gemm::y16_spv("silu_mul_fused");
+        let k = self.be.kernel(name, spv, 3, 16);
+        let mut push = [0u8; 16];
+        push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(nff as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(u32::from(clamp.is_some())).to_ne_bytes());
+        push[12..16].copy_from_slice(&clamp.unwrap_or(0.0).to_ne_bytes());
+        self.dispatch(
+            k,
+            &[Self::vkb(gu), Self::vkb(y), Self::vkb(y16)],
+            2,
+            &push,
+            ((rows * nff) as u32).div_ceil(64),
+        );
+    }
+
     /// Gated-DeltaNet recurrence, one token (qwen35 SSM). The persistent `state` buffer
     /// `[nv*kd*vd]` is updated in place; `out` is `[nv*vd]`. One workgroup per value head; the
     /// `nk` q/k heads are tiled up to `nv`. See shaders/deltanet.comp.
@@ -8740,6 +8856,36 @@ impl<'a> Recorder<'a> {
                 Self::vkb(sact),
             ],
             4,
+            &push,
+            (n as u32).div_ceil(64),
+        );
+    }
+
+    /// [`Self::mul_sigmoid`] that also writes an f16 copy of `y` into `y16` (prefill; see
+    /// [`Self::rmsnorm_y16`]).
+    #[allow(clippy::too_many_arguments)]
+    pub fn mul_sigmoid_y16(
+        &self,
+        a: &dyn Buffer,
+        b: &dyn Buffer,
+        y: &dyn Buffer,
+        y16: &dyn Buffer,
+        n: usize,
+        gate_stride_el: usize,
+        gate_row_width: usize,
+        gate_block_width: usize,
+    ) {
+        let (name, spv) = crate::gemm::y16_spv("mul_sigmoid");
+        let kern = self.be.kernel(name, spv, 4, 16);
+        let mut push = [0u8; 16];
+        push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(gate_stride_el as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(gate_row_width as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(gate_block_width as u32).to_ne_bytes());
+        self.dispatch(
+            kern,
+            &[Self::vkb(a), Self::vkb(b), Self::vkb(y), Self::vkb(y16)],
+            2,
             &push,
             (n as u32).div_ceil(64),
         );

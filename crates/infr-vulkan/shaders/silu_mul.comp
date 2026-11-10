@@ -25,6 +25,12 @@
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
 #endif
+// -DY16 (prefill): also writes an f16 copy of y for the Intel Xe2 `_x256` GEMM that reads it next
+// (see rmsnorm.comp's -DY16).
+#ifdef Y16
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+#endif
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
 layout(push_constant) uniform PC {
@@ -35,6 +41,9 @@ layout(push_constant) uniform PC {
 layout(binding = 0) readonly buffer GB { float gate[]; };
 layout(binding = 1) readonly buffer UB { float up[]; };
 layout(binding = 2) buffer YB { float y[]; };
+#ifdef Y16
+layout(binding = 3) writeonly buffer Y16B { float16_t y16[]; };
+#endif
 #ifdef Q8
 layout(binding = 3) writeonly buffer QBuf { int8_t qa[]; };
 layout(binding = 4) writeonly buffer DBuf { float16_t dact[]; };
@@ -97,6 +106,9 @@ void main() {
     if (pc.do_clamp != 0u) { u = clamp(u, -pc.limit, pc.limit); }
     float v = a * u;
     y[i] = v;
+#ifdef Y16
+    y16[i] = float16_t(v);
+#endif
 #ifdef Q8
     quant_block(i, v);
 #endif

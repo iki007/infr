@@ -525,6 +525,7 @@ fn main() {
             &["-DMLA_SG", "-DFREQ_FACTORS", "-DKEY_BIAS"],
         ),
         ("rmsnorm", "rmsnorm", &[]),
+        ("rmsnorm", "rmsnorm_y16", &["-DY16"]),
         // Decode twin of `rmsnorm`: 1024 threads + vec4 loads in the single rows==1 workgroup, to
         // buy back the memory-level parallelism the 256-thread build lacks (see rmsnorm.comp).
         ("rmsnorm", "rmsnorm_wide", &["-DWIDE"]),
@@ -532,6 +533,7 @@ fn main() {
         // Fused per-head RMSNorm + SiLU gate multiply (qwen35 DeltaNet z-gate, Op::GatedRmsNorm) —
         // same reduction as `rmsnorm`, one extra buffer + the gate multiply on store.
         ("rmsnorm", "rmsnorm_gate", &["-DGATE"]),
+        ("rmsnorm", "rmsnorm_gate_y16", &["-DGATE", "-DY16"]),
         ("rmsnorm", "rmsnorm_gate_q8", &["-DGATE", "-DQ8"]),
         ("rmsnorm", "rmsnorm_add", &["-DADD"]),
         // f16-in/f16-out RMSNorm (llama4's post-rope weightless Q/K L2-norm, `Op::QkNorm` on the
@@ -579,6 +581,7 @@ fn main() {
         ("copy_strided", "copy_strided", &[]),
         ("mul_sigmoid", "mul_sigmoid", &[]),
         ("mul_sigmoid", "mul_sigmoid_q8", &["-DQ8"]),
+        ("mul_sigmoid", "mul_sigmoid_y16", &["-DY16"]),
         ("add", "add", &[]),
         ("add_bias", "add_bias", &[]),
         ("mul_vec", "mul_vec", &[]),
@@ -591,6 +594,8 @@ fn main() {
         ("silu_mul_fused", "silu_mul_fused", &[]),
         ("silu_mul_fused", "gelu_mul_fused", &["-DGELU"]),
         ("silu_mul", "silu_mul_q8", &["-DQ8"]),
+        ("silu_mul", "silu_mul_y16", &["-DY16"]),
+        ("silu_mul_fused", "silu_mul_fused_y16", &["-DY16"]),
         ("silu_mul_fused", "silu_mul_fused_q8", &["-DQ8"]),
         ("store_f16", "store_f16", &[]),
         ("store_f16", "store_f16_dyn", &["-DUSE_PARAMS"]),
