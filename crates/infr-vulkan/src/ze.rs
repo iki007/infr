@@ -1,12 +1,12 @@
-//! Level Zero prefill GEMMs between Vulkan segments — the hybrid of backlog B102
-//! (`docs/level-zero.md`). Opt-in: `INFR_ZE_GEMM` (`kernels.vulkan.ze_gemm`).
+//! Level Zero prefill kernels between Vulkan segments — the hybrid of backlog B102
+//! (`docs/level-zero.md`). Default on for Intel Xe2; `INFR_ZE_GEMM=0` disables it.
 //!
 //! On an Intel Xe2 card driven by both Mesa ANV and the Intel compute runtime, the prefill GEMMs
-//! of the formats `infr-ze` has DPAS kernels for run as Level Zero kernels on the same card, while
-//! every other op stays on Vulkan. The pieces:
+//! of the formats `infr-ze` has DPAS kernels for, their joining elementwise ops, and compatible
+//! head-dim-256 prefill attention run on the same card. The remaining ops stay on Vulkan.
 //!
 //! - **Memory**: the weight blocks (`bda_weight_alloc`) and an *exchange arena* holding the
-//!   offloaded GEMMs' f16 A copies and outputs are dedicated exportable allocations
+//!   offloaded kernels' activations, plus the KV caches, are dedicated exportable allocations
 //!   (`alloc_exportable`); Level Zero imports each once as a dma-buf (keyed by its `export_id`) and
 //!   addresses tensors as base + offset. Graph tensors in the arena are ordinary `BdaSub` views,
 //!   so every Vulkan op reads and writes them unchanged.
@@ -92,6 +92,7 @@ mod imp {
         q6k: infr_ze::Kernel,
         q3k: infr_ze::Kernel,
         iq4nl: infr_ze::Kernel,
+        attn256: infr_ze::Kernel,
         rmsnorm: infr_ze::Kernel,
         swiglu: infr_ze::Kernel,
         add: infr_ze::Kernel,
@@ -119,10 +120,12 @@ mod imp {
             let iq = infr_ze::kernels::gemm_iq4().ok_or("infr-ze built without ocloc")?;
             let ew = infr_ze::kernels::elementwise().ok_or("infr-ze built without ocloc")?;
             let k16 = infr_ze::kernels::gemm_kq16().ok_or("infr-ze built without ocloc")?;
+            let fa = infr_ze::kernels::attn_fa().ok_or("infr-ze built without ocloc")?;
             let kq = gpu.module(kq).map_err(|e| e.to_string())?;
             let iq = gpu.module(iq).map_err(|e| e.to_string())?;
             let ew = gpu.module(ew).map_err(|e| e.to_string())?;
             let k16 = gpu.module(k16).map_err(|e| e.to_string())?;
+            let fa = gpu.module(fa).map_err(|e| e.to_string())?;
             let kernel = |m: &std::rc::Rc<infr_ze::Module>, name: &str, wg: u32| {
                 let k = m.kernel(name).map_err(|e| e.to_string())?;
                 k.group_size(wg, 1, 1).map_err(|e| e.to_string())?;
@@ -138,6 +141,7 @@ mod imp {
                 kernel(&k16, "gemm_q3k", 128)?,
                 kernel(&iq, "gemm_iq4nl", 128)?,
             );
+            let attn256 = kernel(&fa, "attn_fa256", 128)?;
             let (rmsnorm, swiglu, add, to_f16) = (
                 kernel(&ew, "rmsnorm", 256)?,
                 kernel(&ew, "swiglu", 256)?,
@@ -157,6 +161,7 @@ mod imp {
                 q6k,
                 q3k,
                 iq4nl,
+                attn256,
                 rmsnorm,
                 swiglu,
                 add,
@@ -310,6 +315,43 @@ mod imp {
                 .launch(&g.swiglu, [(rows * nff).div_ceil(256) as u32, 1, 1]))
         }
 
+        /// Flash-attention prefill, head dim 256 (`attn_fa256`): `q` f16 `[rows, nh, 256]`, `kc`/`vc`
+        /// f16 caches `[kv_len.., nkv, 256]` (no ring), `o` f32 `[rows, nh, 256]`; causal from
+        /// `pos`, `window` (0 = none), `scale` (0 = 1/16).
+        #[allow(clippy::too_many_arguments)]
+        pub(crate) fn attention(
+            &self,
+            be_: &VulkanBackend,
+            q: &dyn Buffer,
+            kc: &dyn Buffer,
+            vc: &dyn Buffer,
+            o: &dyn Buffer,
+            rows: usize,
+            kv_len: usize,
+            nh: usize,
+            nkv: usize,
+            pos: usize,
+            window: usize,
+            scale: f32,
+        ) -> Result<()> {
+            let mut g = self.0.lock().unwrap();
+            let ids = [q, kc, vc, o]
+                .iter()
+                .map(|b| g.import(be_, *b))
+                .collect::<Result<Vec<_>>>()?;
+            let g = &*g;
+            let k = &g.attn256;
+            let e = |r: infr_ze::Result<()>| r.map_err(|e| be(format!("ze attention: {e}")));
+            for (i, (id, off)) in ids.iter().enumerate() {
+                e(k.arg_buf_at(i as u32, &g.imports[id], *off))?;
+            }
+            for (i, v) in [rows, kv_len, nh, nkv, pos, window].iter().enumerate() {
+                e(k.arg(4 + i as u32, *v as i32))?;
+            }
+            e(k.arg(10, scale))?;
+            e(g.gpu.launch(k, [(rows.div_ceil(32) * nh) as u32, 1, 1]))
+        }
+
         /// `dst = a + b` over `n` floats.
         pub(crate) fn add(
             &self,
@@ -393,7 +435,7 @@ mod imp {
     }
 
     impl VulkanBackend {
-        /// Does this backend route prefill GEMMs to Level Zero? Opt-in, Intel Xe2 only, and only
+        /// Does this backend route prefill kernels to Level Zero? Intel Xe2 only, and only
         /// with the external memory/semaphore extensions the hand-off needs.
         pub(crate) fn ze_wanted(&self) -> bool {
             self.cfg().kernels.vulkan.ze_gemm
@@ -570,6 +612,23 @@ mod imp {
             _: &dyn Buffer,
             _: &dyn Buffer,
             _: usize,
+        ) -> Result<()> {
+            match *self {}
+        }
+        pub(crate) fn attention(
+            &self,
+            _: &VulkanBackend,
+            _: &dyn Buffer,
+            _: &dyn Buffer,
+            _: &dyn Buffer,
+            _: &dyn Buffer,
+            _: usize,
+            _: usize,
+            _: usize,
+            _: usize,
+            _: usize,
+            _: usize,
+            _: f32,
         ) -> Result<()> {
             match *self {}
         }

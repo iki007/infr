@@ -47,3 +47,8 @@ pub fn elementwise() -> Option<&'static [u8]> {
 pub fn gemm_kq16() -> Option<&'static [u8]> {
     bin!("gemm_kq16")
 }
+
+/// `kernels/attn_fa.cl`: DPAS flash-attention prefill (`attn_fa256`: head dim 256).
+pub fn attn_fa() -> Option<&'static [u8]> {
+    bin!("attn_fa")
+}

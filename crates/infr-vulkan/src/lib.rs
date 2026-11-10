@@ -3661,6 +3661,10 @@ impl VulkanBackend {
                 self.shared.kv_spill.record_host(bytes as u64);
                 return Ok(buf);
             }
+            // With the Level Zero path on (`ze.rs`), its flash attention reads the caches in place.
+            if self.ze_wanted() {
+                return self.alloc_exportable(bytes);
+            }
             return self.make_buf_ex(bytes, MemoryLocation::GpuOnly, "kv-cache", false, true);
         }
         let (location, label) = match usage {

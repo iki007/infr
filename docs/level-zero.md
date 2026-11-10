@@ -1,10 +1,10 @@
 # Level Zero backend (`infr-ze`) — Intel Xe2, native
 
-Status (2026-11-10): **prefill GEMMs and the ops joining them run on Level Zero inside the Vulkan
-backend**, on by default on Intel Xe2 cards with Level Zero (`INFR_ZE_GEMM=0` turns it off;
-`crates/infr-vulkan/src/ze.rs`): Qwen3.8-27B pp512 740 -> 1110
-t/s (llama.cpp SYCL 1087), Qwen3.5-4B 4172 -> 6278, greedy output unchanged. Long context is
-where it still trails SYCL (attention at depth — see the end). Backlog B102.
+Status (2026-11-10): **prefill GEMMs, head-dim-256 flash attention and the ops joining them run on
+Level Zero inside the Vulkan backend**, on by default on Intel Xe2 cards with Level Zero (`INFR_ZE_GEMM=0` turns it off;
+`crates/infr-vulkan/src/ze.rs`): Qwen3.8-27B pp512 740 -> 1123
+t/s (llama.cpp SYCL 1087), Qwen3.5-4B 4172 -> 6335, tested greedy output unchanged. Long context is
+where it still trails SYCL; the attention work below narrows that gap. Backlog B102.
 
 ## Why
 
@@ -213,11 +213,69 @@ compile-time choice per pair half. m=512 5120 -> 17408: Q3_K 0.98 ms (93 TFLOPS)
 (infr before the Q6_K/Q3_K/IQ4_NL kernels.) SYCL's prefill barely moves with depth; ours halves
 by 8k and again by 32k: the Vulkan flash attention (`attn_xmx_fa`) at depth is the gap (~7 TFLOPS
 effective at 32k). Decode at 32k spends ~14 ms per token on the 2 GB KV read (~150 GB/s; SYCL
-~3 ms). Next: attention on Level Zero (DPAS flash attention), then the decode KV read.
+~3 ms). The prefill attention change below addresses the first gap; the decode KV read remains.
+
+### Phase 4: DPAS flash-attention prefill
+
+`kernels/attn_fa.cl` adds `attn_fa256`: f16 queries and K/V caches, f32 output, causal or sliding
+window, grouped-query attention, custom positive scale (nonpositive means `1/sqrt(256)`), and zero
+output for a fully masked row. Its online softmax never materializes a score matrix.
+
+Each SIMD16 subgroup owns eight query rows and **half** their 256-wide output. Two subgroups
+recompute the same QK scores and divide the PV output, keeping the output accumulators in
+registers: the whole-output version spilled around 140 registers and took 29.45 ms; splitting
+the output removed that bottleneck. A 128-thread workgroup covers 32 queries of one head. Q/K/V
+use 2D block loads (transposed for K, VNNI-transformed for V), with DPAS for both QK and PV.
+
+On the headless B70 (`03:00.0`), `tests/probe.rs::attn_fa256_probe` measures **16.99 ms / 24.6
+effective TFLOPS** at q=512, kv=33280, 24 query heads and 4 KV heads (five launches, median),
+against the earlier Vulkan `attn_xmx_fa` measurement of 69 ms. The effective FLOPs count the
+mathematical QK+PV work, excluding duplicated QK. The host-f64 reference errors are 3.49e-5 for
+GQA causal attention and 6.63e-5 for sliding-window attention.
+
+A 64-key softmax block ran faster in isolation (14.67 ms), but changed the 4B's later greedy
+wording on the 1378-token test prompt. Matching Vulkan's 32-key blocks keeps the same f16-P
+rescaling boundaries and restores identical output on that check; it is the retained version.
+
+Matched end-to-end comparison (`Vulkan1`, pp512, f16 KV, `INFR_UBATCH=1024`):
+
+| model | depth | Existing L0 GEMMs + elementwise, Vulkan attention | + L0 attention | gain |
+| --- | --- | --- | --- | --- |
+| Qwen3.8-27B UD-Q4_K_M | 0 | 1114.3 t/s | 1122.9 t/s | 1.01x |
+| Qwen3.8-27B UD-Q4_K_M | 32768 | 339.5 t/s | **685.0 t/s** | **2.02x** |
+| Qwen3.5-4B Q4_K_M | 0 | 6332.0 t/s | 6335.2 t/s | 1.00x |
+
+Both binaries use the same exportable KV allocations; the adapter's attention offload is the
+difference. The short-context row has two timed reps; the 32K row has one. Each benchmark
+discards a warm rep at the measured shape, and processes run serially with a 60-second cooldown.
+The earlier SYCL 32K result is 894 t/s, so this closes much of the gap without reaching parity.
+The 1378-token correctness prompt produces identical 80-token greedy output on both the 4B and
+27B with the retained kernel (`INFR_CTX=8192`, `INFR_UBATCH=1024`).
+
+Integration uses the existing bridge and timeline. Device-local KV caches become exportable
+allocations when the bridge is wanted; Q and output join the exchange arena. `ze_plan` selects
+attention with at least 64 query rows, head dim 256, internal f16 Q, f16 K/V, and exportable caches
+that both hold the full live KV range. Ring caches after wrap, quantized KV, attention sinks,
+key bias and canvas masks stay on Vulkan. KV overflow placement keeps its existing allocation
+path, so those caches also stay on Vulkan.
+
+The adapter regression (`tests/support/ze_attention.rs`, included as a private unit-test module)
+checks the selected path against Vulkan and a host-f64 reference: causal GQA, MHA, partial query
+and key tiles, a custom scale, fully masked rows, wrapped-cache fallback, and repeated forwards.
+It asserts that the bridge is active and that eligible attention actually enters the Level Zero
+plan, so a silent Vulkan fallback cannot satisfy the test.
+
+```sh
+INFR_ZE_VK=1 cargo test --release -p infr-vulkan --lib ze_attention -- --ignored --nocapture --test-threads=1
+INFR_ZE_PCI=03:00.0 cargo test --release -p infr-ze --test probe attn_fa256_probe -- --ignored --nocapture --test-threads=1
+```
 
 ### Next
 
-- Attention at depth (prefill and decode) — the long-context gap above.
+- Further prefill attention tuning and the decode KV read — the remaining long-context gap.
+- Default-context placement: the earlier 27B run clamped its unpinned context to 50640 and
+  reduced the prefill chunk to 128 rows to fit it, below the L0 GEMMs' 256-row floor. The explicit
+  context/chunk settings above avoid that policy tradeoff; it is unchanged by this slice.
 - IQ4_XS: fewer SLM gathers — e.g. a byte-indexed table (k-pairs `(j, j+16)`, one index per byte)
   with the producer writing A in the matching k order.
 - IQ3_S, Q8_0, Q2_K (not in the 27B/4B's GEMM paths).

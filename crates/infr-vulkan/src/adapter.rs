@@ -5667,11 +5667,15 @@ fn abort_segment(rec: Option<Recorder<'_>>, e: Error) -> Error {
     }
 }
 
+#[cfg(all(test, target_os = "linux"))]
+#[path = "../tests/support/ze_attention.rs"]
+mod ze_attention_tests;
+
 /// The ops this forward runs on Level Zero (`ze.rs`): the prefill Linears of a dtype with a
 /// kernel, and the elementwise ops joining them (`RmsNorm`, `Add`, SwiGLU `GatedActFused`). Every
 /// L0-capable op is a candidate; a run of consecutive candidates (in live order, with an offloaded
-/// Linear's residual `Add` unfused) is kept when it holds a Linear — so a layer's GEMMs and the ops
-/// between them become one chain, while an elementwise op that joins no GEMM stays on Vulkan.
+/// Linear's residual `Add` unfused) is kept when it holds a Linear or supported prefill attention
+/// — so the compute kernels and the ops between them become one chain.
 /// Empty without the bridge (`INFR_ZE_GEMM` off, not Intel Xe2, no Level Zero) and under dense
 /// layer streaming.
 fn ze_plan(
@@ -5694,6 +5698,46 @@ fn ze_plan(
             }
     };
     let exportable = |t: &TensorId| bindings.get(*t).is_some_and(|w| be_.ze_operand_ok(w));
+    // Flash-attention prefill (`attn_fa256`): the semantics it shares with the Vulkan kernels —
+    // f16 Q / non-ring f16 caches, causal or sliding window, head dim 256, no sinks or key bias.
+    let attention = |op: &Op| match op {
+        Op::Attention {
+            q,
+            k_cache,
+            v_cache,
+            dst,
+            rows,
+            kv_len,
+            n_head,
+            n_kv,
+            head_dim,
+            mask,
+            sinks,
+            key_bias,
+            ..
+        } => {
+            let internal =
+                |t: &TensorId| matches!(graph.tensors[t.0 as usize].kind, TensorKind::Internal);
+            *head_dim == 256
+                && *rows >= 64
+                && *n_kv > 0
+                && *n_head > 0
+                && n_head % n_kv == 0
+                && sinks.is_none()
+                && key_bias.is_none()
+                && matches!(mask, AttnMask::Causal | AttnMask::SlidingWindow(_))
+                && graph.desc(*q).dtype == DType::F16
+                && internal(q)
+                && arena(dst)
+                && graph.desc(*k_cache).dtype == DType::F16
+                && graph.desc(*v_cache).dtype == DType::F16
+                && graph.desc(*k_cache).numel() / (*n_kv as usize * 256) >= *kv_len as usize
+                && graph.desc(*v_cache).numel() / (*n_kv as usize * 256) >= *kv_len as usize
+                && exportable(k_cache)
+                && exportable(v_cache)
+        }
+        _ => false,
+    };
     let gemm = |op: &Op| match op {
         Op::Linear {
             x,
@@ -5725,7 +5769,7 @@ fn ze_plan(
         Op::GatedActFused { gu, dst, act, .. } => {
             matches!(act, Activation::Silu) && arena(gu) && arena(dst)
         }
-        op => gemm(op),
+        op => gemm(op) || attention(op),
     };
     let plan = infr_core::fusion::plan_fusions(graph, &fusion_cfg(be_));
     let mut skip = plan.skip.clone();
@@ -5736,7 +5780,10 @@ fn ze_plan(
     }
     let mut run: Vec<usize> = Vec::new();
     let flush = |run: &mut Vec<usize>, out: &mut std::collections::HashSet<usize>| {
-        if run.iter().any(|&i| gemm(&graph.ops[i])) {
+        if run
+            .iter()
+            .any(|&i| gemm(&graph.ops[i]) || attention(&graph.ops[i]))
+        {
             out.extend(run.iter().copied());
         }
         run.clear();
@@ -5794,6 +5841,7 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
                 Op::Add { a, b, dst, .. } => vec![*a, *b, *dst],
                 Op::RmsNorm { x, dst, .. } => vec![*x, *dst],
                 Op::GatedActFused { gu, dst, .. } => vec![*gu, *dst],
+                Op::Attention { q, dst, .. } => vec![*q, *dst],
                 _ => vec![],
             };
             for t in ts {
@@ -6108,6 +6156,39 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
                 }
                 Op::Add { a, b, dst, n } => {
                     bridge.add(be_, r(*a)?, r(*b)?, r(*dst)?, *n as usize)?;
+                }
+                Op::Attention {
+                    q,
+                    k_cache,
+                    v_cache,
+                    dst,
+                    rows,
+                    kv_len,
+                    n_head,
+                    n_kv,
+                    scale,
+                    mask,
+                    pos,
+                    ..
+                } => {
+                    let window = match mask {
+                        AttnMask::SlidingWindow(w) => *w,
+                        _ => 0,
+                    };
+                    bridge.attention(
+                        be_,
+                        r(*q)?,
+                        r(*k_cache)?,
+                        r(*v_cache)?,
+                        r(*dst)?,
+                        *rows as usize,
+                        *kv_len as usize,
+                        *n_head as usize,
+                        *n_kv as usize,
+                        *pos as usize,
+                        window,
+                        *scale,
+                    )?;
                 }
                 _ => unreachable!("ze_plan holds Level Zero ops only"),
             }

@@ -428,3 +428,177 @@ fn gemm_iq4nl_probe() {
     };
     quant_gemm_probe(&fmt, bin);
 }
+
+/// Host attention (f64), the `attn_fa256` semantics: causal from `pos`, optional window, GQA.
+#[allow(clippy::too_many_arguments)]
+fn host_attn(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    q_len: usize,
+    kv_len: usize,
+    nh: usize,
+    nkv: usize,
+    hd: usize,
+    pos: usize,
+    window: usize,
+) -> Vec<f32> {
+    let scale = 1.0 / (hd as f64).sqrt();
+    let mut o = vec![0f32; q_len * nh * hd];
+    for r in 0..q_len {
+        let qp = pos + r;
+        for h in 0..nh {
+            let kvh = h / (nh / nkv);
+            let lo = if window > 0 && qp + 1 > window {
+                qp + 1 - window
+            } else {
+                0
+            };
+            let hi = (qp + 1).min(kv_len);
+            let qrow = &q[(r * nh + h) * hd..][..hd];
+            let sc: Vec<f64> = (lo..hi)
+                .map(|j| {
+                    let krow = &k[(j * nkv + kvh) * hd..][..hd];
+                    qrow.iter()
+                        .zip(krow)
+                        .map(|(a, b)| *a as f64 * *b as f64)
+                        .sum::<f64>()
+                        * scale
+                })
+                .collect();
+            let mx = sc.iter().cloned().fold(f64::MIN, f64::max);
+            let w: Vec<f64> = sc.iter().map(|s| (s - mx).exp()).collect();
+            let sum: f64 = w.iter().sum();
+            for d in 0..hd {
+                let mut acc = 0f64;
+                for (i, j) in (lo..hi).enumerate() {
+                    acc += w[i] * v[(j * nkv + kvh) * hd + d] as f64;
+                }
+                o[(r * nh + h) * hd + d] = if sum > 0.0 { (acc / sum) as f32 } else { 0.0 };
+            }
+        }
+    }
+    o
+}
+
+#[test]
+#[ignore = "requires a Level Zero GPU"]
+fn attn_fa256_probe() {
+    let (Some(g), Some(bin)) = (gpu(), infr_ze::kernels::attn_fa()) else {
+        eprintln!("skip: no Level Zero GPU or no ocloc kernels");
+        return;
+    };
+    let module = g.module(bin).unwrap();
+    let kern = module.kernel("attn_fa256").unwrap();
+    kern.group_size(128, 1, 1).unwrap();
+    let hd = 256;
+    let run = |q_len: usize,
+               kv_len: usize,
+               nh: usize,
+               nkv: usize,
+               pos: usize,
+               window: usize,
+               dq: &infr_ze::DevBuf,
+               dk: &infr_ze::DevBuf,
+               dv: &infr_ze::DevBuf,
+               dout: &infr_ze::DevBuf| {
+        kern.arg_buf(0, dq).unwrap();
+        kern.arg_buf(1, dk).unwrap();
+        kern.arg_buf(2, dv).unwrap();
+        kern.arg_buf(3, dout).unwrap();
+        for (i, v) in [q_len, kv_len, nh, nkv, pos, window].iter().enumerate() {
+            kern.arg(4 + i as u32, *v as i32).unwrap();
+        }
+        kern.arg(10, 0.0f32).unwrap();
+        [(q_len.div_ceil(32) * nh) as u32, 1, 1]
+    };
+    for (q_len, kv_len, nh, nkv, window) in [
+        (100usize, 300usize, 6usize, 2usize, 0usize),
+        (130, 260, 4, 4, 70),
+    ] {
+        let pos = kv_len - q_len;
+        let mut seed = 5u64;
+        let f16r = |n: usize, seed: &mut u64| -> Vec<f32> {
+            (0..n)
+                .map(|_| half::f16::from_f32(lcg(seed)).to_f32())
+                .collect()
+        };
+        let q = f16r(q_len * nh * hd, &mut seed);
+        let k = f16r(kv_len * nkv * hd, &mut seed);
+        let v = f16r(kv_len * nkv * hd, &mut seed);
+        let (dq, dk, dv, dout) = (
+            g.alloc(q.len() * 2).unwrap(),
+            g.alloc(k.len() * 2).unwrap(),
+            g.alloc(v.len() * 2).unwrap(),
+            g.alloc(q_len * nh * hd * 4).unwrap(),
+        );
+        g.upload(&dq, &f16_bytes(&q)).unwrap();
+        g.upload(&dk, &f16_bytes(&k)).unwrap();
+        g.upload(&dv, &f16_bytes(&v)).unwrap();
+        let groups = run(q_len, kv_len, nh, nkv, pos, window, &dq, &dk, &dv, &dout);
+        g.launch(&kern, groups).unwrap();
+        let mut out = vec![0u8; q_len * nh * hd * 4];
+        g.download(&dout, &mut out).unwrap();
+        let got: Vec<f32> = out
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|x| f32::from_le_bytes(*x))
+            .collect();
+        let want = host_attn(&q, &k, &v, q_len, kv_len, nh, nkv, hd, pos, window);
+        assert!(
+            got.iter().all(|x| x.is_finite()),
+            "non-finite attention output"
+        );
+        let worst = got
+            .iter()
+            .zip(&want)
+            .fold(0f32, |a, (g, w)| a.max((g - w).abs()));
+        let mag = want.iter().fold(0f32, |a, w| a.max(w.abs()));
+        println!("attn_fa256 q={q_len} kv={kv_len} nh={nh} nkv={nkv} window={window}: worst abs err {worst:.3e} (max |O| {mag:.3})");
+        assert!(worst < 1e-2 * mag.max(0.1), "attn mismatch {worst}");
+    }
+    // timing: the 27B's pp512 at 32k depth
+    let (q_len, kv_len, nh, nkv) = (512usize, 33280usize, 24usize, 4usize);
+    let (dq, dk, dv, dout) = (
+        g.alloc(q_len * nh * hd * 2).unwrap(),
+        g.alloc(kv_len * nkv * hd * 2).unwrap(),
+        g.alloc(kv_len * nkv * hd * 2).unwrap(),
+        g.alloc(q_len * nh * hd * 4).unwrap(),
+    );
+    let mut seed = 9u64;
+    g.upload(
+        &dq,
+        &f16_bytes(
+            &(0..q_len * nh * hd)
+                .map(|_| lcg(&mut seed))
+                .collect::<Vec<_>>(),
+        ),
+    )
+    .unwrap();
+    let kv: Vec<f32> = (0..kv_len * nkv * hd).map(|_| lcg(&mut seed)).collect();
+    g.upload(&dk, &f16_bytes(&kv)).unwrap();
+    g.upload(&dv, &f16_bytes(&kv)).unwrap();
+    let groups = run(
+        q_len,
+        kv_len,
+        nh,
+        nkv,
+        kv_len - q_len,
+        0,
+        &dq,
+        &dk,
+        &dv,
+        &dout,
+    );
+    let t = g.time_launches(&kern, groups, 5).unwrap();
+    let mut s = t.clone();
+    s.sort_by(|x, y| x.partial_cmp(y).unwrap());
+    let med = s[s.len() / 2];
+    let flops = 4.0 * q_len as f64 * kv_len as f64 * hd as f64 * nh as f64;
+    println!(
+        "attn_fa256 q={q_len} kv={kv_len} nh={nh} nkv={nkv}: median {:.2} ms, {:.1} TFLOPS (Vulkan attn_xmx_fa: 69 ms)",
+        med / 1e6,
+        flops / med / 1e3
+    );
+}
