@@ -2329,6 +2329,7 @@ impl VulkanBackend {
             embed_gather: true,
             gpu_sample: true,
             argmax_rows: true,
+            deltanet_strided: true,
             argmax_prob: true,
             // Fused per-head RMSNorm + SiLU gate multiply (qwen35 DeltaNet z-gate) — the
             // `rmsnorm_gate` kernel (rmsnorm.comp's -DGATE build). Collapses QkNorm→GatedAct's
@@ -5098,7 +5099,15 @@ mod ssm_tests {
 
     /// One `Recorder::deltanet` case against the CPU recurrence (mirrors the qwen35 CPU mixer),
     /// `rows` tokens in sequence with the state carried across them.
-    fn deltanet_case(be: &VulkanBackend, nv: usize, nk: usize, kd: usize, vd: usize, rows: usize) {
+    fn deltanet_case(
+        be: &VulkanBackend,
+        nv: usize,
+        nk: usize,
+        kd: usize,
+        vd: usize,
+        rows: usize,
+        strided: bool,
+    ) {
         let eps = 1e-6f32;
         let q = det(rows * nk * kd, 0.1);
         let k = det(rows * nk * kd, 0.7);
@@ -5149,7 +5158,6 @@ mod ssm_tests {
             }
         }
 
-        let (qb, kb, vb) = (dev(be, &q), dev(be, &k), dev(be, &v));
         let (bb, ab) = (dev(be, &blog), dev(be, &alpha));
         let (acb, dtb) = (dev(be, &acoef), dev(be, &dtbias));
         let sbuf = dev(be, &state0);
@@ -5157,27 +5165,59 @@ mod ssm_tests {
             .alloc(rows * nv * vd * 4, BufferUsage::Activations)
             .unwrap();
         let rec = be.recorder().unwrap();
-        rec.deltanet(
-            qb.as_ref(),
-            kb.as_ref(),
-            vb.as_ref(),
-            bb.as_ref(),
-            ab.as_ref(),
-            acb.as_ref(),
-            dtb.as_ref(),
-            sbuf.as_ref(),
-            ob.as_ref(),
-            rows,
-            nv,
-            nk,
-            kd,
-            vd,
-            eps,
-        );
-        rec.finish().unwrap();
+        if strided {
+            // The decode graph's conv-output form: one [rows, 2*nk*kd + nv*vd] buffer.
+            let stride = 2 * nk * kd + nv * vd;
+            let mut packed = Vec::with_capacity(rows * stride);
+            for t in 0..rows {
+                packed.extend_from_slice(&q[t * nk * kd..(t + 1) * nk * kd]);
+                packed.extend_from_slice(&k[t * nk * kd..(t + 1) * nk * kd]);
+                packed.extend_from_slice(&v[t * nv * vd..(t + 1) * nv * vd]);
+            }
+            let pb = dev(be, &packed);
+            rec.deltanet_strided(
+                pb.as_ref(),
+                pb.as_ref(),
+                pb.as_ref(),
+                bb.as_ref(),
+                ab.as_ref(),
+                acb.as_ref(),
+                dtb.as_ref(),
+                sbuf.as_ref(),
+                ob.as_ref(),
+                rows,
+                nv,
+                nk,
+                kd,
+                vd,
+                eps,
+                stride,
+            );
+            rec.finish().unwrap();
+        } else {
+            let (qb, kb, vb) = (dev(be, &q), dev(be, &k), dev(be, &v));
+            rec.deltanet(
+                qb.as_ref(),
+                kb.as_ref(),
+                vb.as_ref(),
+                bb.as_ref(),
+                ab.as_ref(),
+                acb.as_ref(),
+                dtb.as_ref(),
+                sbuf.as_ref(),
+                ob.as_ref(),
+                rows,
+                nv,
+                nk,
+                kd,
+                vd,
+                eps,
+            );
+            rec.finish().unwrap();
+        }
         let out_gpu = read(be, ob.as_ref(), rows * nv * vd);
         let s_gpu = read(be, sbuf.as_ref(), nv * kd * vd);
-        let label = format!("nv={nv} nk={nk} kd={kd} vd={vd} rows={rows}");
+        let label = format!("nv={nv} nk={nk} kd={kd} vd={vd} rows={rows} strided={strided}");
         let (eo, es) = (maxerr(&out_cpu, &out_gpu), maxerr(&s, &s_gpu));
         println!("deltanet {label}: out err {eo:e}, state err {es:e}");
         assert!(eo < 1e-4, "deltanet {label}: out err {eo}");
@@ -5195,10 +5235,13 @@ mod ssm_tests {
         };
         // The original tiny shape; the real qwen35 head (kd=vd=128) at decode and a 3-token
         // verify window; and a head whose vd is not a multiple of the column block.
-        deltanet_case(&be, 4, 2, 8, 8, 1);
-        deltanet_case(&be, 4, 2, 128, 128, 1);
-        deltanet_case(&be, 6, 2, 128, 128, 3);
-        deltanet_case(&be, 3, 1, 64, 40, 2);
+        deltanet_case(&be, 4, 2, 8, 8, 1, false);
+        deltanet_case(&be, 4, 2, 128, 128, 1, false);
+        deltanet_case(&be, 6, 2, 128, 128, 3, false);
+        deltanet_case(&be, 3, 1, 64, 40, 2, false);
+        // The decode graph's strided form (q/k/v sliced out of one conv-output row).
+        deltanet_case(&be, 4, 2, 128, 128, 1, true);
+        deltanet_case(&be, 6, 2, 128, 128, 2, true);
     }
 
     #[test]

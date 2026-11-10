@@ -2674,10 +2674,13 @@ pub(crate) fn generate_dense_backend(
                     channels: q35_cc as u32,
                     kernel: c.ssm_d_conv as u32,
                 });
-                // Strided DeltaNet: when INFR_DELTA_STRIDED=1 and batch==1 (decode only —
-                // the chunked prefill path doesn't support stride), q/k/v read from conv_out,
-                // skipping 3 CopyStrided dispatches per layer.
-                let delta_strided = batch == 1 && ec.kernels.vulkan.delta_strided;
+                // Strided DeltaNet (decode only — the chunked prefill path doesn't support stride):
+                // q/k/v read from conv_out in place, skipping 3 CopyStrided dispatches per layer.
+                // On by default wherever the backend supports it (`caps.deltanet_strided`); the
+                // old `INFR_DELTA_STRIDED=1` opt-in still forces it. Measured on an Arc Pro B70
+                // (Qwen3.8-27B decode): 144 CopyStrided dispatches per token before.
+                let delta_strided =
+                    batch == 1 && (caps.deltanet_strided || ec.kernels.vulkan.delta_strided);
                 if !delta_strided {
                     g.push(Op::CopyStrided {
                         src: dn_convout,
@@ -2749,7 +2752,7 @@ pub(crate) fn generate_dense_backend(
                     head_k: q35_kd as u32,
                     head_v: q35_vd as u32,
                     eps: 1e-6,
-                    src_stride: 0,
+                    src_stride: if delta_strided { q35_cc as u32 } else { 0 },
                 });
                 // silu-gated RMSNorm per v-head: rmsnorm(out, ssm_norm) then * silu(z). Fused into
                 // ONE dispatch when the backend supports it (see `fuse_gated_rmsnorm`'s doc) — the

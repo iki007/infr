@@ -685,6 +685,7 @@ impl Backend for CpuBackend {
             embed_gather: true,
             gpu_sample: true,
             argmax_rows: true,
+            deltanet_strided: true,
             argmax_prob: true,
             // The interpreter implements `Op::GatedRmsNorm` (below) for direct-op parity tests,
             // but leaves the capability false so the runner keeps emitting the split

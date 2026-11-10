@@ -35,11 +35,16 @@ layout(push_constant) uniform PC {
     uint vd;     // head_v_dim
     float eps;   // l2norm epsilon
     float qscale; // 1/sqrt(kd)
+    // 0 = q/k/v are separate packed buffers ([rows, nk*kd], [rows, nk*kd], [rows, nv*vd]). > 0 =
+    // all three bindings are the SAME conv-output buffer with this per-row stride, q at offset 0,
+    // k at nk*kd, v at 2*nk*kd within each row — the decode graph's form, which drops the three
+    // CopyStrided dispatches per layer that unpack it.
+    uint src_stride;
 } pc;
 
-layout(binding = 0) readonly buffer QB  { float q[]; };       // [rows, nk*kd]
-layout(binding = 1) readonly buffer KB  { float k[]; };       // [rows, nk*kd]
-layout(binding = 2) readonly buffer VB  { float v[]; };       // [rows, nv*vd]
+layout(binding = 0) readonly buffer QB  { float q[]; };       // [rows, nk*kd] (or the strided source)
+layout(binding = 1) readonly buffer KB  { float k[]; };       // [rows, nk*kd] (or the strided source)
+layout(binding = 2) readonly buffer VB  { float v[]; };       // [rows, nv*vd] (or the strided source)
 layout(binding = 3) readonly buffer BB  { float blog[]; };    // [rows, nv]  beta logits
 layout(binding = 4) readonly buffer AB  { float alpha[]; };   // [rows, nv]
 layout(binding = 5) readonly buffer ACB { float acoef[]; };   // [nv]  (ssm_a weight)
@@ -76,15 +81,18 @@ void main() {
     }
 
     for (uint tk = 0u; tk < pc.rows; tk++) {
-        uint qbase = tk * pc.nk * pc.kd + hqbase;
-        uint vbase = tk * pc.nv * pc.vd + hvbase;
+        uint qbase = (pc.src_stride > 0u ? tk * pc.src_stride : tk * pc.nk * pc.kd) + hqbase;
+        uint kbase = pc.src_stride > 0u ? qbase + pc.nk * pc.kd : qbase;
+        uint vin = (pc.src_stride > 0u ? tk * pc.src_stride + 2u * pc.nk * pc.kd
+                                       : tk * pc.nv * pc.vd) + hvbase;
+        uint vbase = tk * pc.nv * pc.vd + hvbase; // the output row (always packed)
         uint ga = tk * pc.nv + h;
 
         // ── L2-normalize q,k over kd into shared (thread t < kd holds element t) ──
         float qv = 0.0, kv = 0.0;
         if (t < pc.kd) {
             qv = q[qbase + t];
-            kv = k[qbase + t];
+            kv = k[kbase + t];
         }
         float qs = subgroupAdd(qv * qv);
         float ks = subgroupAdd(kv * kv);
@@ -124,7 +132,7 @@ void main() {
         [[unroll]] for (uint g = 0u; g < GROUPS; g++) {
             kvv += pkv[g * COLS + col];
         }
-        float delta = live ? (v[vbase + d] - kvv) * beta : 0.0;
+        float delta = live ? (v[vin + d] - kvv) * beta : 0.0;
 
         // ── S += k⊗delta, out = qᵀS ──
         float pq = 0.0;

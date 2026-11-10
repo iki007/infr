@@ -181,6 +181,11 @@ pub struct Capabilities {
     /// backends whose kernel is single-row-only (Metal) leave this false and the runner keeps
     /// the host-logits accept path there.
     pub argmax_rows: bool,
+    /// The backend reads a single-row [`crate::Op::DeltaNet`]'s q/k/v straight out of ONE buffer
+    /// (`src_stride > 0`, q/k at offsets 0 and `n_khead·head_k`, v at twice that), so the decode
+    /// graph skips the three `CopyStrided` unpacks per DeltaNet layer. Vulkan and the CPU
+    /// interpreter; Metal refuses a strided op.
+    pub deltanet_strided: bool,
     /// The backend executes [`crate::Op::ArgmaxProb`] (fused single-row argmax + softmax top-1
     /// probability — the MTP draft-loop accept, issue #33 follow-up: only 8 bytes read back
     /// instead of the `[vocab]` logits + host argmax/softmax scan). Backends without the kernel

@@ -2977,17 +2977,6 @@ pub(crate) fn deltanet_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(DELTANET_SPV_BYTES))
 }
-/// SPIR-V for DeltaNet reading q/k/v from a single strided source buffer (env-gated).
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn deltanet_strided_spv() -> &'static [u32] {
-    static S: OnceLock<Vec<u32>> = OnceLock::new();
-    S.get_or_init(|| {
-        spv_words(include_bytes!(concat!(
-            env!("OUT_DIR"),
-            "/deltanet_strided.spv"
-        )))
-    })
-}
 /// SPIR-V for the chunked-DeltaNet PREP pass (normalize + intra-chunk dot matrices).
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn deltanet_prep_spv() -> &'static [u32] {

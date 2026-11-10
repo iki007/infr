@@ -42,9 +42,9 @@ INFR_DEV=Vulkan1 cargo test --release -p infr-vulkan --no-fail-fast -- --include
 | model                       | infr first run | infr now  | llama.cpp Vulkan | llama.cpp SYCL |
 | --------------------------- | -------------- | --------- | ---------------- | -------------- |
 | Qwen3.5-4B Q4_K_M pp512     | 1571           | 2380      | 3165             | 7031           |
-| Qwen3.5-4B Q4_K_M tg128     | 62.6           | **120.0** | 111.2            | 148.5          |
+| Qwen3.5-4B Q4_K_M tg128     | 62.6           | **141.8** | 111.2            | 148.5          |
 | Qwen3.8-27B UD-Q4_K_M pp512 | 220            | 376       | 746              | 1087           |
-| Qwen3.8-27B UD-Q4_K_M tg128 | 13.8           | **25.3**  | 23.1             | 29.9           |
+| Qwen3.8-27B UD-Q4_K_M tg128 | 13.8           | **27.1**  | 23.1             | 29.9           |
 
 llama.cpp at `0f236bc21`; its 27B decode row is tg64. "infr first run" is
 `f568ff7`. "infr now" is after plan slice 3. Prefill moved in slice 2,
@@ -259,8 +259,17 @@ Each slice is measured against the numbers above on `Vulkan1`.
 4. **Done.** The IQ4 codebook byte-pair LUT: Qwen3.8-27B tg128 18.8 → 25.3.
 5. **Done (opt-in).** MTP speculative decode, below. Qwen3.8-27B 25.3 → 38.0
    t/s under `INFR_MTP=1`.
-6. Next: the MTP cycle cost (an XMX small-m verify GEMV, the per-cycle host
-   round trips, the draft head), then prefill.
+6. **Done.** Plain decode, three changes (measured on `Vulkan1`, tg128):
+   the m=1 decode reuses the previous Linear's quantized activation
+   (`mmv_memo`; 381 → 251 `quant_q8` per 27B token), the strided DeltaNet
+   form is the decode default (no `CopyStrided` unpack; 144 dispatches per
+   27B token), and the OUTS4 mrow layout covers in_f <= 5120 and Q6_K on Xe2
+   (`caps::mrow_outs4`). Qwen3.5-4B 120.0 → 141.8 t/s, Qwen3.8-27B 25.3 → 27.1.
+   The spec bandwidth (608 GB/s) puts the single-card ceilings at ~243 and
+   ~40 t/s; the cold-weight mrow GEMV still runs 220–475 GB/s.
+7. Next: the mrow GEMV's load shape (Q4_K/Q5_K lanes reload the 32-byte qs
+   pair and the super-block header per 32-element sub-block), then dispatch
+   count, then prefill.
 
 ## MTP (speculative decode, `INFR_MTP=1`)
 

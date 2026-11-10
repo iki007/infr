@@ -709,8 +709,13 @@ fn mmv_mw_choice(
     // specific dtypes Q3_K/Q5_K that had only mmv_mw builds are no longer in the default set,
     // and INFR_MMV_MW=1 still force-opt-in them — they just fall through here as None since
     // they lack mrow builds).
-    let have_spv =
-        crate::gemm::native_mmv_mrow_variant_kernel_name(dt, in_f < 2048, true, false).is_some();
+    let have_spv = crate::gemm::native_mmv_mrow_variant_kernel_name(
+        dt,
+        vk.mmv_o4 && crate::caps::mrow_outs4(arch, dt, in_f),
+        true,
+        false,
+    )
+    .is_some();
     have_spv.then_some(warps)
 }
 
@@ -1897,18 +1902,26 @@ fn lower_op(
                         rec.linear_mmv_mrow_fuseq(dt, w, w_off, xb, None, y, 1, in_f, out_f);
                         return Ok(());
                     }
+                    // Same pooled scratch and `mmv_memo` protocol as the m>=3 mrow tier: a Linear
+                    // whose `x` the immediately-preceding Linear already quantized (gate+up, the
+                    // DeltaNet qkv+z pair, fused-QKV offset GEMVs) skips the requant — and with it
+                    // the WAR barrier the requant puts before the sibling GEMV. Measured on an Arc
+                    // Pro B70 (Qwen3.8-27B decode): 381 quant_q8 dispatches per token before.
                     let nblk = in_f / 32;
-                    let qa = pooled(pool, be_, "mmv_qa", in_f)?;
-                    let dact = pooled(pool, be_, "mmv_dact", nblk * 2)?;
-                    let sact = pooled(pool, be_, "mmv_sact", nblk * 2)?;
-                    rec.quant_q8(
-                        xb,
-                        pool[&qa].as_ref(),
-                        pool[&dact].as_ref(),
-                        pool[&sact].as_ref(),
-                        1,
-                        in_f,
-                    );
+                    let qa = pooled(pool, be_, "mmvr_qa", in_f)?;
+                    let dact = pooled(pool, be_, "mmvr_dact", nblk * 2)?;
+                    let sact = pooled(pool, be_, "mmvr_sact", nblk * 2)?;
+                    if memo_prev != Some((*x, 1, in_f)) {
+                        rec.quant_q8(
+                            xb,
+                            pool[&qa].as_ref(),
+                            pool[&dact].as_ref(),
+                            pool[&sact].as_ref(),
+                            1,
+                            in_f,
+                        );
+                    }
+                    *mmv_memo = Some((*x, 1, in_f));
                     if unified_mmv_row1(be_.caps()) {
                         // Same kernel/reduction as the m>=3 verify tier, dispatched at rows=1 — see
                         // the fused-add branch above and `unified_mmv_row1`'s doc.
@@ -3654,7 +3667,7 @@ fn lower_op(
             head_k,
             head_v,
             eps,
-            ..
+            src_stride,
         } => {
             // Prefill AND multi-row batches (rows ≥ 2): the chunkwise delta rule processes up to 32
             // tokens per state traversal (matmuls + a triangular solve) instead of the token-serial
@@ -3794,11 +3807,11 @@ fn lower_op(
                 );
                 transient.extend([kn, qn, dk, dq, bg, gg]);
             } else {
-                // Strided DeltaNet (env-gated): when q==k==v (all same source buffer), derive
-                // stride from dimensions: 2*nk*kd + nv*vd.
-                let strided = *q == *k && *k == *v && be_.cfg().kernels.vulkan.delta_strided;
-                if strided {
-                    let stride = 2 * nk_ * kd_ + nv_ * vd_;
+                // Strided DeltaNet: q/k/v are slices of ONE buffer (the decode graph's conv output,
+                // `src_stride` = its row width), read in place by the same kernel.
+                if *src_stride > 0 {
+                    debug_assert!(*q == *k && *k == *v, "strided DeltaNet: q/k/v must alias");
+                    let stride = *src_stride as usize;
                     rec.deltanet_strided(
                         r(*q)?,
                         r(*k)?,

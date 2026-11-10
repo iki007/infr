@@ -3529,7 +3529,7 @@ impl<'a> Recorder<'a> {
         );
         assert_native_k("linear_mmv_mrow_at", in_f);
         self.label_gemv("mmvr_streamed", rows, in_f, out_f);
-        let o4 = in_f < 2048 && self.vk().mmv_o4;
+        let o4 = self.vk().mmv_o4 && crate::caps::mrow_outs4(self.be.device_arch(), dtype, in_f);
         let m4 = rows <= 4 && self.vk().mmv_m4;
         let res = residual.is_some();
         let (name, spv) = if rows > 8 {
@@ -3679,7 +3679,7 @@ impl<'a> Recorder<'a> {
         let arena_addr = w
             .device_addr()
             .expect("resident-BDA weight: linear_mmv_mrow_fuseq requires a u64 BDA device address");
-        let o4 = in_f < 2048 && self.vk().mmv_o4;
+        let o4 = self.vk().mmv_o4 && crate::caps::mrow_outs4(self.be.device_arch(), dtype, in_f);
         let m4 = rows <= 4;
         let res = residual.is_some();
         let (name, spv) = crate::gemm::native_mmv_mrow_variant_fuseq_spv(dtype, o4, m4, res)
@@ -7785,6 +7785,34 @@ impl<'a> Recorder<'a> {
         vd: usize,
         eps: f32,
     ) {
+        self.deltanet_impl(
+            q, k, v, blog, alpha, acoef, dtbias, state, out, rows, nv, nk, kd, vd, eps, 0,
+        );
+    }
+
+    /// [`Self::deltanet`] with q/k/v as slices of ONE buffer: `src_stride` > 0 is the per-row stride,
+    /// q at offset 0, k at `nk*kd`, v at `2*nk*kd` within each row (`src_stride == 0` = the packed
+    /// form). Same kernel.
+    #[allow(clippy::too_many_arguments)]
+    fn deltanet_impl(
+        &self,
+        q: &dyn Buffer,
+        k: &dyn Buffer,
+        v: &dyn Buffer,
+        blog: &dyn Buffer,
+        alpha: &dyn Buffer,
+        acoef: &dyn Buffer,
+        dtbias: &dyn Buffer,
+        state: &dyn Buffer,
+        out: &dyn Buffer,
+        rows: usize,
+        nv: usize,
+        nk: usize,
+        kd: usize,
+        vd: usize,
+        eps: f32,
+        src_stride: usize,
+    ) {
         // The shader keeps each thread's kd/8 state rows in a 16-entry register array and the
         // normalized q/k in `qn[128]`/`kn[128]`, so kd must be ≤ 128. qwen35 uses kd=128; assert so
         // a larger head_k_dim fails loudly instead of corrupting state.
@@ -7794,8 +7822,8 @@ impl<'a> Recorder<'a> {
         );
         let kern = self
             .be
-            .kernel("deltanet", crate::gemm::deltanet_spv(), 9, 28);
-        let mut push = [0u8; 28];
+            .kernel("deltanet", crate::gemm::deltanet_spv(), 9, 32);
+        let mut push = [0u8; 32];
         push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(nv as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&(nk as u32).to_ne_bytes());
@@ -7803,6 +7831,7 @@ impl<'a> Recorder<'a> {
         push[16..20].copy_from_slice(&(vd as u32).to_ne_bytes());
         push[20..24].copy_from_slice(&eps.to_ne_bytes());
         push[24..28].copy_from_slice(&(1.0f32 / (kd as f32).sqrt()).to_ne_bytes());
+        push[28..32].copy_from_slice(&(src_stride as u32).to_ne_bytes());
         // One workgroup per (value head, block of 16 state columns); local_size_x=128 (16 columns
         // × 8 key-row groups — see the shader header).
         let n_blk = vd.div_ceil(16);
@@ -7825,8 +7854,9 @@ impl<'a> Recorder<'a> {
         );
     }
 
-    /// Strided DeltaNet: q/k/v read from same source buffer at offsets 0, nk*kd, 2*nk*kd.
-    /// Env-gated via INFR_DELTA_STRIDED=1. Push constants 32B (adds src_stride to standard).
+    /// Strided DeltaNet: q/k/v read from the same source buffer at offsets 0, nk*kd, 2*nk*kd of each
+    /// `src_stride`-wide row (the decode graph's conv output, with no CopyStrided unpack). Rides
+    /// the same `deltanet` kernel as the packed form.
     #[allow(clippy::too_many_arguments)]
     pub fn deltanet_strided(
         &self,
@@ -7847,39 +7877,8 @@ impl<'a> Recorder<'a> {
         eps: f32,
         src_stride: usize,
     ) {
-        debug_assert!(kd <= 128);
-        let kern = self.be.kernel(
-            "deltanet_strided",
-            crate::gemm::deltanet_strided_spv(),
-            9,
-            32,
-        );
-        let mut push = [0u8; 32];
-        push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
-        push[4..8].copy_from_slice(&(nv as u32).to_ne_bytes());
-        push[8..12].copy_from_slice(&(nk as u32).to_ne_bytes());
-        push[12..16].copy_from_slice(&(kd as u32).to_ne_bytes());
-        push[16..20].copy_from_slice(&(vd as u32).to_ne_bytes());
-        push[20..24].copy_from_slice(&eps.to_ne_bytes());
-        push[24..28].copy_from_slice(&(1.0f32 / (kd as f32).sqrt()).to_ne_bytes());
-        push[28..32].copy_from_slice(&(src_stride as u32).to_ne_bytes());
-        let n_blk = vd.div_ceil(32);
-        self.dispatch(
-            kern,
-            &[
-                Self::vkb(q),
-                Self::vkb(k),
-                Self::vkb(v),
-                Self::vkb(blog),
-                Self::vkb(alpha),
-                Self::vkb(acoef),
-                Self::vkb(dtbias),
-                Self::vkb(state),
-                Self::vkb(out),
-            ],
-            2,
-            &push,
-            (nv * n_blk) as u32,
+        self.deltanet_impl(
+            q, k, v, blog, alpha, acoef, dtbias, state, out, rows, nv, nk, kd, vd, eps, src_stride,
         );
     }
 

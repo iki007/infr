@@ -297,6 +297,24 @@ fn intel_shader_core_count(device_id: u32) -> u32 {
     }
 }
 
+// ── decode GEMV layout ───────────────────────────────────────────────────────────────────────────
+
+/// Whether the multi-row int8 GEMV (`native_mmv_mrow.comp`) takes its OUTS4 layout — 4 outputs per
+/// workgroup × 16 K-lanes each — instead of the default 2 outputs × 64 K-lanes, for a weight of
+/// `dtype` with `in_f` inputs. The split decides how much independent work each lane has; which
+/// wins is a property of the part, so the rule is per architecture:
+///
+/// * every architecture: `in_f < 2048` (the RDNA3-measured rule this replaces — below that the
+///   64-lane split leaves most lanes idle).
+/// * Intel Xe2 additionally: `in_f <= 5120`, and Q6_K at any width. Measured on an Arc Pro B70,
+///   cold-weight GEMV and decode end to end: in_f=2560 Q4_K 85 -> 55 µs; Qwen3.5-4B tg128 125 ->
+///   142 t/s, Qwen3.8-27B 26.3 -> 27.0. Wider non-Q6_K weights stay on the default layout
+///   (IQ4_XS 17408x5120 108 µs default vs 150 µs OUTS4).
+pub(crate) fn mrow_outs4(arch: DeviceArch, dtype: infr_core::DType, in_f: usize) -> bool {
+    in_f < 2048
+        || (arch == DeviceArch::IntelXe2 && (in_f <= 5120 || dtype == infr_core::DType::Q6K))
+}
+
 // ── cooperative-matrix trust ─────────────────────────────────────────────────────────────────────
 
 /// How far this driver's cooperative-matrix ENUMERATION may be believed.

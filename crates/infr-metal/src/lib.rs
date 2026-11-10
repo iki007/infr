@@ -383,6 +383,7 @@ impl Backend for MetalBackend {
             // argmax_f32 is single-row (whole-buffer scan, no row offset); the MTP verify
             // accept keeps the host-logits path on Metal — see the Op::Argmax exec arm.
             argmax_rows: false,
+            deltanet_strided: false,
             // No fused argmax+prob kernel yet (issue #33 follow-up, Vulkan-only so far) — the MTP
             // draft loop keeps the host `top1_softmax` logits-download path on Metal. See the
             // Op::ArgmaxProb exec arm's Unsupported note.
