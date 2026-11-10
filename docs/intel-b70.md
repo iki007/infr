@@ -296,11 +296,11 @@ cap 3 (one identifier, ~20 tokens in).
 Against llama.cpp `0f236bc21` with `--spec-type draft-mtp` on the same card
 (llama-server, the same prompt, greedy):
 
-| engine           | plain | MTP n_max=3 | MTP n_max=6 |
-| ---------------- | ----- | ----------- | ----------- |
-| infr Vulkan      | 25.3  | —           | 38.0        |
-| llama.cpp Vulkan | 23.0  | 44.2        | 41.9        |
-| llama.cpp SYCL   | 29.5  | 72          | **80**      |
+| engine           | plain | MTP n_max=3     | MTP n_max=6 |
+| ---------------- | ----- | --------------- | ----------- |
+| infr Vulkan      | 25.3  | 41.4 (adaptive) | 38.0        |
+| llama.cpp Vulkan | 23.0  | 44.2            | 41.9        |
+| llama.cpp SYCL   | 29.5  | 72              | **80**      |
 
 Same acceptance (llama.cpp 159/233 = 0.68), so the gap is cycle cost. An m=7
 infr forward costs 1.73x an m=1 forward (`pp7` 72.8 ms vs `pp1` 42 ms) because

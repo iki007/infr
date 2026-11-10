@@ -101,7 +101,7 @@ pub fn generate_mtp_spec_vulkan(
 /// init (issue: an `INFR_MTP=1` chat run used to construct TWO full Vulkan backends — one for
 /// Floor on a persistent MTP trunk session's KV capacity (see
 /// [`generate_mtp_spec_vulkan_timed_on`]): a turn that outgrows it re-uploads the whole trunk.
-pub const MTP_TRUNK_MIN_CTX: usize = 16384;
+pub(crate) const MTP_TRUNK_MIN_CTX: usize = 16384;
 
 /// `warmup()`, one for the first real turn — for exactly this reason).
 #[cfg_attr(infr_profile, infr_prof::instrument)]
