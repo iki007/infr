@@ -2215,6 +2215,38 @@ fn main() {
             "native_mmv_mrow_iq4nl_m16",
             &["-DFMT_IQ4NL", "-DMRV=16"],
         ),
+        // IQ3_S int8 mrow (its 512-entry grid staged in shared memory; see the shader's FMT_IQ3S).
+        ("native_mmv_mrow", "native_mmv_mrow_iq3s", &["-DFMT_IQ3S"]),
+        (
+            "native_mmv_mrow",
+            "native_mmv_mrow_iq3s_m4",
+            &["-DFMT_IQ3S", "-DMRV=4"],
+        ),
+        (
+            "native_mmv_mrow",
+            "native_mmv_mrow_iq3s_o4",
+            &["-DFMT_IQ3S", "-DOUTS4"],
+        ),
+        (
+            "native_mmv_mrow",
+            "native_mmv_mrow_iq3s_o4_m4",
+            &["-DFMT_IQ3S", "-DOUTS4", "-DMRV=4"],
+        ),
+        (
+            "native_mmv_mrow",
+            "native_mmv_mrow_iq3s_m4_res",
+            &["-DFMT_IQ3S", "-DMRV=4", "-DUSE_RES"],
+        ),
+        (
+            "native_mmv_mrow",
+            "native_mmv_mrow_iq3s_o4_m4_res",
+            &["-DFMT_IQ3S", "-DOUTS4", "-DMRV=4", "-DUSE_RES"],
+        ),
+        (
+            "native_mmv_mrow",
+            "native_mmv_mrow_iq3s_m16",
+            &["-DFMT_IQ3S", "-DMRV=16"],
+        ),
         ("native_gemm_mmq_q4k", "native_gemm_mmq_q4k", &[]),
         ("native_gemm_mmq_q6k", "native_gemm_mmq_q6k", &[]),
         // DENSE (non-expert-grid) builds of the remaining mmq dtypes — the non-coopmat prefill

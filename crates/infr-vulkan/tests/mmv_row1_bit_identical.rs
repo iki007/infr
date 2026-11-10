@@ -73,6 +73,9 @@ fn patch_scales(dt: DType, bi: usize, blk: &mut [u8]) {
         DType::Q8_0 | DType::Q4_0 | DType::Q5_0 | DType::Iq4Nl => {
             blk[0..2].copy_from_slice(&f16b(d));
         }
+        // IQ4_XS / IQ3_S (Intel Xe2's int8 decode set): `d` leads; every other byte is valid as
+        // random (6-bit scales, codebook / grid indices, signs).
+        DType::Iq4Xs | DType::Iq3S => blk[0..2].copy_from_slice(&f16b(d)),
         DType::Q4_1 | DType::Q5_1 => {
             blk[0..2].copy_from_slice(&f16b(d));
             blk[2..4].copy_from_slice(&f16b(((bi % 7) as f32 - 3.0) * 0.04));
@@ -104,6 +107,8 @@ fn mmv_row1_matches_mrow_row0_exact() {
         DType::Q4_1,
         DType::Q5_1,
         DType::Iq4Nl,
+        DType::Iq4Xs,
+        DType::Iq3S,
     ] {
         for &(in_f, out_f) in &shapes {
             let (blk, belems) = blk_shape(dt);

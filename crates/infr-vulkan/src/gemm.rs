@@ -693,6 +693,9 @@ pub(crate) fn native_mmv_mrow_cl_twin(name: &str) -> Option<(&'static str, &'sta
         "native_mmv_mrow_iq4nl_o4" => v!("native_mmv_mrow_iq4nl_o4_cl"),
         "native_mmv_mrow_iq4nl_o4_m4" => v!("native_mmv_mrow_iq4nl_o4_m4_cl"),
         "native_mmv_mrow_iq4nl_o4_m4_res" => v!("native_mmv_mrow_iq4nl_o4_m4_res_cl"),
+        "native_mmv_mrow_iq3s_o4" => v!("native_mmv_mrow_iq3s_o4_cl"),
+        "native_mmv_mrow_iq3s_o4_m4" => v!("native_mmv_mrow_iq3s_o4_m4_cl"),
+        "native_mmv_mrow_iq3s_o4_m4_res" => v!("native_mmv_mrow_iq3s_o4_m4_res_cl"),
         _ => None,
     }
 }
@@ -796,6 +799,12 @@ pub(crate) fn native_mmv_mrow_variant_spv(
         (Iq4Nl, true, true, false) => v!("native_mmv_mrow_iq4nl_o4_m4"),
         (Iq4Nl, false, true, true) => v!("native_mmv_mrow_iq4nl_m4_res"),
         (Iq4Nl, true, true, true) => v!("native_mmv_mrow_iq4nl_o4_m4_res"),
+        (Iq3S, false, false, false) => v!("native_mmv_mrow_iq3s"),
+        (Iq3S, false, true, false) => v!("native_mmv_mrow_iq3s_m4"),
+        (Iq3S, true, false, false) => v!("native_mmv_mrow_iq3s_o4"),
+        (Iq3S, true, true, false) => v!("native_mmv_mrow_iq3s_o4_m4"),
+        (Iq3S, false, true, true) => v!("native_mmv_mrow_iq3s_m4_res"),
+        (Iq3S, true, true, true) => v!("native_mmv_mrow_iq3s_o4_m4_res"),
         _ => None,
     }
 }
@@ -887,6 +896,7 @@ pub(crate) fn native_mmv_mrow_m16_spv(
         Q4_1 => v!("native_mmv_mrow_q4_1_m16"),
         Q5_1 => v!("native_mmv_mrow_q5_1_m16"),
         Iq4Nl => v!("native_mmv_mrow_iq4nl_m16"),
+        Iq3S => v!("native_mmv_mrow_iq3s_m16"),
         _ => None,
     }
 }

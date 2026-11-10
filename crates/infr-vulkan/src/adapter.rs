@@ -545,7 +545,9 @@ fn mmv_int8_decode_dtypes(
     arch: crate::caps::DeviceArch,
     vk: &infr_core::config::VulkanCfg,
 ) -> &'static [infr_core::DType] {
-    use infr_core::DType::{Iq4Nl, Iq4Xs, Q2K, Q3K, Q4K, Q4_0, Q4_1, Q5K, Q5_0, Q5_1, Q6K, Q8_0};
+    use infr_core::DType::{
+        Iq3S, Iq4Nl, Iq4Xs, Q2K, Q3K, Q4K, Q4_0, Q4_1, Q5K, Q5_0, Q5_1, Q6K, Q8_0,
+    };
     // `INFR_MMV_MW` is TRI-state — `mmv_mw: Option<bool>`, where `Some(false)` is the exact
     // string `"0"`, `Some(true)` any other value, and `None` (unset) the unified default below.
     match vk.mmv_mw {
@@ -554,7 +556,7 @@ fn mmv_int8_decode_dtypes(
         // escape). The legacy 32-block set is included so its decode tier is measurable without a
         // rebuild — none of them are on the DEFAULT set (see the `None` arm).
         Some(true) => &[
-            Q4K, Q6K, Q2K, Q3K, Q5K, Q8_0, Q4_0, Q5_0, Q4_1, Q5_1, Iq4Nl, Iq4Xs,
+            Q4K, Q6K, Q2K, Q3K, Q5K, Q8_0, Q4_0, Q5_0, Q4_1, Q5_1, Iq4Nl, Iq4Xs, Iq3S,
         ],
         // Unified default: the safe intersection of the old per-vendor sets — every dtype here is a
         // measured win on AMD (7900 XTX, Qwen3-14B). Unmeasured on Intel/NVIDIA but the kernels exist
@@ -577,9 +579,11 @@ fn mmv_int8_decode_dtypes(
         // coherence note above stay on the f32 GEMV. Measured on the B70 (Qwen3.8-27B
         // UD-Q4_K_M, 2026-11-10): its Q3_K FFN GEMVs ran at ~165 GB/s on the f32 path against
         // ~540 int8, and decode went 27.6 -> 28.1 t/s; the greedy output is unchanged for ~190 of
-        // 200 tokens, then diverges at a near-tie ("Extra memory" vs "Memory").
+        // 200 tokens, then diverges at a near-tie ("Extra memory" vs "Memory"). IQ3_S joins with
+        // its int8 mrow build (5120x17408 213 -> 78 µs, 17408x5120 205 -> 87; the 27B's 4 IQ3_S
+        // FFN weights).
         None if arch == crate::caps::DeviceArch::IntelXe2 => &[
-            Q2K, Q3K, Q4K, Q6K, Q8_0, Q4_0, Q5_0, Q5_1, Iq4Nl, Q5K, Iq4Xs,
+            Q2K, Q3K, Q4K, Q6K, Q8_0, Q4_0, Q5_0, Q5_1, Iq4Nl, Q5K, Iq4Xs, Iq3S,
         ],
         None => &[Q2K, Q4K, Q6K, Q4_0, Q5_0, Q5_1, Iq4Nl],
     }
@@ -648,7 +652,7 @@ fn mrow_int8_prefill_dtypes(dt: infr_core::DType) -> bool {
 ///   [`unified_mmv_row1`]), a dtype on the decode set is bit-identical in both streams by
 ///   construction, not merely both-int8.
 /// - **Ordinary prefill** (`verify == false`): [`mrow_int8_prefill_dtypes`] — every measured win,
-///   independent of the decode policy.
+///   independent of the decode policy — plus this device's decode set (IQ3_S on Xe2).
 ///
 /// This closes a real bug: Q6_K and IQ4_XS used to take this kernel UNCONDITIONALLY at m>=3
 /// (predating this split), while their m=1 decode is f32-exact and neither is ever on the decode
@@ -664,7 +668,9 @@ fn mrow_int8_dtype_ok(
     if verify {
         mmv_int8_decode_dtypes(arch, vk).contains(&dt)
     } else {
-        mrow_int8_prefill_dtypes(dt)
+        // A dtype on this device's decode set is int8 in prefill too (IQ3_S on Xe2: it has no
+        // f32 multi-row kernel, so its m=3..8 rows otherwise take the GEMM tiles).
+        mrow_int8_prefill_dtypes(dt) || mmv_int8_decode_dtypes(arch, vk).contains(&dt)
     }
 }
 
@@ -1515,9 +1521,12 @@ fn lower_op(
                 && mmv_gate
                 && crate::gemm::native_mmv_mrow_m16_kernel_name(dt).is_some()
                 && be_.cfg().kernels.vulkan.mrow16;
+            // A format with an int8 mrow build but no f32 one (IQ3_S) enters only when the int8
+            // gate below passes, so it never reaches the f32 `linear_native_mrow` fallback.
             if (in_band(MROW_BAND) || mrow16)
                 && in_f % 32 == 0
-                && crate::gemm::native_mrow_kernel_name(dt).is_some()
+                && (crate::gemm::native_mrow_kernel_name(dt).is_some()
+                    || ((m >= 3 || graph.mtp_verify) && mmv_gate))
                 && be_.cfg().kernels.vulkan.mrow
             {
                 // Int8 dp4a multi-row GEMV: quantize the m activation rows once (`quant_q8`), then
@@ -7070,7 +7079,8 @@ mod tests {
     ///
     /// EVERY dtype with an int8 mrow build must be listed in `POLICY_DTYPES` — the k-quants, IQ4_XS,
     /// and the legacy 32-block family.
-    const POLICY_DTYPES: [DType; 12] = [
+    const POLICY_DTYPES: [DType; 13] = [
+        DType::Iq3S,
         DType::Q2K,
         DType::Q3K,
         DType::Q4K,
@@ -7218,14 +7228,18 @@ mod tests {
         // Every dtype's ORDINARY PREFILL is unconditionally on regardless of the decode/verify
         // policy above — this is the actual point of the split: prefill has no partner to protect.
         // Unified across all vendors.
+        // IQ3_S is the exception: Xe2 only, where its decode int8 carries prefill with it.
         for arch in [amd, intel] {
             for dt in POLICY_DTYPES {
-                assert!(
+                assert_eq!(
                     mrow_int8_dtype_ok(arch, &vk, dt, false),
+                    dt != DType::Iq3S || arch == intel,
                     "{dt:?} ordinary-prefill mrow must stay on"
                 );
             }
         }
+        assert!(mmv_int8_decode_dtypes(intel, &vk).contains(&DType::Iq3S));
+        assert!(!mmv_int8_decode_dtypes(amd, &vk).contains(&DType::Iq3S));
         // Intel now takes the same unified rows=1 path (unconditional, part of the
         // capability-first architecture).
         assert!(unified_mmv_row1(&caps0));

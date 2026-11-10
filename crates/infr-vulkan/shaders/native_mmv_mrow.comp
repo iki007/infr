@@ -115,7 +115,7 @@ float f16tof32(uint bits) { return unpackHalf2x16(bits & 0xffffu).x; }
 int sgn8(uint b) { return int(b) - ((b > 127u) ? 256 : 0); }
 
 #if defined(FMT_Q3K) || defined(FMT_Q6K) || defined(FMT_Q8_0) || defined(FMT_Q4_0) \
-    || defined(FMT_Q5_0) || defined(FMT_IQ4NL)
+    || defined(FMT_Q5_0) || defined(FMT_IQ4NL) || defined(FMT_IQ3S)
 // Unaligned u32 via two word loads + funnel shift — same helper as native_mmv_mw.comp's FMT_Q3K.
 // Q3_K's 110-byte blocks are only 2-aligned. Q6_K's 210-byte blocks are ALSO only 2-aligned (210 %
 // 4 == 2), so every odd-indexed super-block's `bd` sits at a byte offset that is 2 mod 4, not 0 —
@@ -398,6 +398,47 @@ void wdec(uint gelem, out uint qp[8], out float f0, out float f1) {
 }
 #endif
 
+#ifdef FMT_IQ3S
+#define ARM_SINGLE_DP
+// IQ3_S: [f16 d][u8 qs[64]][u8 qh[8]][u8 signs[32]][u8 scales[4]] = 110 bytes, 256 elements, 8
+// sub-blocks of 32. Sub-block ib (pair = ib/2, grp = ib%2) has 8 grid indices (a qs byte plus
+// one qh bit as bit 8) into the 512-entry IQ3S grid (4 unsigned bytes in {1,3,...,15} each), 32
+// sign bits and one scale d·(1 + 2·nibble). Symmetric, so f0 = that scale and f1 = 0. Element
+// order matches native_decode.glsl's dqblk: word 2l = grid[gi0] (elements 8l..8l+3), word 2l+1 =
+// grid[gi1] (8l+4..8l+7), and sign bit j of signs byte l negates element 8l+j. Grid bytes are
+// never 0, so the byte-wise negate (w ^ m) + (m & 0x01010101) never carries across byte lanes.
+// The grid sits in shared memory (native_grids.glsl's grid_init, run at the top of main()).
+#include "native_grids.glsl"
+// 4 sign bits -> 4 byte masks (0x00/0xFF): the multiply moves bit i to bit 8i (see qh_spread).
+uint sign_mask4(uint bits) { return ((bits * 0x00204081u) & 0x01010101u) * 0xFFu; }
+void wdec(uint gelem, out uint qp[8], out float f0, out float f1) {
+    uint bd = (gelem / 256u) * 110u;
+    uint ib = (gelem % 256u) / 32u;
+    uint pair = ib >> 1u;
+    uint grp = ib & 1u;
+    float d = f16tof32(ru16(bd));
+    uint sc = rb(bd + 106u + pair);
+    f0 = d * (1.0 + 2.0 * float((sc >> (4u * grp)) & 0xFu));
+    f1 = 0.0;
+    uint qh = rb(bd + 66u + pair * 2u + grp);
+    uint qsa = ru32u(bd + 2u + pair * 16u + grp * 8u); // qs bytes 0..3 (l = 0, 1)
+    uint qsb = ru32u(bd + 6u + pair * 16u + grp * 8u); // qs bytes 4..7 (l = 2, 3)
+    uint sg4 = ru32u(bd + 74u + pair * 8u + grp * 4u); // one signs byte per l
+    for (uint l = 0u; l < 4u; l++) {
+        uint pw = (l < 2u) ? qsa : qsb;
+        uint q0 = (pw >> (16u * (l & 1u))) & 0xFFu;
+        uint q1 = (pw >> (16u * (l & 1u) + 8u)) & 0xFFu;
+        uint gi0 = q0 | ((qh << (8u - 2u * l)) & 256u);
+        uint gi1 = q1 | ((qh << (7u - 2u * l)) & 256u);
+        uint signs = (sg4 >> (8u * l)) & 0xFFu;
+        uint m0 = sign_mask4(signs & 0xFu);
+        uint m1 = sign_mask4(signs >> 4u);
+        qp[2u * l] = (G_IQ3S[gi0] ^ m0) + (m0 & 0x01010101u);
+        qp[2u * l + 1u] = (G_IQ3S[gi1] ^ m1) + (m1 & 0x01010101u);
+    }
+}
+#endif
+
 // ── Legacy 32-block ("_0"/"_1") formats + IQ4_NL ────────────────────────────────────────────────
 // One 32-element block == one activation quant block (BLK=32), so `wdec`'s 8 words ARE the whole
 // block: no super-block sub-indexing, one scale (+ one min for the `_1` twins) per wdec call.
@@ -642,6 +683,9 @@ void main() {
 #if defined(FMT_IQ4XS) || defined(FMT_IQ4NL)
     iq4_lut_init(t);
 #endif
+#ifdef FMT_IQ3S
+    grid_init();
+#endif
     uint ot = t >> 4u;               // which of the 4 outputs this lane serves
     uint sl = t & 15u;               // K sub-lane within the output's 16
     uint nsub = pc.in_f / 32u;
@@ -774,6 +818,9 @@ void main() {
     w_addr = arena_base(pc.arena_lo, pc.arena_hi); // resident slot base byte address; NO slot multiply
 #if defined(FMT_IQ4XS) || defined(FMT_IQ4NL)
     iq4_lut_init(t);
+#endif
+#ifdef FMT_IQ3S
+    grid_init();
 #endif
     uint nsub = pc.in_f / 32u;
     uint in_fq = pc.in_f >> 4u;      // activation row stride in packed uvec4s
