@@ -1159,7 +1159,16 @@ pub(crate) fn generate_dense_backend(
             "after the weights",
             || {
                 let budget = room?.saturating_sub(crate::seam::POST_KV_DEVICE_RESERVE);
-                crate::seam::kv_fit_ctx_in_budget(c, ec, budget, None, &[ubatch], k_fmt, v_fmt)
+                crate::seam::kv_fit_ctx_in_budget(
+                    c,
+                    ec,
+                    budget,
+                    None,
+                    &[ubatch],
+                    k_fmt,
+                    v_fmt,
+                    &caps,
+                )
             },
         )?;
         let mut kbufs: Vec<Box<dyn Buffer>> = Vec::new();
@@ -6027,7 +6036,13 @@ pub(crate) fn generate_dense_backend(
         // Both halves of what a prefill holds live, so the comparison stays honest in either
         // order: the per-chunk scratch, plus — layer-major only — the whole prompt's residual
         // stream, which is exactly what the placement budgets were told to leave room for.
-        let reserved = crate::seam::dense_act_reserve_at(c, max_ctx, rows).saturating_add(
+        let reserved = crate::seam::dense_act_reserve_at(
+            c,
+            max_ctx,
+            rows,
+            crate::seam::AttentionScores::for_device(&caps, k_fmt, v_fmt),
+        )
+        .saturating_add(
             if crate::seam::layer_major_prefill(ec, &caps, be.dense_paged(), !e2b) {
                 crate::seam::layer_major_act_bytes(c, max_ctx, rows)
             } else {

@@ -331,15 +331,15 @@ struct VulkanShared {
     /// VK_EXT_memory_budget is absent — the live per-heap budget is preferred when present
     /// (it also sees other processes' VRAM).
     device_used: AtomicU64,
-    /// Concurrently-live [`BufferUsage::Activations`] bytes, and the high-water mark that figure
-    /// has reached since this backend was built ([`VulkanBackend::activation_peak`]).
+    /// Concurrently-live activation bytes (ordinary buffers and the Level Zero exchange arena),
+    /// and their high-water mark since this backend was built ([`VulkanBackend::activation_peak`]).
     ///
     /// The seam's activation reserve is a PREDICTION of `act_peak`, and nothing else in the tree
     /// observes the predicted quantity — so a reserve could be wrong by a factor and only show up
     /// as a mid-prefill allocation failure on some unrelated model. These two counters are what
     /// make the prediction checkable: the runner compares them against what it reserved when a
-    /// generation ends. Charged in `make_alloc` (the single funnel every `Activations` allocation
-    /// takes) and released in `VkBuffer::drop` via its `act_bytes`.
+    /// generation ends. Charged through `track_activation` and released in `VkBuffer::drop`
+    /// via its `act_bytes`. Arena views share their owner's charge.
     act_live: AtomicU64,
     act_peak: AtomicU64,
     /// SUBMIT SPLITTER: the most dispatches `execute_static` will record into one command buffer
@@ -546,9 +546,9 @@ struct VkBuffer {
     /// that never requested one.
     own_addr: Option<u64>,
     /// This buffer's charge against [`VulkanShared::act_live`] — its logical size when it was
-    /// allocated as [`BufferUsage::Activations`], and `0` for every other usage (weights, KV,
-    /// staging, readback), which the activation high-water mark deliberately does not count.
-    /// Set by `make_alloc`, released by this buffer's `Drop`.
+    /// allocated as [`BufferUsage::Activations`] or as the exchange-arena owner. Views and
+    /// non-activation buffers (weights, KV, staging, readback) carry no charge.
+    /// Set by `track_activation`, released by this buffer's `Drop`.
     act_bytes: u64,
 }
 
@@ -3685,20 +3685,23 @@ impl VulkanBackend {
                 pb.inc(bytes as u64);
             }
         }
-        // Charge the live-activation tally and raise the high-water mark (see
-        // `VulkanShared::act_live`). The logical `bytes`, not the allocation's aligned size: this
-        // measures what the seam's reserve is trying to predict, which is asked for in logical
-        // bytes. Released by `VkBuffer::drop` through the `act_bytes` set here.
         if usage == BufferUsage::Activations {
-            buf.act_bytes = bytes as u64;
-            let live = self
-                .shared
-                .act_live
-                .fetch_add(bytes as u64, Ordering::Relaxed)
-                + bytes as u64;
-            self.shared.act_peak.fetch_max(live, Ordering::Relaxed);
+            self.track_activation(&mut buf);
         }
         Ok(buf)
+    }
+
+    /// Charge an owning activation buffer once, until its final view is dropped. Count logical
+    /// bytes, including the exchange arena's rounded capacity, rather than allocator alignment.
+    fn track_activation(&self, buf: &mut VkBuffer) {
+        debug_assert_eq!(buf.act_bytes, 0);
+        buf.act_bytes = buf.size as u64;
+        let live = self
+            .shared
+            .act_live
+            .fetch_add(buf.act_bytes, Ordering::Relaxed)
+            + buf.act_bytes;
+        self.shared.act_peak.fetch_max(live, Ordering::Relaxed);
     }
 
     /// Copy `src` into device-local `dst_buf` through the REUSED staging ring (see [`StagingRing`])

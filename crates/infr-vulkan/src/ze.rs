@@ -497,7 +497,8 @@ mod imp {
                 }
             }
             let size = bytes.next_multiple_of(64 << 20);
-            let buf = self.alloc_exportable(size)?;
+            let mut buf = self.alloc_exportable(size)?;
+            self.track_activation(&mut buf);
             let export_id = match &buf.backing {
                 Backing::External { export_id, .. } => *export_id,
                 _ => unreachable!("alloc_exportable returns an External buffer"),

@@ -654,12 +654,23 @@ impl SeamModel {
                 gib(fp.total()),
             ));
         }
+        let (k_fmt, v_fmt) = self.kv_fit_fmts(false);
+        let fit = crate::seam::prefer_default_prefill_ctx(
+            &self.cfg,
+            &self.ecfg,
+            vram.alloc_room().saturating_sub(fp.total()),
+            k_fmt,
+            v_fmt,
+            &vk.capabilities(),
+        )
+        .unwrap_or(fit);
         tracing::warn!(
             "ctx clamp: default context {want} -> {fit} to fit VRAM (weights {:.2} GiB vs \
-             {:.2} GiB available{}); set INFR_CTX to override",
+             {:.2} GiB available{}, prefill chunk {}); set INFR_CTX to override",
             fp.total() as f64 / (1u64 << 30) as f64,
             vram.available as f64 / (1u64 << 30) as f64,
             if vram.live { ", live" } else { ", total heap" },
+            crate::seam::ubatch_rows(&self.ecfg),
         );
         Ok(fit)
     }
@@ -769,7 +780,15 @@ impl SeamModel {
         // that the rest of this math is exact rather than 5%-shy — that overhang landed as a
         // mid-prefill alloc failure. The placement sweeps derive from the same function, so the
         // context this validates is one placement will actually take (`seam`'s drift tests).
-        crate::seam::kv_fit_ctx_for(&self.cfg, &self.ecfg, fp.total(), &vram, k_fmt, v_fmt)
+        crate::seam::kv_fit_ctx_for(
+            &self.cfg,
+            &self.ecfg,
+            fp.total(),
+            &vram,
+            k_fmt,
+            v_fmt,
+            &vk.capabilities(),
+        )
     }
 
     /// The per-side KV dtypes a fit/footprint estimate must price: the user's explicit

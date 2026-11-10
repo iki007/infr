@@ -59,6 +59,50 @@ the A/B was taken. infr's 27B prefill
 arms the submit splitter (`split/185`, `split/244`). That is a symptom of the
 slow forward, not a cause: the splitter's cap is measured from forward time.
 
+## Automatic context and prefill chunks (2026-11-10)
+
+The old automatic fit maximized context at a 128-row chunk. That bypassed the
+large XMX/Level Zero GEMMs, so a normal `infr run` could be much slower than
+`bench --ctx 8192 -u 1024`. The reserve also charged Xe2 for `nonfa_s`, a full
+query-by-key score matrix that only the 16x16x16 Vulkan attention tier allocates.
+Xe2 streams attention scores even when Level Zero is unavailable.
+
+The fit now uses the device's attention profile. Ordinary Xe2 f16 KV omits the
+score matrix; quantized KV, MLA/indexer paths and other device profiles retain
+the previous reserve. The measured activation peak now includes the rounded
+Level Zero exchange arena once, until its last view is dropped. On 27B at a
+1,024-row chunk, peak usage is **1,568 MiB** against a **1,675 MiB** reserve;
+the earlier 1,056 MiB peak omitted that arena.
+
+When a single session's automatic trained window cannot fit, dense Xe2 f16
+sessions now keep the tallest chunk that supports at least 1,024 context tokens.
+The post-load fit shrinks context while preserving that chunk. A trained window
+that already fits keeps its capacity policy. Explicit `--ctx`/`INFR_CTX`,
+`--ubatch`/`INFR_UBATCH`, fractional sizing and multiple slots keep their existing
+behavior; `INFR_UBATCH=128` remains the way to maximize capacity at the smaller
+chunk. No kernel arithmetic changes in this slice.
+
+Serial A/B on `Vulkan1`, cached models, the same 1,378-token text prompt, greedy
+80-token output, two process runs per arm, no context/chunk overrides:
+
+| model / automatic default | before | after |
+| --- | --- | --- |
+| Qwen3.8-27B UD-Q4_K_M prefill | 323 t/s | **970 t/s (3.00x)** |
+| 27B decode | 28.5 t/s | 28.4 t/s |
+| 27B context / chunk | 48,301 / 128 | 44,141 / 1,024 |
+| Qwen3.5-4B Q4_K_M prefill | 3,992 t/s | 4,014 t/s |
+| 4B decode | 121.2 t/s | 121.2 t/s |
+
+Both models' 80-token output is byte-identical across arms and repetitions. The
+4B trained window already fits through the existing auto-q8/512-row ladder,
+so that default is preserved. Pinning 27B to 1,024 rows before this correction
+kept only 34,421 context tokens; removing the nonexistent score tile recovers
+9,720 of those tokens while retaining the fast chunk. A separate 32,768-token
+prefill stress run (one warmup, one timed repetition, 1,024-row chunks) completes
+at 867 t/s with the same 1,568 MiB peak, below the 1,675 MiB reserve. A separate
+32,796-token text prompt through `run` with the automatic 44,141-token context
+also completes (855 t/s, same peak), exercising the full advertised KV allocation.
+
 ## Test suite (2026-11-09)
 
 The first run: 284 pass, 17 fail. None of the 17 was a production-path failure,

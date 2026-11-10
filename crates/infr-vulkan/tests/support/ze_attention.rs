@@ -5,6 +5,44 @@ use super::*;
 use infr_testkit::{f16_bytes, gen_f32};
 use std::sync::Arc;
 
+#[test]
+#[ignore = "needs an Intel Xe2 GPU with both Mesa ANV and Level Zero"]
+fn ze_exchange_arena_counts_live_activations_and_retained_views() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let idx = std::env::var("INFR_ZE_VK")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1);
+    let mut cfg = infr_core::config::Config::default();
+    cfg.kernels.vulkan.ze_gemm = true;
+    let be_ = VulkanBackend::new_on_with(idx, Arc::new(cfg)).unwrap();
+    assert!(be_.ze_bridge().is_some());
+    let initial = be_.shared.act_live.load(Relaxed);
+    be_.ze_arena_reset(1 << 20).unwrap();
+    assert_eq!(be_.shared.act_live.load(Relaxed), initial + (64 << 20));
+    let old_view = be_.ze_view(4096).unwrap();
+    assert_eq!(
+        be_.shared.act_live.load(Relaxed),
+        initial + (64 << 20),
+        "views must not be charged twice"
+    );
+    be_.ze_arena_reset(65 << 20).unwrap();
+    assert_eq!(
+        be_.shared.act_live.load(Relaxed),
+        initial + (192 << 20),
+        "an old view keeps the old allocation alive"
+    );
+    assert!(be_.activation_peak().unwrap() >= initial + (192 << 20));
+    drop(old_view);
+    assert_eq!(be_.shared.act_live.load(Relaxed), initial + (128 << 20));
+    be_.ze_arena_reset(1).unwrap();
+    assert_eq!(
+        be_.shared.act_live.load(Relaxed),
+        initial + (128 << 20),
+        "arena reuse must not add another charge"
+    );
+}
+
 #[derive(Clone, Copy, Debug)]
 struct Case {
     rows: usize,

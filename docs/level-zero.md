@@ -146,7 +146,11 @@ the limit.
 - **Activations**: an *exchange arena* (one exportable block, bump-allocated per forward) holds the
   `_x256` f16 A copies (`lin_a16_x256`, which the producers' `-DY16` builds already write) and the
   outputs of the offloaded Linears. They are ordinary `BdaSub` views, so every Vulkan op reads and
-  writes them unchanged.
+  writes them unchanged. The activation high-water mark charges the arena's full rounded
+  capacity once, including an old arena retained by outstanding views during growth. Its
+  views carry no additional charge. Xe2's default-context sizing keeps a large prefill chunk
+  when it must clamp the trained window; measured capacity and throughput are in
+  [the B70 campaign log](intel-b70.md#automatic-context-and-prefill-chunks-2026-11-10).
 - **Ordering**: `execute_static` ends the segment at an offloaded Linear with a submit signalling
   the timeline `v` (`Recorder::finish_nowait_signal`), appends Level Zero's wait `v` / GEMM / signal
   `v + 1`, and opens the next segment waiting `v + 1` (`Recorder::wait_timeline`). Nothing waits on
