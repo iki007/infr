@@ -50,8 +50,10 @@ fn vadd_matches_host() {
     let mut out = vec![0u8; n * 4];
     g.download(&dc, &mut out).unwrap();
     let c: Vec<f32> = out
-        .chunks_exact(4)
-        .map(|w| f32::from_le_bytes([w[0], w[1], w[2], w[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|w| f32::from_le_bytes(*w))
         .collect();
     for i in 0..n {
         assert_eq!(c[i], a[i] + b[i], "element {i}");
@@ -131,8 +133,10 @@ fn gemm_f16_probe() {
     let mut out = vec![0u8; m * n * 4];
     g.download(&dc, &mut out).unwrap();
     let c: Vec<f32> = out
-        .chunks_exact(4)
-        .map(|x| f32::from_le_bytes([x[0], x[1], x[2], x[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|x| f32::from_le_bytes(*x))
         .collect();
     let mut worst = 0.0f64;
     for r in 0..m {

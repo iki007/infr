@@ -344,6 +344,11 @@ pub const NOT_MIGRATED: &[(&str, &str)] = &[
          A runtime Config cannot exist when it is read.",
     ),
     (
+        "INFR_ZE_TARGET",
+        "build-time input: the ocloc -device target infr-ze's build.rs compiles its OpenCL C \
+         kernels for. A runtime Config cannot exist when it is read.",
+    ),
+    (
         "INFR_LLAMA_DIFFUSION_CLI",
         "test/dev fixture: points at a llama.cpp binary on disk (cli/main.rs).",
     ),

@@ -747,7 +747,7 @@ fn scan_file_for_keys(path: &Path, out: &mut Vec<String>) {
 /// Rust, minus comments. The allowed hits are exactly the permanent exclusions below:
 ///
 /// * `INFR_PROFILE` in the five `build.rs` — a BUILD-time input; a runtime `Config` cannot exist
-///   when it is read.
+///   when it is read. `INFR_ZE_TARGET` in `infr-ze/build.rs` (the `ocloc` target) likewise.
 /// * `INFR_TEST_GGUF` / `INFR_TEST_MODEL` / `INFR_LLAMA_DIFFUSION_CLI` — test/dev fixtures that
 ///   point at files on disk, deliberately left on the environment.
 ///
@@ -776,8 +776,8 @@ fn no_infr_env_reads_outside_the_config_layer() {
         if FIXTURE_KEYS.contains(&key) {
             return false;
         }
-        // `INFR_PROFILE` is the build scripts' alone.
-        !(key == "INFR_PROFILE" && path.ends_with("build.rs"))
+        // `INFR_PROFILE` and `INFR_ZE_TARGET` are the build scripts' alone.
+        !((key == "INFR_PROFILE" || key == "INFR_ZE_TARGET") && path.ends_with("build.rs"))
     });
     assert!(
         offenders.is_empty(),
