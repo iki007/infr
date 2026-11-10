@@ -146,12 +146,20 @@ uvec4 rw4(uint bo) {
 }
 
 #if defined(FMT_Q4K) || defined(FMT_Q5K)
-// Q4_K/Q5_K share the same 6-bit scale/min packed layout for sub-block i from the 12-byte scales
-// field at sb.
-uvec2 k4(uint i, uint sb) {
-    if (i < 4u) { return uvec2(rb(sb + i) & 63u, rb(sb + i + 4u) & 63u); }
-    uint sc = (rb(sb + i + 4u) & 0xFu) | ((rb(sb + i - 4u) >> 6u) << 4u);
-    uint mn = (rb(sb + i + 4u) >> 4u) | ((rb(sb + i) >> 6u) << 4u);
+// Q4_K/Q5_K share the same 6-bit scale/min packed layout for sub-block i, unpacked here from the
+// super-block's 16-byte header ALREADY IN REGISTERS:
+// h = [d|dmin as f16x2][scales 0..3][scales 4..7][scales 8..11]. One b128 load of the header
+// (Q4_K's 144- and Q5_K's 176-byte super-blocks are both 16-byte aligned) replaces the scattered
+// 32-bit loads `ru16`/`rb` issued for d, dmin and the scale bytes. Measured on an Arc Pro B70
+// (docs/intel-b70.md): the OUTS4 loop's memory sends 83 -> 80, instructions 542 -> 512.
+uint hbyte(uvec4 h, uint j) {
+    uint w = j < 4u ? h.y : (j < 8u ? h.z : h.w);
+    return (w >> ((j & 3u) * 8u)) & 0xFFu;
+}
+uvec2 k4h(uint i, uvec4 h) {
+    if (i < 4u) { return uvec2(hbyte(h, i) & 63u, hbyte(h, i + 4u) & 63u); }
+    uint sc = (hbyte(h, i + 4u) & 0xFu) | ((hbyte(h, i - 4u) >> 6u) << 4u);
+    uint mn = (hbyte(h, i + 4u) >> 4u) | ((hbyte(h, i) >> 6u) << 4u);
     return uvec2(sc, mn);
 }
 #endif
@@ -164,11 +172,11 @@ uvec2 k4(uint i, uint sb) {
 void wdec(uint gelem, out uint qp[8], out float f0, out float f1) {
     uint bd = (gelem / 256u) * 144u; // super-block byte base
     uint sub = (gelem / 32u) & 7u;   // sub-block 0..7
-    float d = f16tof32(ru16(bd));
-    float dmin = f16tof32(ru16(bd + 2u));
-    uvec2 km = k4(sub, bd + 4u);
-    f0 = d * float(km.x);
-    f1 = dmin * float(km.y);
+    uvec4 h = NW4(bd >> 2u);         // [d|dmin][scales 12 bytes], 16B-aligned
+    vec2 dd = unpackHalf2x16(h.x);
+    uvec2 km = k4h(sub, h);
+    f0 = dd.x * float(km.x);
+    f1 = dd.y * float(km.y);
     // qbase is always word-aligned (bd = sb·144, 144 % 4 == 0; +16 +32·k) — load each 4-byte
     // quant word ONCE and nibble-mask it packed (vs 4 rb() byte loads + shifts per word).
     uint qword = (bd + 16u + (sub >> 1u) * 32u) >> 2u;
@@ -199,11 +207,11 @@ void wdec(uint gelem, out uint qp[8], out float f0, out float f1) {
 void wdec(uint gelem, out uint qp[8], out float f0, out float f1) {
     uint bd = (gelem / 256u) * 176u; // super-block byte base
     uint sub = (gelem / 32u) & 7u;   // sub-block 0..7 (== llama.cpp's `is`)
-    float d = f16tof32(ru16(bd));
-    float dmin = f16tof32(ru16(bd + 2u));
-    uvec2 km = k4(sub, bd + 4u);
-    f0 = d * float(km.x);
-    f1 = dmin * float(km.y);
+    uvec4 h = NW4(bd >> 2u);         // [d|dmin][scales 12 bytes], 16B-aligned
+    vec2 dd = unpackHalf2x16(h.x);
+    uvec2 km = k4h(sub, h);
+    f0 = dd.x * float(km.x);
+    f1 = dd.y * float(km.y);
     // qs base: bd+48 (d+dmin+scales=16 bytes, then qh=32 bytes -> qs at +48), word-aligned the same
     // way Q4_K's qword is (bd, 48, 32·k, 4·j all multiples of 4).
     uint qlword = (bd + 48u + (sub >> 1u) * 32u) >> 2u;
