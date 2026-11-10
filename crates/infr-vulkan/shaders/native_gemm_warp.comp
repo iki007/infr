@@ -204,6 +204,10 @@ void main() {
 #ifdef STREAMED
     w_addr = arena_base(pc.arena_lo, pc.arena_hi); // resident slot base byte address; NO slot multiply
 #endif
+#ifdef IQ4_LUT
+    iq4_lut_init();
+#endif
+    GRID_INIT; // grid formats (IQ3_S): stage the codebook in shared; empty otherwise
     uint tilesN = pc.n / BN;
 #ifdef SPLIT_K
     uint tilesMN = (pc.mpad / BM) * tilesN;

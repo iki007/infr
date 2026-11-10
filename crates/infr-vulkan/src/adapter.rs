@@ -1610,11 +1610,20 @@ fn lower_op(
             // shapes (`gemm::native_gemm_warp_xmx` owns their tiles and n/k rules). Anything it
             // can't cover (dtype without a build, non-dividing shape) keeps falling to the
             // nc_mmq/nc_fma tier.
-            let cm8_ok = gemm_ok
-                && (be_.caps().f16_coopmat_8x8() || be_.caps().f16_coopmat_8x16())
-                && be_.caps().coopmat_f16.is_some_and(|s| {
-                    crate::gemm::native_gemm_warp_xmx(dt, s, out_f, in_f).is_some()
-                });
+            // Intel Xe2 at m >= 256: the 256-row `_x256` tile (see
+            // `gemm::native_gemm_warp_x256`) — half the weight decodes of the 128-row `_cm816`
+            // tile, spread over every thread. Qwen3.5-4B pp512 2380 -> 3070, Qwen3.8-27B
+            // 376 -> 558 (Arc Pro B70). IQ3_S has only this tile.
+            let x256 = gemm_ok
+                && m >= 256
+                && be_.caps().f16_coopmat_8x16()
+                && crate::gemm::native_gemm_warp_x256(dt, out_f, in_f).is_some();
+            let cm8_ok = x256
+                || (gemm_ok
+                    && (be_.caps().f16_coopmat_8x8() || be_.caps().f16_coopmat_8x16())
+                    && be_.caps().coopmat_f16.is_some_and(|s| {
+                        crate::gemm::native_gemm_warp_xmx(dt, s, out_f, in_f).is_some()
+                    }));
             let is_gemm = cm8_ok
                 || (gemm_ok
                     && be_.caps().f16_coopmat()
@@ -1729,18 +1738,16 @@ fn lower_op(
                         && be_.caps().bf16_coopmat()
                         && (bf16cm_wide || bf16cm_narrow)
                         && be_.cfg().kernels.vulkan.bf16_coopmat;
-                    // Intel Xe2 at m >= 256: the 256-row `_x256` tile (see
-                    // `gemm::native_gemm_warp_x256`) — half the weight decodes of the 128-row
-                    // `_cm816` tile, spread over every thread. Qwen3.5-4B pp512 2380 -> 3070,
-                    // Qwen3.8-27B 376 -> 558 (Arc Pro B70).
-                    let x256 = cm8_ok
-                        && m >= 256
-                        && be_.caps().f16_coopmat_8x16()
-                        && crate::gemm::native_gemm_warp_x256(dt, out_f, in_f).is_some();
                     if x256 {
                         let mpad = m.div_ceil(256) * 256;
                         let k16 = pooled(pool, be_, "lin_a16_x256", mpad * in_f * 2)?;
-                        rec.store_f16(xb, pool[&k16].as_ref(), m * in_f, 0);
+                        // The previous Linear converted this same `x` (gate/up, qkv/z): reuse its
+                        // f16 copy. `mmv_memo` is the int8 memo too, but that is only ever set at
+                        // m <= 16, so an m >= 256 entry can only be this one.
+                        if memo_prev != Some((*x, m, in_f)) {
+                            rec.store_f16(xb, pool[&k16].as_ref(), m * in_f, 0);
+                        }
+                        *mmv_memo = Some((*x, m, in_f));
                         rec.matmul_native_x256(
                             dt,
                             pool[&k16].as_ref(),

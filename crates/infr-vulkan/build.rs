@@ -2292,6 +2292,9 @@ fn main() {
         ("attn_nc_fa", "attn_nc_fa_hd128", &[]),
         ("attn_nc_fa", "attn_nc_fa_hd256", &["-DHD_MAX=256"]),
         ("attn_nc_fa", "attn_nc_fa_hd512", &["-DHD_MAX=512"]),
+        // Intel Xe2 XMX flash attention (8x16x16 coopmat, subgroup 16): `gemm::attn_xmx_fa_spv`.
+        ("attn_xmx_fa", "attn_xmx_fa_hd128", &["-DHD=128u"]),
+        ("attn_xmx_fa", "attn_xmx_fa_hd256", &["-DHD=256u"]),
         // int8 coopmat (WMMA) prefill GEMM, Q8_0 only — measurement kernel gated behind
         // INFR_I8_COOPMAT=1 (see adapter.rs / docs in the .comp file). Default-off; correctness
         // validated against native_gemm_mmq_q8_0/native_gemm_warp_q8_0.
@@ -3371,6 +3374,7 @@ fn main() {
             "native_gemm_warp_iq4xs_x256",
             &[
                 "-DFMT_IQ4XS",
+                "-DIQ4_LUT",
                 "-DNARROW_N",
                 "-DBM256",
                 "-DBK128",
@@ -3388,6 +3392,25 @@ fn main() {
             "native_gemm_warp_iq4nl_x256",
             &[
                 "-DFMT_IQ4NL",
+                "-DIQ4_LUT",
+                "-DNARROW_N",
+                "-DBM256",
+                "-DBK128",
+                "-DCM_M=8",
+                "-DCM_N=16",
+                "-DXE_WM=32u",
+                "-DXE_WN=32u",
+                "-DWG_THREADS=512",
+                "-DA_GLOBAL",
+                "-DROW_GUARD",
+            ],
+        ),
+        (
+            "native_gemm_warp",
+            "native_gemm_warp_iq3s_x256",
+            &[
+                "-DFMT_IQ3S",
+                "-DUSE_GRID",
                 "-DNARROW_N",
                 "-DBM256",
                 "-DBK128",

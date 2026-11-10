@@ -608,6 +608,20 @@ const uint KV_IQ4NL_W[4] = uint[](0xBFAD9881u, 0xF6EADDCFu, 0x26190D01u, 0x71594
 int kv_iq4nl(uint idx) {
     return bitfieldExtract(int(KV_IQ4NL_W[idx >> 2u]), int((idx & 3u) << 3u), 8);
 }
+#ifdef IQ4_LUT
+// -DIQ4_LUT (the Intel Xe2 `_x256` GEMM builds): a byte-pair table in shared memory, KVP[b] =
+// kv[b & 15] | kv[b >> 4] << 8 as int8 bytes, so `dqblk` does one shared load per qs byte instead
+// of two select-cascade lookups — the decode GEMV's measured table (native_mmv_mrow.comp). Same
+// values, bit-identical. The includer calls `iq4_lut_init()` at the top of main() (it barriers).
+shared uint KVP[256];
+void iq4_lut_init() {
+    uint n = gl_WorkGroupSize.x * gl_WorkGroupSize.y * gl_WorkGroupSize.z;
+    for (uint i = gl_LocalInvocationIndex; i < 256u; i += n) {
+        KVP[i] = (uint(kv_iq4nl(i & 15u)) & 0xFFu) | ((uint(kv_iq4nl(i >> 4u)) & 0xFFu) << 8u);
+    }
+    barrier();
+}
+#endif
 #endif
 #if defined(FMT_MXFP4) || defined(FMT_NVFP4)
 const int KV_MXFP4[16] = int[](0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12);
@@ -651,8 +665,14 @@ void dqblk(uint gstart, out float v[32]) {
         uint q = ru32u(bd + 2u + w8 * 4u);
         for (uint b = 0u; b < 4u; b++) {
             uint byteq = (q >> (8u * b)) & 0xFFu;
+#ifdef IQ4_LUT
+            uint pr = KVP[byteq];
+            v[w8 * 4u + b] = d * float(bitfieldExtract(int(pr), 0, 8));
+            v[w8 * 4u + b + 16u] = d * float(bitfieldExtract(int(pr), 8, 8));
+#else
             v[w8 * 4u + b] = d * float(kv_iq4nl(byteq & 0xFu));
             v[w8 * 4u + b + 16u] = d * float(kv_iq4nl(byteq >> 4u));
+#endif
         }
     }
 }
@@ -698,8 +718,14 @@ void dqblk(uint gstart, out float v[32]) {
         for (uint b = 0u; b < 4u; b++) {
             uint byte = (q >> (8u * b)) & 0xFFu;
             uint j = w4 * 4u + b;
+#ifdef IQ4_LUT
+            uint pr = KVP[byte];
+            v[j] = dl * float(bitfieldExtract(int(pr), 0, 8));
+            v[j + 16u] = dl * float(bitfieldExtract(int(pr), 8, 8));
+#else
             v[j] = dl * float(kv_iq4nl(byte & 0xFu));
             v[j + 16u] = dl * float(kv_iq4nl(byte >> 4u));
+#endif
         }
     }
 }

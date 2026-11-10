@@ -1130,6 +1130,29 @@ pub(crate) fn native_gemm_fma_kernel_name(dtype: infr_core::DType) -> Option<&'s
         _ => return None,
     })
 }
+/// The Intel Xe2 XMX flash-attention prefill kernel (`attn_xmx_fa.comp`: 8x16x16 coopmat, 16-lane
+/// subgroups, 32-row tiles) for head dim `hd` — the drop-in for [`attn_nc_fa_spv`] on a device with
+/// that fragment shape. `None` for hd other than 128 and 256.
+pub(crate) fn attn_xmx_fa_spv(hd: usize) -> Option<(&'static str, &'static [u32])> {
+    macro_rules! v {
+        ($name:literal) => {{
+            static S: OnceLock<Vec<u32>> = OnceLock::new();
+            Some((
+                $name,
+                S.get_or_init(|| {
+                    spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))
+                })
+                .as_slice(),
+            ))
+        }};
+    }
+    match hd {
+        128 => v!("attn_xmx_fa_hd128"),
+        256 => v!("attn_xmx_fa_hd256"),
+        _ => None,
+    }
+}
+
 /// SPIR-V for the non-coopmat shared-memory fma flash-attention prefill (the "nc_fa" tier, see
 /// `attn_nc_fa.comp`): fused QK^T → online softmax → PV for devices without a usable f16 coopmat
 /// (adapter.rs `nc_fa_ok`). Three shared-Os builds; returns the smallest that fits `hd` as
@@ -1595,6 +1618,7 @@ pub(crate) fn native_gemm_warp_x256(
         Q3K => v!("native_gemm_warp_q3k_x256"),
         Iq4Xs => v!("native_gemm_warp_iq4xs_x256"),
         Iq4Nl => v!("native_gemm_warp_iq4nl_x256"),
+        Iq3S => v!("native_gemm_warp_iq3s_x256"),
         _ => return None,
     };
     Some(XmxGemm {

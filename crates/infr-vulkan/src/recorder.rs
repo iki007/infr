@@ -5552,9 +5552,21 @@ impl<'a> Recorder<'a> {
         scale: f32,
         cap: usize,
     ) {
-        let (name, spv, bm) =
-            crate::gemm::attn_nc_fa_spv(hd).expect("attention_prefill_nc_fa: hd gated <= 512");
-        let k = self.be.kernel(name, spv, 4, 36);
+        // On an 8x16x16 coopmat device (Intel Xe2) the XMX flash kernel takes hd 128/256 — same
+        // interface, push and bindings (`attn_xmx_fa.comp`).
+        let xmx = if self.be.caps().f16_coopmat_8x16() {
+            crate::gemm::attn_xmx_fa_spv(hd)
+        } else {
+            None
+        };
+        let (k, bm) = match xmx {
+            Some((name, spv)) => (self.be.kernel_sg(name, spv, 4, 36, 16), 32),
+            None => {
+                let (name, spv, bm) = crate::gemm::attn_nc_fa_spv(hd)
+                    .expect("attention_prefill_nc_fa: hd gated <= 512");
+                (self.be.kernel(name, spv, 4, 36), bm)
+            }
+        };
         let mut p = [0u8; 36];
         p[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
         p[4..8].copy_from_slice(&(kv_len as u32).to_ne_bytes());
