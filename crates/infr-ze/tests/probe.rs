@@ -316,7 +316,7 @@ fn quant_gemm_probe(fmt: &QFormat, bin: &[u8]) {
 #[test]
 #[ignore = "requires a Level Zero GPU"]
 fn gemm_q4k_probe() {
-    let Some(bin) = infr_ze::kernels::gemm_q4k() else {
+    let Some(bin) = infr_ze::kernels::gemm_kquant() else {
         eprintln!("skip: no ocloc kernels");
         return;
     };
@@ -325,6 +325,42 @@ fn gemm_q4k_probe() {
         dtype: infr_core::DType::Q4K,
         block_bytes: 144,
         f16_fields: &[0, 2],
+        wg_m: 256,
+        wg_n: 64,
+    };
+    quant_gemm_probe(&fmt, bin);
+}
+
+#[test]
+#[ignore = "requires a Level Zero GPU"]
+fn gemm_q5k_probe() {
+    let Some(bin) = infr_ze::kernels::gemm_kquant() else {
+        eprintln!("skip: no ocloc kernels");
+        return;
+    };
+    let fmt = QFormat {
+        name: "gemm_q5k",
+        dtype: infr_core::DType::Q5K,
+        block_bytes: 176,
+        f16_fields: &[0, 2],
+        wg_m: 256,
+        wg_n: 64,
+    };
+    quant_gemm_probe(&fmt, bin);
+}
+
+#[test]
+#[ignore = "requires a Level Zero GPU"]
+fn gemm_iq4xs_probe() {
+    let Some(bin) = infr_ze::kernels::gemm_iq4() else {
+        eprintln!("skip: no ocloc kernels");
+        return;
+    };
+    let fmt = QFormat {
+        name: "gemm_iq4xs",
+        dtype: infr_core::DType::Iq4Xs,
+        block_bytes: 136,
+        f16_fields: &[0],
         wg_m: 256,
         wg_n: 64,
     };

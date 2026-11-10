@@ -87,12 +87,12 @@ Vulkan resubmit — kernel-driver scheduling of a cross-queue dependency, not wo
 against ~690 ms per 512 tokens today; moving the norms/elementwise ops between GEMMs into L0 later
 cuts that to ~2 per layer.
 
-### Phase 2: quantized DPAS GEMMs (`kernels/gemm_q4k.cl` done)
+### Phase 2: quantized DPAS GEMMs (Q4_K, Q5_K, IQ4_XS done)
 
 The 27B (UD-Q4_K_M) GEMM work by weight format: IQ4_XS 36%, Q5_K 28%, Q4_K 25%, Q6_K 3.6%, the
 rest under 3% each; the 4B Q4_K_M is nearly all Q4_K (+ Q6_K).
 
-`gemm_q4k`: the f16 probe's tiling with the B operand dequantized in registers. Each lane owns two
+`gemm_q4k` (`kernels/gemm_kquant.cl`): the f16 probe's tiling with the B operand dequantized in registers. Each lane owns two
 W rows (DPAS's B operand is one column per lane) and turns 16 nibbles into 8 dwords of half
 k-pairs: mask, widen bytes to words, `| 0x6400` (the half 1024 + q), `- 1024`, `* s + m`.
 
@@ -118,10 +118,30 @@ Other shapes (m=512): 17408 -> 5120 1.070 ms (85 TFLOPS), 5120 -> 12288 0.577 ms
 L2 across the N tiles — a packet-ordered grid (all N tiles of a 512-row M packet first) is the fix.
 Against Vulkan `_x256` Q4_K (1.62 ms / ~2.19 ms for the two FFN shapes) this is 1.7-2x.
 
+`gemm_q5k` shares the body (`gemm_kq`, specialised by a constant format): Q5_K's fifth bit is
+`((qh >> sb) & 0x01010101) << 4` OR-ed into the nibble bytes before `deq_b`.
+
+`gemm_iq4xs` (`kernels/gemm_iq4.cl`): the IQ4_NL codebook through a byte-pair table in shared
+memory (`lut[a | b << 4] = half2(kv[a], kv[b])`, one gather per B row), then the sub-block scale in
+vISA (`scale_b`). A degree-4 polynomial for the codebook misses by up to 0.476 — too close to the
+rounding edge in f16. A sparse table indexed by the nibbles in place (`lut[a | b << 8]`, two ALU
+ops per row instead of five) ran 4% slower: entries 1 KB apart share SLM banks; the gathers are
+the limit.
+
+| m=512, 5120 -> 17408, sustained | L0 | TFLOPS | Vulkan `_x256` |
+| --- | --- | --- | --- |
+| f16 (reference) | 0.881 ms | 104 | — |
+| Q4_K | 0.925 ms | 99 | 1.62 ms |
+| Q5_K | 0.856 ms | 107 | 1.77 ms |
+| IQ4_XS | 1.291 ms | 71 | 1.78 ms |
+
 ### Next
 
-- The same for Q5_K, IQ4_XS (codebook: a byte-pair table instead of `| 0x6400`), Q6_K, Q8_0 and
-  the long tail.
+- Integration (the formats above are 90% of the 27B's GEMM work; the rest stays on Vulkan):
+  exportable weight and activation allocations, the recorder split around offloaded GEMMs.
+- IQ4_XS: fewer SLM gathers — e.g. a byte-indexed table (k-pairs `(j, j+16)`, one index per byte)
+  with the producer writing A in the matching k order.
+- Q6_K, Q3_K, IQ4_NL, IQ3_S, Q8_0; a packet-ordered grid for m > 512.
 - Exportable allocations for the weights and the activation arena (dedicated, dma-buf), then the
   recorder split: end the command buffer at an offloaded GEMM, submit signalling the timeline, L0
   waits / runs / signals, the next command buffer waits.

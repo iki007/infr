@@ -1,6 +1,6 @@
 // ocloc-options: -cl-intel-256-GRF-per-thread
-// C[M,N] (f32) = A[M,K] (f16) . W[N,K]^T, W in GGUF Q4_K (144-byte superblocks of 256, row-major
-// over K), DPAS on Xe2.
+// C[M,N] (f32) = A[M,K] (f16) . W[N,K]^T, W in a GGUF K-quant with (scale, min) sub-blocks —
+// Q4_K (144-byte superblocks of 256) or Q5_K (176) — row-major over K, DPAS on Xe2.
 //
 // Each 16-lane subgroup holds a 64x32 C tile (8x2 DPAS accumulators). Lane l of the subgroup owns
 // W rows n0+l and n0+16+l: DPAS's B operand is 16 k-values of ONE column per lane, so each lane
@@ -15,7 +15,8 @@
 #define WG_M 256
 #define WG_N 64
 #define QK 256
-#define BLK 144
+#define FMT_Q4K 0
+#define FMT_Q5K 1
 
 // One DPAS B operand (16 k of this lane's W row, 8 dwords of k-pairs) from four dwords of masked
 // nibbles (byte e of `nib` dword d = k 4d+e): row i = half2(q[2i], q[2i+1]) * s + m, with `s2` /
@@ -74,10 +75,13 @@ inline int8 deq_b(uint4 nib, uint s2, uint m2) {
     return as_int8(out);
 }
 
-__attribute__((intel_reqd_sub_group_size(16)))
-__attribute__((reqd_work_group_size(128, 1, 1)))
-__kernel void gemm_q4k(__global const half* A, __global const uchar* W, __global float* C,
-                       int M, int N, int K) {
+// The kernel body, specialised per format at its constant `fmt`. Q4_K and Q5_K share the
+// superblock header (d, dmin, 6-bit scales and mins of 8 sub-blocks); Q5_K adds qh[32], whose bit
+// `sb` of byte l is the fifth bit of value l of sub-block sb.
+inline void gemm_kq(__global const half* A, __global const uchar* W, __global float* C, int M,
+                    int N, int K, const int fmt) {
+    const int BLK = fmt == FMT_Q5K ? 176 : 144;
+    const int QS = fmt == FMT_Q5K ? 48 : 16;
     const int sg = get_sub_group_id();
     const int lane = get_sub_group_local_id();
     const int m0 = get_group_id(0) * WG_M + (sg >> 1) * SG_M;
@@ -96,6 +100,11 @@ __kernel void gemm_q4k(__global const half* A, __global const uchar* W, __global
     for (int s = 0; s < nsb; s++) {
         half8 S[2], Mn[2];
         __global const uchar* blk[2] = {row0 + s * BLK, row1 + s * BLK};
+        uint8 qh[2];
+        if (fmt == FMT_Q5K) {
+            qh[0] = vload8(0, (__global const uint*)(blk[0] + 16));
+            qh[1] = vload8(0, (__global const uint*)(blk[1] + 16));
+        }
         for (int j = 0; j < 2; j++) {
             // d, dmin, then scales[12]: 6-bit (scale, min) for 8 sub-blocks of 32.
             uint4 hd = vload4(0, (__global const uint*)blk[j]);
@@ -118,8 +127,8 @@ __kernel void gemm_q4k(__global const half* A, __global const uchar* W, __global
                 }
             }
             uint8 q[2];
-            q[0] = vload8(0, (__global const uint*)(blk[0] + 16 + c * 32));
-            q[1] = vload8(0, (__global const uint*)(blk[1] + 16 + c * 32));
+            q[0] = vload8(0, (__global const uint*)(blk[0] + QS + c * 32));
+            q[1] = vload8(0, (__global const uint*)(blk[1] + QS + c * 32));
             __attribute__((opencl_unroll_hint))
             for (int kb = 0; kb < 4; kb++) {
                 const int k = s * QK + c * 64 + kb * 16;
@@ -132,6 +141,11 @@ __kernel void gemm_q4k(__global const half* A, __global const uchar* W, __global
                 for (int j = 0; j < 2; j++) {
                     uint4 w = (kb & 1) ? q[j].s4567 : q[j].s0123;
                     uint4 nib = (kb & 2) ? ((w >> 4) & 0x0F0F0F0Fu) : (w & 0x0F0F0F0Fu);
+                    if (fmt == FMT_Q5K) {
+                        const int sb = 2 * c + (kb >> 1);
+                        uint4 hw = (kb & 1) ? qh[j].s4567 : qh[j].s0123;
+                        nib |= ((hw >> sb) & 0x01010101u) << 4;
+                    }
                     b[j] = deq_b(nib, s2[j][kb >> 1], m2[j][kb >> 1]);
                 }
                 for (int i = 0; i < 4; i++) {
@@ -155,4 +169,18 @@ __kernel void gemm_q4k(__global const half* A, __global const uchar* W, __global
                 (__private uint*)&acc[i][j]);
         }
     }
+}
+
+__attribute__((intel_reqd_sub_group_size(16)))
+__attribute__((reqd_work_group_size(128, 1, 1)))
+__kernel void gemm_q4k(__global const half* A, __global const uchar* W, __global float* C,
+                       int M, int N, int K) {
+    gemm_kq(A, W, C, M, N, K, FMT_Q4K);
+}
+
+__attribute__((intel_reqd_sub_group_size(16)))
+__attribute__((reqd_work_group_size(128, 1, 1)))
+__kernel void gemm_q5k(__global const half* A, __global const uchar* W, __global float* C,
+                       int M, int N, int K) {
+    gemm_kq(A, W, C, M, N, K, FMT_Q5K);
 }
