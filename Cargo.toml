@@ -4,6 +4,7 @@ members = [
     "crates/infr-core",
     "crates/infr-plat",
     "crates/infr-vulkan",
+    "crates/infr-ze",
     "crates/infr-metal",
     "crates/infr-hub",
     "crates/infr-gguf",
@@ -46,6 +47,8 @@ infr-prof-rt = { path = "crates/infr-prof-rt", version = "0.2.0" }
 infr-testkit = { path = "crates/infr-testkit" }
 
 # shared third-party
+# Level Zero is opened at run time (`infr-ze`), the way `ash` opens the Vulkan loader.
+libloading = "0.8"
 thiserror = "2"
 anyhow = "1"
 half = "2"

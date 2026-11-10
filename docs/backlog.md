@@ -3381,6 +3381,11 @@ kernels. A true SYCL backend needs a C++ shim built with `icpx` and oneAPI at
 build time, which breaks that rule. Both options and the evidence are in
 `docs/intel-b70.md`.
 
+**Started (2026-11-10).** `crates/infr-ze` has the device layer (`dlopen`ed
+Level Zero, `ocloc`-built OpenCL C kernels) and a DPAS + 2D-block-load f16 GEMM
+probe: 104 TFLOPS sustained at m=512 5120x17408 on the B70, 2.3x the Vulkan
+`_x256` tile. Not wired into the engine yet; `docs/level-zero.md`.
+
 ### B103 — fp32 divide is not correctly rounded on Intel, and `quant_q8` divides (2026-11-09)
 
 **Tag:** vulkan · correctness · Intel · **Blocked on:** nothing; found reading,

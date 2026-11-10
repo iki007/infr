@@ -51,6 +51,9 @@ at that index. It holds:
 
 ## Models & architectures
 
+- [level-zero.md](level-zero.md) — the native Intel backend (`crates/infr-ze`,
+  backlog B102): Level Zero through `dlopen`, OpenCL C kernels built by `ocloc`,
+  and the phase-0 DPAS GEMM probe (104 TFLOPS on the B70, 2.3x the Vulkan tile).
 - [qwen35.md](qwen35.md) — Qwen3.5 / Qwen3.6 (`qwen35`): the gated-DeltaNet
   linear-attention + full-attention hybrid, and the interleaved q+gate trap.
 - [qwen38.md](qwen38.md) — Qwen3.8 support plan. One release name, three archs:
