@@ -58,6 +58,9 @@ mod imp {
         export_id: u64,
     }
 
+    /// Rows per Level Zero launch — the kernels' workgroup tile height (see `ZeBridge::gemm`).
+    const PACKET: usize = 256;
+
     pub(crate) struct ZeBridge(Mutex<Inner>);
 
     // SAFETY: every Level Zero object — and the `Rc`s `infr-ze` keeps them in — is created, used and
@@ -168,15 +171,21 @@ mod imp {
                 _ => &g.iq4xs,
             };
             let e = |r: infr_ze::Result<()>| r.map_err(|e| be(format!("ze gemm: {e}")));
-            e(k.arg_buf_at(0, &g.imports[&a_id], a_off))?;
             e(k.arg_buf_at(1, &g.imports[&w_id], w_base + w_off_b))?;
-            e(k.arg_buf_at(2, &g.imports[&c_id], c_off))?;
-            e(k.arg(3, m as i32))?;
             e(k.arg(4, out_f as i32))?;
             e(k.arg(5, in_f as i32))?;
             e(g.gpu.wait_semaphore(&g.ze_sem, wait))?;
-            e(g.gpu
-                .launch(k, [m.div_ceil(256) as u32, (out_f / 64) as u32, 1]))?;
+            // One launch per 256-row packet (one workgroup row each): a packet's A stays in L2
+            // across all the N tiles. Measured on the B70 (Q4_K): m=512 5120->17408 0.93 ms as one
+            // launch vs 2 x 0.42 as packets, 17408->5120 1.07 vs 2 x 0.41 (85 -> 112 TFLOPS).
+            // Arguments are captured at append, so each packet rebinds A, C and its row count.
+            for r0 in (0..m).step_by(PACKET) {
+                let mc = (m - r0).min(PACKET);
+                e(k.arg_buf_at(0, &g.imports[&a_id], a_off + r0 * in_f * 2))?;
+                e(k.arg_buf_at(2, &g.imports[&c_id], c_off + r0 * out_f * 4))?;
+                e(k.arg(3, mc as i32))?;
+                e(g.gpu.launch(k, [1, (out_f / 64) as u32, 1]))?;
+            }
             e(g.gpu.signal_semaphore(&g.ze_sem, wait + 1))
         }
 

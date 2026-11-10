@@ -162,6 +162,16 @@ the limit.
 | Qwen3.8-27B UD-Q4_K_M | 740 | **1013** | 746 | 1087 |
 | Qwen3.5-4B Q4_K_M | 4172 | **5138** | 3165 | 7031 |
 
+Each offloaded GEMM is launched as 256-row packets (one workgroup row each): a packet's A stays in
+L2 across all N tiles. Q4_K, alone: m=512 5120 -> 17408 0.93 ms as one launch, 2 x 0.42 as
+packets; 17408 -> 5120 1.07 vs 2 x 0.41 (85 -> 112 TFLOPS). End to end it moves the 27B pp2048
+(m=1024 ubatches) 967 -> 1028 t/s (Vulkan only 739) and leaves pp512 at ~1010.
+
+Where the 27B pp512 goes now (~508 ms per 512 tokens): with the Level Zero launches skipped (wrong
+output, timing only) it runs at 2198 t/s, so ~233 ms is everything but the offloaded GEMMs —
+attention, DeltaNet, norms, the handoffs, and the ~10% of GEMM work in formats still on Vulkan
+(Q6_K, Q3_K, IQ4_NL, IQ3_S at ~45 TFLOPS, ~60 ms); the offloaded GEMMs take ~275 ms (~90 TFLOPS).
+
 ### Next
 
 - On by default on Intel Xe2 once it has run more models and longer prompts.
