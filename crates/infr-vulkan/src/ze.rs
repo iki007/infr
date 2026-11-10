@@ -73,6 +73,10 @@ mod imp {
         q4k: infr_ze::Kernel,
         q5k: infr_ze::Kernel,
         iq4xs: infr_ze::Kernel,
+        rmsnorm: infr_ze::Kernel,
+        swiglu: infr_ze::Kernel,
+        add: infr_ze::Kernel,
+        to_f16: infr_ze::Kernel,
         /// The Vulkan side of the timeline (signalled by segment submits, waited by the next).
         vk_sem: TpExportSemaphore,
         /// The same timeline imported into Level Zero.
@@ -94,17 +98,25 @@ mod imp {
             let gpu = infr_ze::Gpu::open(&ze, Some(&pci)).map_err(|e| e.to_string())?;
             let kq = infr_ze::kernels::gemm_kquant().ok_or("infr-ze built without ocloc")?;
             let iq = infr_ze::kernels::gemm_iq4().ok_or("infr-ze built without ocloc")?;
+            let ew = infr_ze::kernels::elementwise().ok_or("infr-ze built without ocloc")?;
             let kq = gpu.module(kq).map_err(|e| e.to_string())?;
             let iq = gpu.module(iq).map_err(|e| e.to_string())?;
-            let kernel = |m: &std::rc::Rc<infr_ze::Module>, name: &str| {
+            let ew = gpu.module(ew).map_err(|e| e.to_string())?;
+            let kernel = |m: &std::rc::Rc<infr_ze::Module>, name: &str, wg: u32| {
                 let k = m.kernel(name).map_err(|e| e.to_string())?;
-                k.group_size(128, 1, 1).map_err(|e| e.to_string())?;
+                k.group_size(wg, 1, 1).map_err(|e| e.to_string())?;
                 Ok::<_, String>(k)
             };
             let (q4k, q5k, iq4xs) = (
-                kernel(&kq, "gemm_q4k")?,
-                kernel(&kq, "gemm_q5k")?,
-                kernel(&iq, "gemm_iq4xs")?,
+                kernel(&kq, "gemm_q4k", 128)?,
+                kernel(&kq, "gemm_q5k", 128)?,
+                kernel(&iq, "gemm_iq4xs", 128)?,
+            );
+            let (rmsnorm, swiglu, add, to_f16) = (
+                kernel(&ew, "rmsnorm", 256)?,
+                kernel(&ew, "swiglu", 256)?,
+                kernel(&ew, "add", 256)?,
+                kernel(&ew, "to_f16", 256)?,
             );
             let vk_sem = be_.tp_export_timeline().map_err(|e| e.to_string())?;
             let fd = unsafe { std::os::fd::BorrowedFd::borrow_raw(vk_sem.raw_fd()) }
@@ -116,6 +128,10 @@ mod imp {
                 q4k,
                 q5k,
                 iq4xs,
+                rmsnorm,
+                swiglu,
+                add,
+                to_f16,
                 vk_sem,
                 ze_sem,
                 value: 0,
@@ -136,10 +152,25 @@ mod imp {
             g.value - 1
         }
 
-        /// `C[m, out_f] = A16[m, in_f] · Wᵀ` on Level Zero: after the timeline reaches `wait`
-        /// (`None`: right after the previous GEMM of a chain), then signalling `signal` (`None`:
-        /// the chain continues). `a16`/`c` are exchange-arena views, `w` a weight in an exportable
-        /// block with `w_off` an ELEMENT offset (row-aligned, as `Op::Linear`'s).
+        /// Append a wait until the timeline reaches `v`: the start of a chain.
+        pub(crate) fn wait(&self, v: u64) -> Result<()> {
+            let g = self.0.lock().unwrap();
+            g.gpu
+                .wait_semaphore(&g.ze_sem, v)
+                .map_err(|e| be(format!("ze wait: {e}")))
+        }
+
+        /// Append a signal of `v` after everything appended before: the end of a chain.
+        pub(crate) fn signal(&self, v: u64) -> Result<()> {
+            let g = self.0.lock().unwrap();
+            g.gpu
+                .signal_semaphore(&g.ze_sem, v)
+                .map_err(|e| be(format!("ze signal: {e}")))
+        }
+
+        /// `C[m, out_f] = A16[m, in_f] · Wᵀ` on Level Zero. `a16`/`c` are exchange-arena views,
+        /// `w` a weight in an exportable block with `w_off` an ELEMENT offset (row-aligned, as
+        /// `Op::Linear`'s).
         #[allow(clippy::too_many_arguments)]
         pub(crate) fn gemm(
             &self,
@@ -152,8 +183,6 @@ mod imp {
             m: usize,
             in_f: usize,
             out_f: usize,
-            wait: Option<u64>,
-            signal: Option<u64>,
         ) -> Result<()> {
             let blk = match dt {
                 DType::Q4K => 144,
@@ -176,9 +205,6 @@ mod imp {
             e(k.arg_buf_at(1, &g.imports[&w_id], w_base + w_off_b))?;
             e(k.arg(4, out_f as i32))?;
             e(k.arg(5, in_f as i32))?;
-            if let Some(v) = wait {
-                e(g.gpu.wait_semaphore(&g.ze_sem, v))?;
-            }
             // One launch per 256-row packet (one workgroup row each): a packet's A stays in L2
             // across all the N tiles. Measured on the B70 (Q4_K): m=512 5120->17408 0.93 ms as one
             // launch vs 2 x 0.42 as packets, 17408->5120 1.07 vs 2 x 0.41 (85 -> 112 TFLOPS).
@@ -190,10 +216,115 @@ mod imp {
                 e(k.arg(3, mc as i32))?;
                 e(g.gpu.launch(k, [1, (out_f / 64) as u32, 1]))?;
             }
-            match signal {
-                Some(v) => e(g.gpu.signal_semaphore(&g.ze_sem, v)),
-                None => Ok(()),
+            Ok(())
+        }
+
+        /// `y = rmsnorm(x) * w` over `rows` rows of `dim` (and its f16 copy into `y16`).
+        #[allow(clippy::too_many_arguments)]
+        pub(crate) fn rmsnorm(
+            &self,
+            be_: &VulkanBackend,
+            x: &dyn Buffer,
+            w: &dyn Buffer,
+            y: &dyn Buffer,
+            y16: Option<&dyn Buffer>,
+            rows: usize,
+            dim: usize,
+            eps: f32,
+        ) -> Result<()> {
+            let mut g = self.0.lock().unwrap();
+            let bufs = [x, w, y, y16.unwrap_or(y)];
+            let ids = bufs
+                .iter()
+                .map(|b| g.import(be_, *b))
+                .collect::<Result<Vec<_>>>()?;
+            let g = &*g;
+            let e = |r: infr_ze::Result<()>| r.map_err(|e| be(format!("ze rmsnorm: {e}")));
+            for (i, (id, off)) in ids.iter().enumerate() {
+                e(g.rmsnorm.arg_buf_at(i as u32, &g.imports[id], *off))?;
             }
+            e(g.rmsnorm.arg(4, dim as i32))?;
+            e(g.rmsnorm.arg(5, eps))?;
+            e(g.rmsnorm.arg(6, i32::from(y16.is_some())))?;
+            e(g.gpu.launch(&g.rmsnorm, [rows as u32, 1, 1]))
+        }
+
+        /// `y = silu(gate) * up` over `rows` rows of `[gate | up]` (`nff` each), with the optional
+        /// SwiGLU clamp, and its f16 copy into `y16`.
+        #[allow(clippy::too_many_arguments)]
+        pub(crate) fn swiglu(
+            &self,
+            be_: &VulkanBackend,
+            gu: &dyn Buffer,
+            y: &dyn Buffer,
+            y16: Option<&dyn Buffer>,
+            rows: usize,
+            nff: usize,
+            clamp: Option<f32>,
+        ) -> Result<()> {
+            let mut g = self.0.lock().unwrap();
+            let bufs = [gu, y, y16.unwrap_or(y)];
+            let ids = bufs
+                .iter()
+                .map(|b| g.import(be_, *b))
+                .collect::<Result<Vec<_>>>()?;
+            let g = &*g;
+            let e = |r: infr_ze::Result<()>| r.map_err(|e| be(format!("ze swiglu: {e}")));
+            for (i, (id, off)) in ids.iter().enumerate() {
+                e(g.swiglu.arg_buf_at(i as u32, &g.imports[id], *off))?;
+            }
+            e(g.swiglu.arg(3, rows as i32))?;
+            e(g.swiglu.arg(4, nff as i32))?;
+            e(g.swiglu.arg(5, i32::from(clamp.is_some())))?;
+            e(g.swiglu.arg(6, clamp.unwrap_or(0.0)))?;
+            e(g.swiglu.arg(7, i32::from(y16.is_some())))?;
+            e(g.gpu
+                .launch(&g.swiglu, [(rows * nff).div_ceil(256) as u32, 1, 1]))
+        }
+
+        /// `dst = a + b` over `n` floats.
+        pub(crate) fn add(
+            &self,
+            be_: &VulkanBackend,
+            a: &dyn Buffer,
+            b: &dyn Buffer,
+            dst: &dyn Buffer,
+            n: usize,
+        ) -> Result<()> {
+            let mut g = self.0.lock().unwrap();
+            let ids = [a, b, dst]
+                .iter()
+                .map(|x| g.import(be_, *x))
+                .collect::<Result<Vec<_>>>()?;
+            let g = &*g;
+            let e = |r: infr_ze::Result<()>| r.map_err(|e| be(format!("ze add: {e}")));
+            for (i, (id, off)) in ids.iter().enumerate() {
+                e(g.add.arg_buf_at(i as u32, &g.imports[id], *off))?;
+            }
+            e(g.add.arg(3, n as i32))?;
+            e(g.gpu.launch(&g.add, [n.div_ceil(256) as u32, 1, 1]))
+        }
+
+        /// `y16 = (half) x` over `n` floats — a GEMM's A copy no producer wrote.
+        pub(crate) fn to_f16(
+            &self,
+            be_: &VulkanBackend,
+            x: &dyn Buffer,
+            y16: &dyn Buffer,
+            n: usize,
+        ) -> Result<()> {
+            let mut g = self.0.lock().unwrap();
+            let ids = [x, y16]
+                .iter()
+                .map(|b| g.import(be_, *b))
+                .collect::<Result<Vec<_>>>()?;
+            let g = &*g;
+            let e = |r: infr_ze::Result<()>| r.map_err(|e| be(format!("ze to_f16: {e}")));
+            for (i, (id, off)) in ids.iter().enumerate() {
+                e(g.to_f16.arg_buf_at(i as u32, &g.imports[id], *off))?;
+            }
+            e(g.to_f16.arg(2, n as i32))?;
+            e(g.gpu.launch(&g.to_f16, [n.div_ceil(256) as u32, 1, 1]))
         }
 
         /// Drop the import of a retired exportable allocation.
@@ -351,6 +482,7 @@ mod imp {
     /// Never constructed off Linux.
     pub(crate) enum ZeBridge {}
 
+    #[allow(clippy::too_many_arguments)]
     impl ZeBridge {
         pub(crate) fn vk_semaphore(&self) -> ash::vk::Semaphore {
             match *self {}
@@ -358,7 +490,12 @@ mod imp {
         pub(crate) fn reserve(&self) -> u64 {
             match *self {}
         }
-        #[allow(clippy::too_many_arguments)]
+        pub(crate) fn wait(&self, _: u64) -> Result<()> {
+            match *self {}
+        }
+        pub(crate) fn signal(&self, _: u64) -> Result<()> {
+            match *self {}
+        }
         pub(crate) fn gemm(
             &self,
             _: &VulkanBackend,
@@ -370,8 +507,50 @@ mod imp {
             _: usize,
             _: usize,
             _: usize,
-            _: Option<u64>,
-            _: Option<u64>,
+        ) -> Result<()> {
+            match *self {}
+        }
+        pub(crate) fn rmsnorm(
+            &self,
+            _: &VulkanBackend,
+            _: &dyn Buffer,
+            _: &dyn Buffer,
+            _: &dyn Buffer,
+            _: Option<&dyn Buffer>,
+            _: usize,
+            _: usize,
+            _: f32,
+        ) -> Result<()> {
+            match *self {}
+        }
+        pub(crate) fn swiglu(
+            &self,
+            _: &VulkanBackend,
+            _: &dyn Buffer,
+            _: &dyn Buffer,
+            _: Option<&dyn Buffer>,
+            _: usize,
+            _: usize,
+            _: Option<f32>,
+        ) -> Result<()> {
+            match *self {}
+        }
+        pub(crate) fn add(
+            &self,
+            _: &VulkanBackend,
+            _: &dyn Buffer,
+            _: &dyn Buffer,
+            _: &dyn Buffer,
+            _: usize,
+        ) -> Result<()> {
+            match *self {}
+        }
+        pub(crate) fn to_f16(
+            &self,
+            _: &VulkanBackend,
+            _: &dyn Buffer,
+            _: &dyn Buffer,
+            _: usize,
         ) -> Result<()> {
             match *self {}
         }

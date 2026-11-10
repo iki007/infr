@@ -10,7 +10,7 @@ use infr_core::backend::{Bindings, Buffer, BufferUsage, Plan};
 use infr_core::error::{Error, Result};
 use infr_core::graph::{Activation, AttnMask, Graph, Op, TensorKind};
 use infr_core::shutdown::shutdown_requested;
-use infr_core::{Backend, TensorId};
+use infr_core::{Backend, DType, TensorDesc, TensorId};
 use std::collections::HashMap;
 use std::sync::Mutex;
 
@@ -5667,9 +5667,13 @@ fn abort_segment(rec: Option<Recorder<'_>>, e: Error) -> Error {
     }
 }
 
-/// The Linears this forward runs as Level Zero GEMMs (`ze.rs`): prefill shapes of a dtype with a
-/// kernel, writing an `Internal` tensor, reading a weight from an exportable block. Empty without
-/// the bridge (`INFR_ZE_GEMM` off, not Intel Xe2, no Level Zero) and under dense layer streaming.
+/// The ops this forward runs on Level Zero (`ze.rs`): the prefill Linears of a dtype with a
+/// kernel, and the elementwise ops joining them (`RmsNorm`, `Add`, SwiGLU `GatedActFused`). Every
+/// L0-capable op is a candidate; a run of consecutive candidates (in live order, with an offloaded
+/// Linear's residual `Add` unfused) is kept when it holds a Linear — so a layer's GEMMs and the ops
+/// between them become one chain, while an elementwise op that joins no GEMM stays on Vulkan.
+/// Empty without the bridge (`INFR_ZE_GEMM` off, not Intel Xe2, no Level Zero) and under dense
+/// layer streaming.
 fn ze_plan(
     be_: &VulkanBackend,
     graph: &Graph,
@@ -5679,29 +5683,78 @@ fn ze_plan(
     if be_.dense_paged() || be_.ze_bridge().is_none() {
         return out;
     }
-    for (i, op) in graph.ops.iter().enumerate() {
-        let Op::Linear {
+    // An f32 activation the exchange arena can hold for the forward: an `Internal` tensor, or a
+    // bound input/output (the seam's residual stream), which `execute_static` shadows there.
+    let arena = |t: &TensorId| {
+        graph.desc(*t).dtype == DType::F32
+            && match graph.tensors[t.0 as usize].kind {
+                TensorKind::Internal => true,
+                TensorKind::Input | TensorKind::Output => bindings.get(*t).is_some(),
+                TensorKind::Weight => false,
+            }
+    };
+    let exportable = |t: &TensorId| bindings.get(*t).is_some_and(|w| be_.ze_operand_ok(w));
+    let gemm = |op: &Op| match op {
+        Op::Linear {
+            x,
             weight,
             dst,
             m,
             in_f,
             out_f,
             ..
-        } = op
-        else {
-            continue;
-        };
-        if !crate::ze::ze_dtype(graph.desc(*weight).dtype)
-            || !crate::ze::ze_shape(*m as usize, *in_f as usize, *out_f as usize)
-            || !matches!(graph.tensors[dst.0 as usize].kind, TensorKind::Internal)
-        {
-            continue;
+        } => {
+            crate::ze::ze_dtype(graph.desc(*weight).dtype)
+                && crate::ze::ze_shape(*m as usize, *in_f as usize, *out_f as usize)
+                && arena(x)
+                && arena(dst)
+                && exportable(weight)
         }
-        if bindings.get(*weight).is_some_and(|w| be_.ze_operand_ok(w)) {
-            out.insert(i);
+        _ => false,
+    };
+    let candidate = |op: &Op| match op {
+        Op::Add { a, b, dst, .. } => arena(a) && arena(b) && arena(dst),
+        Op::RmsNorm { x, weight, dst, .. } => {
+            arena(x) && arena(dst) && graph.desc(*weight).dtype == DType::F32 && exportable(weight)
+        }
+        Op::GatedActFused { gu, dst, act, .. } => {
+            matches!(act, Activation::Silu) && arena(gu) && arena(dst)
+        }
+        op => gemm(op),
+    };
+    let plan = infr_core::fusion::plan_fusions(graph, &fusion_cfg(be_));
+    let mut skip = plan.skip.clone();
+    for &idx in plan.linear_add.keys() {
+        if gemm(&graph.ops[idx]) {
+            skip.remove(&(idx + 1));
         }
     }
+    let mut run: Vec<usize> = Vec::new();
+    let flush = |run: &mut Vec<usize>, out: &mut std::collections::HashSet<usize>| {
+        if run.iter().any(|&i| gemm(&graph.ops[i])) {
+            out.extend(run.iter().copied());
+        }
+        run.clear();
+    };
+    for (i, op) in infr_core::exec::live_ops(&graph.ops, &skip) {
+        if candidate(op) {
+            run.push(i);
+        } else {
+            flush(&mut run, &mut out);
+        }
+    }
+    flush(&mut run, &mut out);
     out
+}
+
+/// [`alloc_scratch`]'s byte size for an `Internal` tensor (leading dim padded to 64 rows).
+fn scratch_bytes(desc: &TensorDesc) -> Option<usize> {
+    let numel = desc.numel();
+    let padded = match desc.shape.first() {
+        Some(&rows) if rows > 0 => rows.div_ceil(64) * 64 * (numel / rows),
+        _ => numel,
+    };
+    desc.dtype.dense_bytes(padded).map(|b| b.max(4))
 }
 
 /// Per-execute static recording: allocate `Internal` scratch fresh, record every op via `lower_op`
@@ -5713,6 +5766,7 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
     // and outputs live in.
     let ze_ops = ze_plan(be_, graph, bindings);
     let mut ze_dsts = std::collections::HashSet::new();
+    let mut ze_shadow: Vec<TensorId> = Vec::new();
     let mut ze_a16: Vec<usize> = Vec::new();
     if !ze_ops.is_empty() {
         let mut bytes = 0usize;
@@ -5728,16 +5782,38 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
                 }
             }
         }
+        // Every Internal tensor a Level Zero op reads or writes.
         for &i in &ze_ops {
-            if let Op::Linear { dst, m, out_f, .. } = &graph.ops[i] {
-                if ze_dsts.insert(dst.0 as usize) {
-                    bytes += (*m as usize).div_ceil(64) * 64 * *out_f as usize * 4 + 256;
+            let ts: Vec<TensorId> = match &graph.ops[i] {
+                Op::Linear { x, dst, .. } => vec![*x, *dst],
+                Op::Add { a, b, dst, .. } => vec![*a, *b, *dst],
+                Op::RmsNorm { x, dst, .. } => vec![*x, *dst],
+                Op::GatedActFused { gu, dst, .. } => vec![*gu, *dst],
+                _ => vec![],
+            };
+            for t in ts {
+                let internal = matches!(graph.tensors[t.0 as usize].kind, TensorKind::Internal);
+                let fresh = if internal {
+                    ze_dsts.insert(t.0 as usize)
+                } else if !ze_shadow.contains(&t) {
+                    ze_shadow.push(t);
+                    true
+                } else {
+                    false
+                };
+                if fresh {
+                    bytes += scratch_bytes(graph.desc(t)).unwrap_or(4) + 256;
                 }
             }
         }
         be_.ze_arena_reset(bytes)?;
     }
-    let scratch = alloc_scratch(be_, graph, &ze_dsts)?;
+    let mut scratch = alloc_scratch(be_, graph, &ze_dsts)?;
+    // A bound activation a Level Zero op touches (the residual stream) runs from an arena copy:
+    // copied in by the first segment, back out by the last.
+    for &t in &ze_shadow {
+        scratch[t.0 as usize] = Some(be_.ze_view(scratch_bytes(graph.desc(t)).unwrap_or(4))?);
+    }
 
     // RoPE position: the static `qk_norm_rope`/`rope` kernels take a scalar `rope_pos`, but the IR
     // carries a `positions` i32 tensor. Read `positions[0]` (decode rows=1, or the start of a
@@ -5800,6 +5876,19 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
     // `PagedStream`'s doc. Every non-paged graph (the overwhelming common case) never touches any
     // of this and records exactly like before — one recorder, one submit.
     let mut rec = Some(be_.recorder()?);
+    let shadow_bytes = |t: TensorId| graph.desc(t).dtype.dense_bytes(graph.desc(t).numel());
+    for &t in &ze_shadow {
+        if let (Some(bound), Some(n)) = (bindings.get(t), shadow_bytes(t)) {
+            let r = rec.as_ref().expect("fresh recorder");
+            r.copy(
+                bound,
+                0,
+                scratch[t.0 as usize].as_deref().expect("shadow view"),
+                0,
+                n,
+            );
+        }
+    }
     let mode = RopeMode::Static(&rope_pos);
     let mut dyn_args: Vec<DynAttnCtx> = Vec::new();
     let mut pool: ScratchPool = HashMap::new();
@@ -5900,48 +5989,13 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
             fresh.seed_barrier();
             rec = Some(fresh);
         }
-        // A Level Zero GEMM (`ze.rs`): end the segment signalling `v`, append the GEMM (waits `v`,
-        // signals `v + 1`), and open the next segment waiting on `v + 1`.
+        // A Level Zero op (`ze.rs`). The first of a run ends the Vulkan segment signalling `v` and
+        // opens a chain waiting on it; the last signals `v + 1`, which the next segment waits on.
         if ze_ops.contains(&op_idx) {
-            let Op::Linear {
-                x,
-                weight,
-                dst,
-                m,
-                in_f,
-                out_f,
-                w_off,
-            } = op
-            else {
-                unreachable!("ze_plan holds Linears only");
-            };
-            let (m, in_f, out_f) = (*m as usize, *in_f as usize, *out_f as usize);
             let bridge = be_.ze_bridge().expect("ze_plan needs the bridge");
-            let operands = (|| -> Result<_> {
-                Ok((
-                    resolve(&scratch, bindings, *x)?,
-                    resolve(&scratch, bindings, *weight)?,
-                    resolve(&scratch, bindings, *dst)?,
-                    x256_a16(&mut pool, be_, m, in_f)?,
-                ))
-            })();
-            let (xb, w, y, k16) = match operands {
-                Ok(t) => t,
-                Err(e) => return Err(abort_segment(rec.take(), e)),
-            };
-            // The producer may already have written this `x`'s f16 copy (`mmv_memo`, the same
-            // hand-off the `_x256` arm takes); inside a chain it always has (same `x`).
-            let memo_prev = mmv_memo.take();
-            if memo_prev != Some((*x, m, in_f)) {
-                rec.as_ref()
-                    .expect("a chain only links GEMMs on the same x")
-                    .store_f16(xb, pool[&k16].as_ref(), m * in_f, 0);
-            }
-            mmv_memo = Some((*x, m, in_f));
             let sem = bridge.vk_semaphore();
-            // Start a chain: end the Vulkan segment signalling `v` for Level Zero to wait on.
-            let (v, wait) = match ze_chain {
-                Some(v) => (v, None),
+            let v = match ze_chain {
+                Some(v) => v,
                 None => {
                     let v = bridge.reserve();
                     let seg = rec
@@ -5955,32 +6009,105 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
                         let old = segments.pop_front().expect("len > MAX_INFLIGHT >= 0");
                         old.wait().map_err(|e| be(e.to_string()))?;
                     }
-                    (v, Some(v))
+                    bridge.wait(v)?;
+                    v
                 }
             };
-            // Continue the chain when the next live op is another Level Zero GEMM on this `x`.
-            let chained = live.peek().is_some_and(|(ni, nop)| {
-                ze_ops.contains(ni)
-                    && matches!(nop, Op::Linear { x: nx, m: nm, in_f: nk, .. }
-                        if nx == x && *nm as usize == m && *nk as usize == in_f)
-            });
-            let dt = graph.desc(*weight).dtype;
-            bridge.gemm(
-                be_,
-                dt,
-                pool[&k16].as_ref(),
-                w,
-                *w_off as usize,
-                y,
-                m,
-                in_f,
-                out_f,
-                wait,
-                (!chained).then_some(v + 1),
-            )?;
-            if chained {
-                ze_chain = Some(v);
-            } else {
+            ze_chain = Some(v);
+            let r = |t: TensorId| resolve(&scratch, bindings, t);
+            // `mmv_memo`: the f16 A copy hand-off, as the Vulkan producers and `_x256` arm keep it.
+            let memo_prev = mmv_memo.take();
+            match op {
+                Op::Linear {
+                    x,
+                    weight,
+                    dst,
+                    m,
+                    in_f,
+                    out_f,
+                    w_off,
+                } => {
+                    let (m, in_f, out_f) = (*m as usize, *in_f as usize, *out_f as usize);
+                    let k16 = x256_a16(&mut pool, be_, m, in_f)?;
+                    if memo_prev != Some((*x, m, in_f)) {
+                        bridge.to_f16(be_, r(*x)?, pool[&k16].as_ref(), m * in_f)?;
+                    }
+                    mmv_memo = Some((*x, m, in_f));
+                    let dt = graph.desc(*weight).dtype;
+                    bridge.gemm(
+                        be_,
+                        dt,
+                        pool[&k16].as_ref(),
+                        r(*weight)?,
+                        *w_off as usize,
+                        r(*dst)?,
+                        m,
+                        in_f,
+                        out_f,
+                    )?;
+                }
+                Op::RmsNorm {
+                    x,
+                    weight,
+                    dst,
+                    rows,
+                    dim,
+                    eps,
+                } => {
+                    let (rows, dim) = (*rows as usize, *dim as usize);
+                    let y16 = if rows >= 256
+                        && prefill_x256_linear_next(be_, graph, op_idx, *dst, dim, rows)
+                    {
+                        mmv_memo = Some((*dst, rows, dim));
+                        Some(x256_a16(&mut pool, be_, rows, dim)?)
+                    } else {
+                        None
+                    };
+                    bridge.rmsnorm(
+                        be_,
+                        r(*x)?,
+                        r(*weight)?,
+                        r(*dst)?,
+                        y16.map(|k| pool[&k].as_ref()),
+                        rows,
+                        dim,
+                        *eps,
+                    )?;
+                }
+                Op::GatedActFused {
+                    gu,
+                    dst,
+                    rows,
+                    nff,
+                    swiglu_clamp,
+                    ..
+                } => {
+                    let (rows, nff) = (*rows as usize, *nff as usize);
+                    let y16 = if rows >= 256
+                        && prefill_x256_linear_next(be_, graph, op_idx, *dst, nff, rows)
+                    {
+                        mmv_memo = Some((*dst, rows, nff));
+                        Some(x256_a16(&mut pool, be_, rows, nff)?)
+                    } else {
+                        None
+                    };
+                    bridge.swiglu(
+                        be_,
+                        r(*gu)?,
+                        r(*dst)?,
+                        y16.map(|k| pool[&k].as_ref()),
+                        rows,
+                        nff,
+                        *swiglu_clamp,
+                    )?;
+                }
+                Op::Add { a, b, dst, n } => {
+                    bridge.add(be_, r(*a)?, r(*b)?, r(*dst)?, *n as usize)?;
+                }
+                _ => unreachable!("ze_plan holds Level Zero ops only"),
+            }
+            if !live.peek().is_some_and(|(ni, _)| ze_ops.contains(ni)) {
+                bridge.signal(v + 1)?;
                 ze_chain = None;
                 let fresh = be_.recorder()?;
                 fresh.seed_barrier();
@@ -6090,6 +6217,17 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
     }
     transient.extend(pool.into_values());
     let last = rec.take().expect("segment always Some at loop end");
+    for &t in &ze_shadow {
+        if let (Some(bound), Some(n)) = (bindings.get(t), shadow_bytes(t)) {
+            last.copy(
+                scratch[t.0 as usize].as_deref().expect("shadow view"),
+                0,
+                bound,
+                0,
+                n,
+            );
+        }
+    }
     submitted_dispatches += last.dispatches();
     last.finish().map_err(|e| be(e.to_string()))?;
     // The blocking finish above already waited the queue idle — draining just releases the

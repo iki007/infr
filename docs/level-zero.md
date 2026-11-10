@@ -1,8 +1,8 @@
 # Level Zero backend (`infr-ze`) — Intel Xe2, native
 
-Status (2026-11-10): **prefill GEMMs run on Level Zero inside the Vulkan backend**, opt-in
-`INFR_ZE_GEMM=1` (`crates/infr-vulkan/src/ze.rs`): Qwen3.8-27B pp512 740 -> 1013 t/s, Qwen3.5-4B
-4172 -> 5138, greedy output unchanged. Backlog B102.
+Status (2026-11-10): **prefill GEMMs and the ops joining them run on Level Zero inside the Vulkan
+backend**, opt-in `INFR_ZE_GEMM=1` (`crates/infr-vulkan/src/ze.rs`): Qwen3.8-27B pp512 740 -> 1067
+t/s (llama.cpp SYCL 1087), Qwen3.5-4B 4172 -> 5811, greedy output unchanged. Backlog B102.
 
 ## Why
 
@@ -171,7 +171,21 @@ A run of offloaded Linears on the same input (qkv + z, gate + up, q/k/v) is one 
 one wait, the GEMMs back to back, one signal — no empty Vulkan segment and two handoffs fewer per
 link. 27B pp512 1008 -> 1037, pp2048 1028 -> 1047; 4B pp512 5138 -> 5242 (output unchanged).
 
-Where the 27B pp512 goes now (~508 ms per 512 tokens): with the Level Zero launches skipped (wrong
+**Whole runs on Level Zero.** `kernels/elementwise.cl` adds `rmsnorm`, `swiglu`, `add` and
+`to_f16` (the arithmetic of the Vulkan shaders they stand in for, with the next GEMM's f16 copy as
+an optional output). `ze_plan` marks every L0-capable op (offloadable Linears, f32 `Add`,
+`RmsNorm` with an exportable weight, SwiGLU `GatedActFused`) and keeps each run of consecutive ones
+that holds a GEMM: a layer's out-projection -> residual add -> norm -> gate|up -> SwiGLU -> down ->
+add -> next norm -> input projections is one chain. The residual stream is the seam's bound
+buffer, not scratch, so a bound f32 activation an L0 op touches is *shadowed* in the exchange arena
+for the forward (copied in by the first segment, out by the last) — without that the residual
+`Add`/`RmsNorm` were ineligible and the elementwise kernels bought nothing (27B 1037 -> 1040).
+With it: 27B pp512 1037 -> 1067, pp2048 1047 -> 1059; 4B 5242 -> 5811. On the 4B the GEMMs that
+still break chains are its Q6_K `ffn_down` / `attn_v` (no fast L0 Q6_K kernel yet: a per-lane
+`ushort` load version runs 24 TFLOPS — 104 single-dword loads per superblock; it needs aligned
+superblock pairs or a load-time repack).
+
+Where the 27B pp512 goes (before the elementwise chains) (~508 ms per 512 tokens): with the Level Zero launches skipped (wrong
 output, timing only) it runs at 2198 t/s, so ~233 ms is everything but the offloaded GEMMs —
 attention, DeltaNet, norms, the handoffs, and the ~10% of GEMM work in formats still on Vulkan
 (Q6_K, Q3_K, IQ4_NL, IQ3_S at ~45 TFLOPS, ~60 ms); the offloaded GEMMs take ~275 ms (~90 TFLOPS).

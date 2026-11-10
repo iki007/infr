@@ -35,3 +35,9 @@ pub fn gemm_kquant() -> Option<&'static [u8]> {
 pub fn gemm_iq4() -> Option<&'static [u8]> {
     bin!("gemm_iq4")
 }
+
+/// `kernels/elementwise.cl`: the ops between the prefill GEMMs — `rmsnorm`, `swiglu`, `add`,
+/// `to_f16`.
+pub fn elementwise() -> Option<&'static [u8]> {
+    bin!("elementwise")
+}
