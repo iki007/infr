@@ -87,6 +87,18 @@ kind, `shard_bytes`' divisibility guard, and the
 `shard_bytes(len_bytes()) == per-rank` round trip — but the real path is still
 unrun.
 
+**First real run (2026-11-10, two Arc Pro B70s, Mesa 26.2.4 ANV):**
+`INFR_TENSOR_PARALLEL=Vulkan1,Vulkan0` on Qwen3-8B Q4_K_M runs and generates
+coherent greedy text (rank 0 16/32 heads, 6144/12288 ffn per matrix). It is
+**unusable for speed there**: ~4.6 t/s decode against 92.1 on one card. ANV
+refuses the cross-device dma-buf import (`ERROR_INVALID_EXTERNAL_HANDLE` into
+memory type 1; card 1 sits behind the chipset with no P2P), so every one of the
+72 all-reduces per token takes the host-bounce path. The same driver offers
+`VK_EXT_external_memory_host` (4 KiB alignment), `VK_KHR_external_semaphore_fd`
+and timeline semaphores, so a shared pinned host buffer imported into both
+devices is the obvious faster path. qwen35 is still refused by
+`dense_multi_gpu_guard` (DeltaNet sharding unbuilt).
+
 **To do:** a two-GPU smoke run with tensor parallelism on — there is no
 `--tensor-parallel` flag; it is `multi.tensor_parallel` (`INFR_TENSOR_PARALLEL`,
 or `--set multi.tensor_parallel=…`). The KV-checkpoint path was exercised by
