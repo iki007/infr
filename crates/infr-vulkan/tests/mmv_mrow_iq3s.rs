@@ -76,8 +76,10 @@ fn mmv_mrow_iq3s_matches_the_host_reference() {
             be.download(y.as_ref(), &mut yb).unwrap();
             let yg: &[f32] = bytemuck::cast_slice(&yb);
             let da: Vec<f64> = db
-                .chunks_exact(2)
-                .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f64())
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|&c| half::f16::from_le_bytes(c).to_f64())
                 .collect();
             let mut worst = 0.0f64;
             for r in 0..rows {
