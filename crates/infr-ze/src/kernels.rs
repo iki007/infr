@@ -23,3 +23,9 @@ pub fn vadd() -> Option<&'static [u8]> {
 pub fn gemm_f16() -> Option<&'static [u8]> {
     bin!("gemm_f16")
 }
+
+/// `kernels/gemm_q4k.cl`: `C = A · Wᵀ` with W in GGUF Q4_K, dequantized in registers into DPAS's
+/// B operand.
+pub fn gemm_q4k() -> Option<&'static [u8]> {
+    bin!("gemm_q4k")
+}

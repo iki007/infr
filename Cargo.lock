@@ -1405,6 +1405,8 @@ name = "infr-ze"
 version = "0.2.0"
 dependencies = [
  "half",
+ "infr-core",
+ "infr-gguf",
  "libloading",
  "thiserror 2.0.21",
 ]

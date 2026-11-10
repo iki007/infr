@@ -87,10 +87,41 @@ Vulkan resubmit — kernel-driver scheduling of a cross-queue dependency, not wo
 against ~690 ms per 512 tokens today; moving the norms/elementwise ops between GEMMs into L0 later
 cuts that to ~2 per layer.
 
+### Phase 2: quantized DPAS GEMMs (`kernels/gemm_q4k.cl` done)
+
+The 27B (UD-Q4_K_M) GEMM work by weight format: IQ4_XS 36%, Q5_K 28%, Q4_K 25%, Q6_K 3.6%, the
+rest under 3% each; the 4B Q4_K_M is nearly all Q4_K (+ Q6_K).
+
+`gemm_q4k`: the f16 probe's tiling with the B operand dequantized in registers. Each lane owns two
+W rows (DPAS's B operand is one column per lane) and turns 16 nibbles into 8 dwords of half
+k-pairs: mask, widen bytes to words, `| 0x6400` (the half 1024 + q), `- 1024`, `* s + m`.
+
+What it took (m=512, 5120 -> 17408, sustained):
+
+| variant | time | TFLOPS | non-DPAS instr. per DPAS |
+| --- | --- | --- | --- |
+| OpenCL C `half16` dequant (`convert_half16(as_uchar16(..))`, `fma`) | 1.551 ms | 58.9 | ~21 |
+| C^T = W·A^T (W as DPAS's A operand, whose layout is OpenCL's per-lane `half8`) | 1.812 ms | 50.4 | ~17 (the structure alone: 1.36 ms) |
+| **vISA inline asm for the B operand** | **0.935 ms** | **97.6** | ~7 |
+| bound: same kernel, no dequant (wrong values) | 0.800 ms | 114 | — |
+
+OpenCL C keeps a per-lane `half16` de-interleaved in registers (element e of all 16 lanes in a
+row), while DPAS's B operand wants each lane's two k-values packed in one dword; IGC moves every
+value out and back. Inline vISA (`__asm__` with `"rw"` operands and `.decl ... alias`) computes the
+packed rows directly: `mov (32) uw <- ub<4;2,1>` widens two nibble bytes into a dword's halves.
+Two IGC inline-asm rules learnt: 32-wide ops in a SIMD16 kernel need `M1_NM` (the upper 16
+channels are otherwise masked off), and there is no early-clobber constraint, so intermediates go
+to asm-local `.decl` registers and only the last instruction writes the output.
+
+Other shapes (m=512): 17408 -> 5120 1.070 ms (85 TFLOPS), 5120 -> 12288 0.577 ms (112),
+5120 -> 6144 0.323 ms (100). m=2048 5120 -> 17408 is 4.85 ms (75): the 21 MB A no longer stays in
+L2 across the N tiles — a packet-ordered grid (all N tiles of a 512-row M packet first) is the fix.
+Against Vulkan `_x256` Q4_K (1.62 ms / ~2.19 ms for the two FFN shapes) this is 1.7-2x.
+
 ### Next
 
-- Quantized DPAS GEMMs in OpenCL C (dequantize the W tile in registers into DPAS's B operand), one
-  per format the target models use, measured against the f16 probe and Vulkan `_x256`.
+- The same for Q5_K, IQ4_XS (codebook: a byte-pair table instead of `| 0x6400`), Q6_K, Q8_0 and
+  the long tail.
 - Exportable allocations for the weights and the activation arena (dedicated, dma-buf), then the
   recorder split: end the command buffer at an offloaded GEMM, submit signalling the timeline, L0
   waits / runs / signals, the next command buffer waits.

@@ -181,3 +181,152 @@ fn gemm_f16_probe() {
         );
     }
 }
+
+/// A GGUF weight format for the quantized GEMM probes: superblock size and bytes, the byte offsets
+/// of its f16 scale fields (set to small sane values; every other byte is random, which is a valid
+/// block for these formats), and the kernel's workgroup tile.
+struct QFormat {
+    name: &'static str,
+    dtype: infr_core::DType,
+    block_bytes: usize,
+    f16_fields: &'static [usize],
+    wg_m: usize,
+    wg_n: usize,
+}
+
+fn random_quant(fmt: &QFormat, n: usize, k: usize, seed: &mut u64) -> Vec<u8> {
+    let nb = k / 256;
+    let mut w = vec![0u8; n * nb * fmt.block_bytes];
+    for (i, b) in w.iter_mut().enumerate() {
+        *b = ((lcg(seed) + 1.0) * 127.9) as u8 ^ (i as u8);
+    }
+    for blk in w.chunks_exact_mut(fmt.block_bytes) {
+        for &off in fmt.f16_fields {
+            let v = 0.0005 + 0.002 * (lcg(seed) + 1.0);
+            blk[off..off + 2].copy_from_slice(&half::f16::from_f32(v).to_le_bytes());
+        }
+    }
+    w
+}
+
+/// Correctness against the host dequant (`infr_gguf::dequant`) at a small shape, then timing at the
+/// 27B gate/up prefill shape (m=512, 5120 -> 17408; INFR_ZE_GEMM="M,N,K" overrides).
+fn quant_gemm_probe(fmt: &QFormat, bin: &[u8]) {
+    let Some(g) = gpu() else {
+        eprintln!("skip: no Level Zero GPU");
+        return;
+    };
+    let module = g.module(bin).unwrap();
+    let kern = module.kernel(fmt.name).unwrap();
+    kern.group_size(128, 1, 1).unwrap();
+    let launch_dims = |m: usize, n: usize| [m.div_ceil(fmt.wg_m) as u32, (n / fmt.wg_n) as u32, 1];
+    let set = |m: usize,
+               n: usize,
+               k: usize,
+               a: &infr_ze::DevBuf,
+               w: &infr_ze::DevBuf,
+               c: &infr_ze::DevBuf| {
+        kern.arg_buf(0, a).unwrap();
+        kern.arg_buf(1, w).unwrap();
+        kern.arg_buf(2, c).unwrap();
+        kern.arg(3, m as i32).unwrap();
+        kern.arg(4, n as i32).unwrap();
+        kern.arg(5, k as i32).unwrap();
+    };
+    // correctness; m not a multiple of the tile, to cover the bounds-checked rows
+    let (m, n, k) = (200usize, 128usize, 1024usize);
+    let mut seed = 11u64;
+    let a: Vec<f32> = (0..m * k)
+        .map(|_| half::f16::from_f32(lcg(&mut seed)).to_f32())
+        .collect();
+    let wq = random_quant(fmt, n, k, &mut seed);
+    let row_bytes = k / 256 * fmt.block_bytes;
+    let wf: Vec<f32> = wq
+        .chunks_exact(row_bytes)
+        .flat_map(|r| infr_gguf::dequant::dequant_block(fmt.dtype, r).unwrap())
+        .collect();
+    let (da, dw, dc) = (
+        g.alloc(m * k * 2).unwrap(),
+        g.alloc(wq.len()).unwrap(),
+        g.alloc(m * n * 4).unwrap(),
+    );
+    g.upload(&da, &f16_bytes(&a)).unwrap();
+    g.upload(&dw, &wq).unwrap();
+    set(m, n, k, &da, &dw, &dc);
+    g.launch(&kern, launch_dims(m, n)).unwrap();
+    let mut out = vec![0u8; m * n * 4];
+    g.download(&dc, &mut out).unwrap();
+    let c: Vec<f32> = out
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|x| f32::from_le_bytes(*x))
+        .collect();
+    let (mut worst, mut big) = (0.0f64, 0.0f64);
+    for r in 0..m {
+        for col in 0..n {
+            let mut s = 0.0f64;
+            for i in 0..k {
+                s += a[r * k + i] as f64 * wf[col * k + i] as f64;
+            }
+            worst = worst.max((c[r * n + col] as f64 - s).abs());
+            big = big.max(s.abs());
+        }
+    }
+    println!(
+        "{} {m}x{n}x{k}: worst abs err {worst:.3e} (max |C| {big:.2})",
+        fmt.name
+    );
+    // INFR_ZE_NOCHECK: time a deliberately wrong kernel variant (e.g. a bound with no dequant).
+    if std::env::var_os("INFR_ZE_NOCHECK").is_none() {
+        assert!(worst < 2e-3 * big, "{} mismatch {worst}", fmt.name);
+    }
+    // timing
+    let (m, n, k) = std::env::var("INFR_ZE_GEMM")
+        .ok()
+        .map(|s| {
+            let v: Vec<usize> = s.split(',').map(|x| x.parse().unwrap()).collect();
+            (v[0], v[1], v[2])
+        })
+        .unwrap_or((512, 17408, 5120));
+    let a: Vec<f32> = (0..m * k).map(|_| lcg(&mut seed)).collect();
+    let wq = random_quant(fmt, n, k, &mut seed);
+    let (da, dw, dc) = (
+        g.alloc(m * k * 2).unwrap(),
+        g.alloc(wq.len()).unwrap(),
+        g.alloc(m * n * 4).unwrap(),
+    );
+    g.upload(&da, &f16_bytes(&a)).unwrap();
+    g.upload(&dw, &wq).unwrap();
+    set(m, n, k, &da, &dw, &dc);
+    for reps in [10u32, 200] {
+        let t = g.time_launches(&kern, launch_dims(m, n), reps).unwrap();
+        let mut s = t.clone();
+        s.sort_by(|x, y| x.partial_cmp(y).unwrap());
+        let med = s[s.len() / 2];
+        let tf = 2.0 * (m * n * k) as f64 / med / 1e3;
+        println!(
+            "{} m={m} {k}->{n} x{reps}: median {:.3} ms, {tf:.1} TFLOPS",
+            fmt.name,
+            med / 1e6
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires a Level Zero GPU"]
+fn gemm_q4k_probe() {
+    let Some(bin) = infr_ze::kernels::gemm_q4k() else {
+        eprintln!("skip: no ocloc kernels");
+        return;
+    };
+    let fmt = QFormat {
+        name: "gemm_q4k",
+        dtype: infr_core::DType::Q4K,
+        block_bytes: 144,
+        f16_fields: &[0, 2],
+        wg_m: 256,
+        wg_n: 64,
+    };
+    quant_gemm_probe(&fmt, bin);
+}

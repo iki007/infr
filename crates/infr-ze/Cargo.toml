@@ -12,3 +12,6 @@ thiserror.workspace = true
 
 [dev-dependencies]
 half.workspace = true
+# Host references for the quantized GEMM probes.
+infr-core.workspace = true
+infr-gguf.workspace = true
