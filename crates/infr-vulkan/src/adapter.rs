@@ -1748,16 +1748,40 @@ fn lower_op(
                             rec.store_f16(xb, pool[&k16].as_ref(), m * in_f, 0);
                         }
                         *mmv_memo = Some((*x, m, in_f));
-                        rec.matmul_native_x256(
-                            dt,
-                            pool[&k16].as_ref(),
-                            w,
-                            w_off,
-                            out,
-                            m,
-                            in_f,
-                            out_f,
-                        );
+                        // A grid under two waves (64 workgroups run at once on a 32-core B70)
+                        // leaves most of the device idle in the tail: split K in two. Measured
+                        // (m=512 Q5_K): 17408x5120 2.32 -> 2.01 ms, 6144x5120 0.91 -> 0.83; three
+                        // or four splits lose it again to the partial-plane traffic.
+                        let grid = m.div_ceil(256) * (out_f / 128);
+                        let split = grid < 128
+                            && in_f >= 2048
+                            && crate::gemm::native_gemm_warp_x256_sk(dt).is_some();
+                        if split {
+                            let pk = pooled(pool, be_, "x256_part", 2 * mpad * out_f * 4)?;
+                            rec.matmul_native_x256_splitk(
+                                dt,
+                                pool[&k16].as_ref(),
+                                w,
+                                w_off,
+                                pool[&pk].as_ref(),
+                                out,
+                                m,
+                                in_f,
+                                out_f,
+                                2,
+                            );
+                        } else {
+                            rec.matmul_native_x256(
+                                dt,
+                                pool[&k16].as_ref(),
+                                w,
+                                w_off,
+                                out,
+                                m,
+                                in_f,
+                                out_f,
+                            );
+                        }
                     } else if cm8_ok {
                         // `_cm8`/`_cm816` XMX warptile (see the `cm8_ok` doc above). First in the
                         // chain: when it's true, `caps.f16_coopmat()` is false (the shapes are

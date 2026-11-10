@@ -2231,6 +2231,60 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    /// Split-K form of [`Self::matmul_native_x256`] for a grid too small to fill the device: each of
+    /// `splits` k-ranges stores a partial plane into `partials` (`splits` x mpad x n f32, mpad =
+    /// ceil(m/256)·256), then `splitk_reduce` sums the planes into the first `m` rows of `c` in
+    /// fixed order. Caller guarantees the `_x256_sk` build exists for `dtype`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn matmul_native_x256_splitk(
+        &self,
+        dtype: infr_core::DType,
+        a16: &dyn Buffer,
+        w: &dyn Buffer,
+        w_base: usize,
+        partials: &dyn Buffer,
+        c: &dyn Buffer,
+        m: usize,
+        k: usize,
+        n: usize,
+        splits: usize,
+    ) {
+        let (name, spv) = crate::gemm::native_gemm_warp_x256_sk(dtype).expect("x256 split-k spv");
+        self.label_gemm(name, m, k, n);
+        let mpad = m.div_ceil(256) * 256;
+        let kern = self.be.kernel_sg(name, spv, 3, 24, 16);
+        let mut push = [0u8; 24];
+        push[0..4].copy_from_slice(&(m as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(n as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(k as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(w_base as u32).to_ne_bytes());
+        push[16..20].copy_from_slice(&(splits as u32).to_ne_bytes());
+        push[20..24].copy_from_slice(&(mpad as u32).to_ne_bytes());
+        let groups = ((mpad / 256) * (n / 128) * splits) as u32;
+        self.dispatch(
+            kern,
+            &[Self::vkb(a16), Self::vkb(w), Self::vkb(partials)],
+            1,
+            &push,
+            groups,
+        );
+        self.label_gemm("splitk_reduce", m, k, n);
+        let rk = self
+            .be
+            .kernel("splitk_reduce", crate::gemm::splitk_reduce_spv(), 2, 12);
+        let mut rp = [0u8; 12];
+        rp[0..4].copy_from_slice(&((m * n) as u32).to_ne_bytes());
+        rp[4..8].copy_from_slice(&(splits as u32).to_ne_bytes());
+        rp[8..12].copy_from_slice(&((mpad * n) as u32).to_ne_bytes());
+        self.dispatch(
+            rk,
+            &[Self::vkb(partials), Self::vkb(c)],
+            1,
+            &rp,
+            ((m * n) as u32).div_ceil(64),
+        );
+    }
+
     /// [`matmul_native_off`](Self::matmul_native_off) with A already converted to f16 (padded to
     /// ceil(m/64)·64 rows) — the A_GLOBAL warptiles coopMatLoad A straight from global, dropping
     /// the As stage/LDS (occupancy 2→3 wgs/WGP: ~1.5x on the 8B shapes). Same tile pick as the

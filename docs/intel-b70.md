@@ -42,9 +42,9 @@ INFR_DEV=Vulkan1 cargo test --release -p infr-vulkan --no-fail-fast -- --include
 
 | model                       | infr first run | infr now  | llama.cpp Vulkan | llama.cpp SYCL |
 | --------------------------- | -------------- | --------- | ---------------- | -------------- |
-| Qwen3.5-4B Q4_K_M pp512     | 1571           | **3611**  | 3165             | 7031           |
+| Qwen3.5-4B Q4_K_M pp512     | 1571           | **3686**  | 3165             | 7031           |
 | Qwen3.5-4B Q4_K_M tg128     | 62.6           | **149.2** | 111.2            | 148.5          |
-| Qwen3.8-27B UD-Q4_K_M pp512 | 220            | 634       | 746              | 1087           |
+| Qwen3.8-27B UD-Q4_K_M pp512 | 220            | 645       | 746              | 1087           |
 | Qwen3.8-27B UD-Q4_K_M tg128 | 13.8           | **28.8**  | 23.1             | 29.9           |
 
 llama.cpp at `0f236bc21`; its 27B decode row is tg64. "infr first run" is
@@ -200,10 +200,22 @@ gets an `_x256` build (it had only the int8 mmq GEMM: 7.2 ms per 17408x5120).
 | 4B pp2048      | 2365   | 3342        | 3609        | 2802             |
 | 27B pp512      | 558    | 624         | 634         | 746              |
 
-The `_x256` GEMMs still spill (117 registers): the 64 accumulator registers of
-the 32x32 warp tile plus the 32-float block decode buffer. A 1024-thread
-32x16-warp variant (4B pp512 3370) and a non-unrolled k loop (2752) were both
-slower; the fix would be a half-block decode per format.
+The `_x256` GEMMs still spill (~117 registers) — Q8_0, whose block decode is
+trivial, spills the same, so it is the matmul loop: fully unrolled at BK=128
+the compiler hoists every step's global A loads. A rolled k loop (4B pp512
+2752), 2- or 4-step groups (Q4_K 5120x17408 1.95 → 5.3 / 4.4 ms) and a
+1024-thread 32x16-warp tile (3370) were all slower. Measured alone, the m=512
+5120x17408 GEMM runs 1.95–2.04 ms (45–47 TFLOPS) for Q4_K/Q5_K/Q8_0/IQ4_XS
+against llama.cpp's 1.70.
+
+**Split-K for small grids.** 512 threads and 35 KB of LDS fit two workgroups
+per Xe core: 64 at once. The 5120-wide outputs at m=512 are 80 workgroups,
+1.25 waves, so the tail idles most of the device (Q5_K 17408x5120 took 2.32 ms
+against 1.96 for the same FLOPs at 5120x17408). `_x256_sk` splits K in two
+when the grid is under two waves (`Recorder::matmul_native_x256_splitk`,
+partial planes + the fixed-order `splitk_reduce`): 17408x5120 2.32 → 2.01 ms,
+6144x5120 0.91 → 0.83; three or four splits lose it to the partial traffic.
+4B pp512 3611 → 3686, pp2048 3609 → 3657; 27B pp512 634 → 645, pp2048 649.
 
 What is left on the 27B (846 ms of GPU per pp512): the GEMMs at ~40 TFLOPS
 against llama.cpp's ~53 (5120x17408 2.3 vs 1.70 ms) are ~80% of it; then
@@ -465,9 +477,12 @@ Each slice is measured against the numbers above on `Vulkan1`.
 10. **Done.** XMX flash attention, the f16 conversion memo, the IQ4 table in
     the GEMM decode, IQ3_S `_x256` (above). Qwen3.5-4B pp512 3070 → 3611,
     pp2048 2365 → 3609; Qwen3.8-27B pp512 558 → 634.
-11. Next: the `_x256` GEMM's remaining gap to llama.cpp (~40 vs ~53 TFLOPS),
-    the m>1 alpha/beta projections, then the IQ4_XS decode lookup and the
-    attention output → `o_proj` quant on dense models.
+11. **Done.** Split-K for the `_x256` GEMMs whose grid is under two waves.
+    Qwen3.5-4B pp512 3611 → 3686; Qwen3.8-27B 634 → 645.
+12. Next: the `_x256` GEMM's register spills (A staged through LDS, or a
+    software-pipelined A load), the m>1 alpha/beta projections, then the
+    IQ4_XS decode lookup and the attention output → `o_proj` quant on dense
+    models.
 
 ## MTP (speculative decode, `INFR_MTP=1`)
 

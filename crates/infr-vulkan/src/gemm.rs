@@ -1585,6 +1585,37 @@ pub(crate) struct XmxGemm {
     pub bn: usize,
 }
 
+/// The split-K twin of [`native_gemm_warp_x256`] (`_x256_sk`: the same tile, each split storing
+/// a partial plane for `splitk_reduce`), for grids too small to fill the device.
+pub(crate) fn native_gemm_warp_x256_sk(
+    dtype: infr_core::DType,
+) -> Option<(&'static str, &'static [u32])> {
+    use infr_core::DType::*;
+    macro_rules! v {
+        ($name:literal) => {{
+            static S: OnceLock<Vec<u32>> = OnceLock::new();
+            Some((
+                $name,
+                S.get_or_init(|| {
+                    spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))
+                })
+                .as_slice(),
+            ))
+        }};
+    }
+    match dtype {
+        Q4K => v!("native_gemm_warp_q4k_x256_sk"),
+        Q5K => v!("native_gemm_warp_q5k_x256_sk"),
+        Q6K => v!("native_gemm_warp_q6k_x256_sk"),
+        Q8_0 => v!("native_gemm_warp_q8_0_x256_sk"),
+        Q3K => v!("native_gemm_warp_q3k_x256_sk"),
+        Iq4Xs => v!("native_gemm_warp_iq4xs_x256_sk"),
+        Iq4Nl => v!("native_gemm_warp_iq4nl_x256_sk"),
+        Iq3S => v!("native_gemm_warp_iq3s_x256_sk"),
+        _ => None,
+    }
+}
+
 /// The Intel Xe2 large-m prefill tile (`native_gemm_warp.comp` `_x256`: BM=256 rows x BN=128
 /// columns, BK=128, 512 threads as 32 warps of 32x32, A read from global as f16). `None` for a
 /// dtype without the build or `n % 128 != 0` / `k % 128 != 0`; the caller then keeps
