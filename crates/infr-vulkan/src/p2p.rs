@@ -260,7 +260,11 @@ impl VulkanBackend {
             buf: VkBuffer {
                 shared: Arc::clone(&self.shared),
                 buffer,
-                backing: Backing::External { memory },
+                backing: Backing::External {
+                    memory,
+                    charged: false,
+                    export_id: 0,
+                },
                 size,
                 mem_size: req.size,
                 location: MemoryLocation::GpuOnly,
@@ -405,7 +409,11 @@ impl VulkanBackend {
         Ok(Box::new(VkBuffer {
             shared: Arc::clone(&self.shared),
             buffer,
-            backing: Backing::External { memory },
+            backing: Backing::External {
+                memory,
+                charged: false,
+                export_id: 0,
+            },
             size: export.size,
             mem_size: export.mem_size,
             location: MemoryLocation::GpuOnly,
@@ -413,5 +421,110 @@ impl VulkanBackend {
             own_addr: None,
             act_bytes: 0,
         }))
+    }
+}
+
+/// Process-unique ids for [`VulkanBackend::alloc_exportable`] allocations (0 = not exported).
+static NEXT_EXPORT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+impl VulkanBackend {
+    /// A device-local, device-addressable buffer on a DEDICATED allocation exportable as a
+    /// dma-buf — memory another API on this same card reads and writes in place (the Level Zero
+    /// GEMMs, `ze.rs`: the weight blocks and the exchange arena). Charged to the VRAM budget like
+    /// any GpuOnly allocation. [`Self::export_dmabuf`] hands out an fd for it.
+    pub(crate) fn alloc_exportable(&self, size: usize) -> Result<VkBuffer> {
+        if !self.p2p_supported(P2pHandleType::DmaBuf) {
+            return Err(be(
+                "alloc_exportable: no VK_KHR_external_memory_fd + VK_EXT_external_memory_dma_buf",
+            ));
+        }
+        let device = &self.shared.device;
+        let ht = vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT;
+        let mut ext_ci = vk::ExternalMemoryBufferCreateInfo::default().handle_types(ht);
+        let buf_ci = vk::BufferCreateInfo::default()
+            .size(size as u64)
+            .usage(BUFFER_USAGE | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .push_next(&mut ext_ci);
+        let buffer = unsafe { device.create_buffer(&buf_ci, None) }
+            .map_err(|e| be(format!("alloc_exportable create_buffer: {e}")))?;
+        let req = unsafe { device.get_buffer_memory_requirements(buffer) };
+        if let Err(e) = self.check_vram_budget(req.size) {
+            unsafe { device.destroy_buffer(buffer, None) };
+            return Err(e);
+        }
+        let Some(ty) =
+            self.find_memory_type(req.memory_type_bits, vk::MemoryPropertyFlags::DEVICE_LOCAL)
+        else {
+            unsafe { device.destroy_buffer(buffer, None) };
+            return Err(be("alloc_exportable: no device-local memory type"));
+        };
+        let mut export_info = vk::ExportMemoryAllocateInfo::default().handle_types(ht);
+        let mut dedicated = vk::MemoryDedicatedAllocateInfo::default().buffer(buffer);
+        let mut flags =
+            vk::MemoryAllocateFlagsInfo::default().flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
+        let alloc_ci = vk::MemoryAllocateInfo::default()
+            .allocation_size(req.size)
+            .memory_type_index(ty)
+            .push_next(&mut export_info)
+            .push_next(&mut dedicated)
+            .push_next(&mut flags);
+        let memory = match unsafe { device.allocate_memory(&alloc_ci, None) } {
+            Ok(m) => m,
+            Err(e) => {
+                unsafe { device.destroy_buffer(buffer, None) };
+                return Err(be(format!(
+                    "alloc_exportable allocate_memory({} bytes): {e}",
+                    req.size
+                )));
+            }
+        };
+        if let Err(e) = unsafe { device.bind_buffer_memory(buffer, memory, 0) } {
+            unsafe {
+                device.free_memory(memory, None);
+                device.destroy_buffer(buffer, None);
+            }
+            return Err(be(format!("alloc_exportable bind_buffer_memory: {e}")));
+        }
+        self.shared
+            .device_used
+            .fetch_add(req.size, std::sync::atomic::Ordering::Relaxed);
+        let addr = unsafe {
+            device.get_buffer_device_address(&vk::BufferDeviceAddressInfo::default().buffer(buffer))
+        };
+        Ok(VkBuffer {
+            shared: Arc::clone(&self.shared),
+            buffer,
+            backing: Backing::External {
+                memory,
+                charged: true,
+                export_id: NEXT_EXPORT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            },
+            size,
+            mem_size: req.size,
+            location: MemoryLocation::GpuOnly,
+            sub_offset: 0,
+            own_addr: Some(addr),
+            act_bytes: 0,
+        })
+    }
+
+    /// A new dma-buf fd for `memory` (allocated by [`Self::alloc_exportable`]), owned by the
+    /// caller.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn export_dmabuf(&self, memory: vk::DeviceMemory) -> Result<std::os::fd::OwnedFd> {
+        use std::os::fd::FromRawFd;
+        let ext_fd = self
+            .shared
+            .external_memory_fd
+            .as_ref()
+            .ok_or_else(|| be("export_dmabuf: no VK_KHR_external_memory_fd"))?;
+        let get = vk::MemoryGetFdInfoKHR::default()
+            .memory(memory)
+            .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+        let fd = unsafe { ext_fd.get_memory_fd(&get) }
+            .map_err(|e| be(format!("vkGetMemoryFdKHR(dma-buf): {e}")))?;
+        // SAFETY: vkGetMemoryFdKHR returns a new descriptor the caller owns.
+        Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
     }
 }

@@ -841,6 +841,9 @@ pub struct Recorder<'a> {
     /// Whether any un-barriered write was produced by a transfer (copy) rather than a shader.
     dirty_transfer: std::cell::Cell<bool>,
     barriers: RefCell<usize>,
+    /// Timeline values this recorder's submit waits on ([`Self::wait_timeline`]) — a segment that
+    /// continues after Level Zero work (`ze.rs`) waits for the value Level Zero signals.
+    waits: RefCell<Vec<(vk::Semaphore, u64)>>,
     /// Set while recording an indirect dispatch so `sync` widens the barrier to cover the
     /// indirect-command read of GPU-written dispatch args.
     indirect_pending: std::cell::Cell<bool>,
@@ -1001,6 +1004,7 @@ impl<'a> Recorder<'a> {
             dirty_reads: RefCell::new(HashSet::new()),
             dirty_transfer: std::cell::Cell::new(false),
             barriers: RefCell::new(0),
+            waits: RefCell::new(Vec::new()),
             indirect_pending: std::cell::Cell::new(false),
             no_barrier: dbgcfg.no_barrier,
             full_barrier: dbgcfg.full_barrier,
@@ -10436,8 +10440,58 @@ impl<'a> Recorder<'a> {
         }
     }
 
+    /// Make this recorder's submit wait until the timeline `sem` reaches `value` (before any of
+    /// its compute or transfer work) — ordering it after work another API signals there.
+    pub fn wait_timeline(&self, sem: vk::Semaphore, value: u64) {
+        self.waits.borrow_mut().push((sem, value));
+    }
+
+    /// Submit the (ended) command buffer with this recorder's timeline waits and an optional
+    /// timeline `signal`.
+    fn submit_cmd(
+        &self,
+        fence: vk::Fence,
+        signal: Option<(vk::Semaphore, u64)>,
+    ) -> ash::prelude::VkResult<()> {
+        let waits = self.waits.borrow();
+        let cmds = std::slice::from_ref(&self.cmd);
+        let device = &self.be.shared.device;
+        let queue = self.be.shared.queue;
+        if waits.is_empty() && signal.is_none() {
+            return unsafe {
+                device.queue_submit(
+                    queue,
+                    &[vk::SubmitInfo::default().command_buffers(cmds)],
+                    fence,
+                )
+            };
+        }
+        let wsems: Vec<vk::Semaphore> = waits.iter().map(|w| w.0).collect();
+        let wvals: Vec<u64> = waits.iter().map(|w| w.1).collect();
+        let stages = vec![
+            vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER;
+            waits.len()
+        ];
+        let (ssems, svals): (Vec<vk::Semaphore>, Vec<u64>) = signal.into_iter().unzip();
+        let mut tl = vk::TimelineSemaphoreSubmitInfo::default()
+            .wait_semaphore_values(&wvals)
+            .signal_semaphore_values(&svals);
+        let si = vk::SubmitInfo::default()
+            .command_buffers(cmds)
+            .wait_semaphores(&wsems)
+            .wait_dst_stage_mask(&stages)
+            .signal_semaphores(&ssems)
+            .push_next(&mut tl);
+        unsafe { device.queue_submit(queue, &[si], fence) }
+    }
+
     /// End recording, submit once, wait, and release transient objects.
     pub fn finish(self) -> Result<()> {
+        self.finish_ex(None)
+    }
+
+    /// [`Self::finish`], signalling the timeline `signal` when the submitted work completes.
+    fn finish_ex(self, signal: Option<(vk::Semaphore, u64)>) -> Result<()> {
         let device = &self.be.shared.device;
         let t_record = self.t0.elapsed();
         if self.stages {
@@ -10461,14 +10515,7 @@ impl<'a> Recorder<'a> {
             self.free_transient();
             return Err(be(format!("end cmd: {e}")));
         }
-        let submit = unsafe {
-            device.queue_submit(
-                queue,
-                &[vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&self.cmd))],
-                vk::Fence::null(),
-            )
-        };
-        if let Err(e) = submit {
+        if let Err(e) = self.submit_cmd(vk::Fence::null(), signal) {
             self.free_transient();
             return Err(be(format!("queue_submit: {e}")));
         }
@@ -10536,10 +10583,20 @@ impl<'a> Recorder<'a> {
     /// per-recorder, so cross-submission RAW/WAR ordering (scratch reuse, arena-slot rewrites vs
     /// a prior segment's reads) is otherwise invisible to it.
     pub fn finish_nowait(self) -> Result<PendingSegment> {
+        self.finish_nowait_ex(None)
+    }
+
+    /// [`Self::finish_nowait`], signalling the timeline `sem` to `value` when the submitted work
+    /// completes — the hand-off to Level Zero work that waits on it (`ze.rs`).
+    pub fn finish_nowait_signal(self, sem: vk::Semaphore, value: u64) -> Result<PendingSegment> {
+        self.finish_nowait_ex(Some((sem, value)))
+    }
+
+    fn finish_nowait_ex(self, signal: Option<(vk::Semaphore, u64)>) -> Result<PendingSegment> {
         let dispatches = self.dispatches.get();
         if self.stages || self.prof_ops {
             let shared = std::sync::Arc::clone(&self.be.shared);
-            self.finish()?;
+            self.finish_ex(signal)?;
             return Ok(PendingSegment {
                 shared,
                 fence: None,
@@ -10563,14 +10620,7 @@ impl<'a> Recorder<'a> {
                 return Err(be(format!("create fence: {e}")));
             }
         };
-        let submit = unsafe {
-            device.queue_submit(
-                self.be.shared.queue,
-                &[vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&self.cmd))],
-                fence,
-            )
-        };
-        if let Err(e) = submit {
+        if let Err(e) = self.submit_cmd(fence, signal) {
             unsafe { device.destroy_fence(fence, None) };
             self.free_transient();
             return Err(be(format!("queue_submit: {e}")));

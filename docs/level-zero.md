@@ -1,8 +1,8 @@
 # Level Zero backend (`infr-ze`) — Intel Xe2, native
 
-Status: **phase 0 and the interop phase done** (2026-11-10). The device layer, a DPAS GEMM probe and
-Vulkan ↔ Level Zero memory/semaphore sharing run on the Arc Pro B70; nothing in the engine uses the
-crate yet. Backlog B102.
+Status (2026-11-10): **prefill GEMMs run on Level Zero inside the Vulkan backend**, opt-in
+`INFR_ZE_GEMM=1` (`crates/infr-vulkan/src/ze.rs`): Qwen3.8-27B pp512 740 -> 1013 t/s, Qwen3.5-4B
+4172 -> 5138, greedy output unchanged. Backlog B102.
 
 ## Why
 
@@ -135,13 +135,36 @@ the limit.
 | Q5_K | 0.856 ms | 107 | 1.77 ms |
 | IQ4_XS | 1.291 ms | 71 | 1.78 ms |
 
+### Phase 3: the engine path (`INFR_ZE_GEMM=1`, `crates/infr-vulkan/src/ze.rs`)
+
+- **Weights**: with the knob on (and the card Intel Xe2 with dma-buf export, external timeline
+  semaphores and `VK_EXT_pci_bus_info`), the resident weight blocks are dedicated exportable
+  allocations (`alloc_exportable`, charged to the VRAM budget). Level Zero imports each block once,
+  keyed by a process-unique `export_id`, and addresses a tensor as base + offset.
+- **Activations**: an *exchange arena* (one exportable block, bump-allocated per forward) holds the
+  `_x256` f16 A copies (`lin_a16_x256`, which the producers' `-DY16` builds already write) and the
+  outputs of the offloaded Linears. They are ordinary `BdaSub` views, so every Vulkan op reads and
+  writes them unchanged.
+- **Ordering**: `execute_static` ends the segment at an offloaded Linear with a submit signalling
+  the timeline `v` (`Recorder::finish_nowait_signal`), appends Level Zero's wait `v` / GEMM / signal
+  `v + 1`, and opens the next segment waiting `v + 1` (`Recorder::wait_timeline`). Nothing waits on
+  the host beyond the existing two-segment window. The offloaded Linear's residual `Add` is unfused.
+- **What runs there**: Q4_K / Q5_K / IQ4_XS Linears with m >= 256, N % 64 == 0, K % 256 == 0 and an
+  `Internal` destination; every other op (and dense streaming) stays as before.
+- **The bug the first run hit**: the Level Zero immediate command list was created without
+  `ZE_COMMAND_QUEUE_FLAG_IN_ORDER`, so a semaphore signal appended after a kernel could fire before
+  the kernel finished: a 1 ms GEMM's consumer read a half-written output (garbage text; the small
+  shapes of the first test passed). `tests/ze_linear.rs` (Linear + residual Add at the 4B gate/up
+  shape, every format, on vs off vs host) now covers it.
+
+| pp512, `Vulkan1`, 3 reps | Vulkan only | `INFR_ZE_GEMM=1` | llama.cpp Vulkan | llama.cpp SYCL |
+| --- | --- | --- | --- | --- |
+| Qwen3.8-27B UD-Q4_K_M | 740 | **1013** | 746 | 1087 |
+| Qwen3.5-4B Q4_K_M | 4172 | **5138** | 3165 | 7031 |
+
 ### Next
 
-- Integration (the formats above are 90% of the 27B's GEMM work; the rest stays on Vulkan):
-  exportable weight and activation allocations, the recorder split around offloaded GEMMs.
+- On by default on Intel Xe2 once it has run more models and longer prompts.
 - IQ4_XS: fewer SLM gathers — e.g. a byte-indexed table (k-pairs `(j, j+16)`, one index per byte)
   with the producer writing A in the matching k order.
 - Q6_K, Q3_K, IQ4_NL, IQ3_S, Q8_0; a packet-ordered grid for m > 512.
-- Exportable allocations for the weights and the activation arena (dedicated, dma-buf), then the
-  recorder split: end the command buffer at an offloaded GEMM, submit signalling the timeline, L0
-  waits / runs / signals, the next command buffer waits.

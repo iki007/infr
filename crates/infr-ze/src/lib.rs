@@ -179,13 +179,16 @@ impl Gpu {
         };
         let mut ctx = std::ptr::null_mut();
         ze!(ze.f, zeContextCreate(info.driver, &cdesc, &mut ctx))?;
-        // Ordinal 0 is the compute (render+compute) queue group on Intel GPUs.
+        // Ordinal 0 is the compute (render+compute) queue group on Intel GPUs. IN_ORDER: without
+        // it the driver need not order appended commands — a semaphore signal appended after a
+        // kernel fired before the kernel finished (measured: a 1 ms GEMM's consumer read a
+        // half-written output).
         let qdesc = ze_command_queue_desc_t {
             stype: ZE_STRUCTURE_TYPE_COMMAND_QUEUE_DESC,
             p_next: std::ptr::null(),
             ordinal: 0,
             index: 0,
-            flags: 0,
+            flags: ZE_COMMAND_QUEUE_FLAG_IN_ORDER,
             mode: ZE_COMMAND_QUEUE_MODE_ASYNCHRONOUS,
             priority: 0,
         };
@@ -651,6 +654,27 @@ impl Kernel {
     /// Bind a device buffer (a global pointer argument).
     pub fn arg_buf(&self, index: u32, buf: &DevBuf) -> Result<()> {
         let p = buf.ptr;
+        ze!(
+            self.f(),
+            zeKernelSetArgumentValue(
+                self.handle,
+                index,
+                std::mem::size_of::<*mut c_void>(),
+                &p as *const *mut c_void as *const c_void
+            )
+        )
+    }
+
+    /// Bind the device address `offset` bytes into `buf` (a global pointer argument into a
+    /// sub-range — e.g. one tensor of an imported arena block).
+    pub fn arg_buf_at(&self, index: u32, buf: &DevBuf, offset: usize) -> Result<()> {
+        assert!(
+            offset <= buf.len,
+            "offset {offset} past a {}-byte buffer",
+            buf.len
+        );
+        // Level Zero device pointers are flat virtual addresses: base + offset is the sub-range.
+        let p = (buf.ptr as *mut u8).wrapping_add(offset) as *mut c_void;
         ze!(
             self.f(),
             zeKernelSetArgumentValue(

@@ -42,7 +42,8 @@ memmap2.workspace = true
 infr-testkit.workspace = true
 infr-plat.workspace = true
 
-# `tests/ze_interop.rs`: Vulkan buffers and timeline semaphores shared with Level Zero on the same
-# Intel GPU (B102 hybrid prefill).
-[target.'cfg(target_os = "linux")'.dev-dependencies]
+# Level Zero prefill GEMMs on Intel Xe2 (`src/ze.rs`, opt-in `INFR_ZE_GEMM`): Vulkan buffers and a
+# timeline semaphore shared with Level Zero on the same card (B102 hybrid). Linux only — the
+# interop rides dma-buf / opaque-fd handles.
+[target.'cfg(target_os = "linux")'.dependencies]
 infr-ze.workspace = true

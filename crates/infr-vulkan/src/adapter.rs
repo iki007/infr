@@ -328,8 +328,15 @@ fn resolve<'a>(
 /// [`alloc_scratch`]'s result: the per-tensor `Internal` scratch, indexed by `TensorId`.
 type ScratchSet = Vec<Option<Box<dyn Buffer>>>;
 
+///
+/// `ze_dsts` (tensor indices) go to the Level Zero exchange arena instead (`ze.rs`): the outputs of
+/// the Linears this forward runs there. Not zero-filled — those GEMMs write every real row.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-fn alloc_scratch(be_: &VulkanBackend, graph: &Graph) -> Result<ScratchSet> {
+fn alloc_scratch(
+    be_: &VulkanBackend,
+    graph: &Graph,
+    ze_dsts: &std::collections::HashSet<usize>,
+) -> Result<ScratchSet> {
     let mut scratch: Vec<Option<Box<dyn Buffer>>> =
         (0..graph.tensors.len()).map(|_| None).collect();
     // Batch the whole scratch set into ONE zero-init submit (`alloc_zeroed_batch`): the naive
@@ -349,6 +356,10 @@ fn alloc_scratch(be_: &VulkanBackend, graph: &Graph) -> Result<ScratchSet> {
                 .dtype
                 .dense_bytes(padded)
                 .ok_or_else(|| be("vulkan adapter: internal tensor must be a dense dtype"))?;
+            if ze_dsts.contains(&i) {
+                scratch[i] = Some(be_.ze_view(bytes.max(4))?);
+                continue;
+            }
             idx.push(i);
             sizes.push(bytes.max(4));
         }
@@ -5457,7 +5468,7 @@ fn record_decode_replay(
     graph: &Graph,
     bindings: &Bindings,
 ) -> Result<DecodeReplay> {
-    let scratch = alloc_scratch(be_, graph)?;
+    let scratch = alloc_scratch(be_, graph, &Default::default())?;
     // `[pos, kv_len]` — Staging (host-visible mapped) so per-token `upload` is a plain memcpy.
     let params = be_.alloc(8, BufferUsage::Staging)?;
     let positions = graph
@@ -5656,12 +5667,77 @@ fn abort_segment(rec: Option<Recorder<'_>>, e: Error) -> Error {
     }
 }
 
+/// The Linears this forward runs as Level Zero GEMMs (`ze.rs`): prefill shapes of a dtype with a
+/// kernel, writing an `Internal` tensor, reading a weight from an exportable block. Empty without
+/// the bridge (`INFR_ZE_GEMM` off, not Intel Xe2, no Level Zero) and under dense layer streaming.
+fn ze_plan(
+    be_: &VulkanBackend,
+    graph: &Graph,
+    bindings: &Bindings,
+) -> std::collections::HashSet<usize> {
+    let mut out = std::collections::HashSet::new();
+    if be_.dense_paged() || be_.ze_bridge().is_none() {
+        return out;
+    }
+    for (i, op) in graph.ops.iter().enumerate() {
+        let Op::Linear {
+            weight,
+            dst,
+            m,
+            in_f,
+            out_f,
+            ..
+        } = op
+        else {
+            continue;
+        };
+        if !crate::ze::ze_dtype(graph.desc(*weight).dtype)
+            || !crate::ze::ze_shape(*m as usize, *in_f as usize, *out_f as usize)
+            || !matches!(graph.tensors[dst.0 as usize].kind, TensorKind::Internal)
+        {
+            continue;
+        }
+        if bindings.get(*weight).is_some_and(|w| be_.ze_operand_ok(w)) {
+            out.insert(i);
+        }
+    }
+    out
+}
+
 /// Per-execute static recording: allocate `Internal` scratch fresh, record every op via `lower_op`
 /// (Static mode — pos as a push constant read from `positions[0]`), submit + wait. Used for prefill
 /// batches and every ineligible decode (gemma/E2B/MoE/qwen35).
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Result<()> {
-    let scratch = alloc_scratch(be_, graph)?;
+    // Level Zero GEMMs (`ze.rs`): which Linears run there, and the exchange arena their A copies
+    // and outputs live in.
+    let ze_ops = ze_plan(be_, graph, bindings);
+    let mut ze_dsts = std::collections::HashSet::new();
+    let mut ze_a16: Vec<usize> = Vec::new();
+    if !ze_ops.is_empty() {
+        let mut bytes = 0usize;
+        for op in &graph.ops {
+            if let Op::Linear { m, in_f, .. } = op {
+                let (m, in_f) = (*m as usize, *in_f as usize);
+                // Every `_x256`-sized A copy comes from the arena too (an offloaded Linear may
+                // share its producer's copy with a Vulkan one).
+                let a16 = m.div_ceil(256) * 256 * in_f * 2;
+                if m >= 256 && !ze_a16.contains(&a16) {
+                    ze_a16.push(a16);
+                    bytes += a16 + 256;
+                }
+            }
+        }
+        for &i in &ze_ops {
+            if let Op::Linear { dst, m, out_f, .. } = &graph.ops[i] {
+                if ze_dsts.insert(dst.0 as usize) {
+                    bytes += (*m as usize).div_ceil(64) * 64 * *out_f as usize * 4 + 256;
+                }
+            }
+        }
+        be_.ze_arena_reset(bytes)?;
+    }
+    let scratch = alloc_scratch(be_, graph, &ze_dsts)?;
 
     // RoPE position: the static `qk_norm_rope`/`rope` kernels take a scalar `rope_pos`, but the IR
     // carries a `positions` i32 tensor. Read `positions[0]` (decode rows=1, or the start of a
@@ -5703,6 +5779,12 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
             }
         }
     }
+    // An offloaded Linear has no Vulkan GEMM epilogue to fold its residual `Add` into.
+    for &idx in &ze_ops {
+        if plan.linear_add.remove(&idx).is_some() {
+            plan.skip.remove(&(idx + 1));
+        }
+    }
     let fused_kv_write = plan.kv_write;
     let fused_add = plan.linear_add;
     let skip_op = plan.skip;
@@ -5721,6 +5803,9 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
     let mode = RopeMode::Static(&rope_pos);
     let mut dyn_args: Vec<DynAttnCtx> = Vec::new();
     let mut pool: ScratchPool = HashMap::new();
+    for &bytes in &ze_a16 {
+        pool.insert(("lin_a16_x256", bytes), be_.ze_view(bytes)?);
+    }
     let mut mmv_memo: Option<(TensorId, usize, usize)> = None;
     let mut pstream = PagedStream::default();
 
@@ -5808,6 +5893,76 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
             // already submitted.
             fresh.seed_barrier();
             rec = Some(fresh);
+        }
+        // A Level Zero GEMM (`ze.rs`): end the segment signalling `v`, append the GEMM (waits `v`,
+        // signals `v + 1`), and open the next segment waiting on `v + 1`.
+        if ze_ops.contains(&op_idx) {
+            let Op::Linear {
+                x,
+                weight,
+                dst,
+                m,
+                in_f,
+                out_f,
+                w_off,
+            } = op
+            else {
+                unreachable!("ze_plan holds Linears only");
+            };
+            let (m, in_f, out_f) = (*m as usize, *in_f as usize, *out_f as usize);
+            let bridge = be_.ze_bridge().expect("ze_plan needs the bridge");
+            let operands = (|| -> Result<_> {
+                Ok((
+                    resolve(&scratch, bindings, *x)?,
+                    resolve(&scratch, bindings, *weight)?,
+                    resolve(&scratch, bindings, *dst)?,
+                    x256_a16(&mut pool, be_, m, in_f)?,
+                ))
+            })();
+            let (xb, w, y, k16) = match operands {
+                Ok(t) => t,
+                Err(e) => return Err(abort_segment(rec.take(), e)),
+            };
+            // The producer may already have written this `x`'s f16 copy (`mmv_memo`, the same
+            // hand-off the `_x256` arm takes).
+            let memo_prev = mmv_memo.take();
+            if memo_prev != Some((*x, m, in_f)) {
+                rec.as_ref()
+                    .expect("segment always Some between ops")
+                    .store_f16(xb, pool[&k16].as_ref(), m * in_f, 0);
+            }
+            mmv_memo = Some((*x, m, in_f));
+            let v = bridge.reserve();
+            let sem = bridge.vk_semaphore();
+            let seg = rec
+                .take()
+                .expect("segment always Some between ops")
+                .finish_nowait_signal(sem, v)
+                .map_err(|e| be(e.to_string()))?;
+            submitted_dispatches += seg.dispatches();
+            segments.push_back(seg);
+            while segments.len() > MAX_INFLIGHT {
+                let old = segments.pop_front().expect("len > MAX_INFLIGHT >= 0");
+                old.wait().map_err(|e| be(e.to_string()))?;
+            }
+            let dt = graph.desc(*weight).dtype;
+            bridge.gemm(
+                be_,
+                dt,
+                pool[&k16].as_ref(),
+                w,
+                *w_off as usize,
+                y,
+                m,
+                in_f,
+                out_f,
+                v,
+            )?;
+            let fresh = be_.recorder()?;
+            fresh.seed_barrier();
+            fresh.wait_timeline(sem, v + 1);
+            rec = Some(fresh);
+            continue;
         }
         // Every error exit below goes through `abort_segment`: the segment being recorded has no
         // `Drop`, so a bare `?` here would leak its descriptor pools.

@@ -26,6 +26,7 @@ pub mod tp;
 pub mod tp_allreduce;
 pub mod tp_sem;
 mod vkext;
+mod ze;
 
 pub use ep::{EpBuffer, ExpertParallelBackend};
 pub use p2p::{P2pExport, P2pHandleType};
@@ -304,6 +305,9 @@ struct VulkanShared {
     /// True when this device enabled `VK_EXT_external_memory_dma_buf`, so the P2P export/import may
     /// use the dma-buf handle type (the cross-GPU-portable one on Linux) in addition to opaque-fd.
     has_dma_buf: bool,
+    /// PCI `bus:device.function` (`03:00.0`) from `VK_EXT_pci_bus_info`, `None` when the device
+    /// lacks it — how the Level Zero bridge (`ze.rs`) finds this card's other driver.
+    pci_bdf: Option<String>,
     /// `VK_KHR_external_semaphore_fd` loader — exports/imports a semaphore fd so a tensor-parallel
     /// all-reduce can order a peer's read after this device's GPU-side signal with no host round-trip
     /// (`AllReduceMode::P2pSemaphore`). `None` = the all-reduce uses the host fence (`queue_wait_idle`)
@@ -503,10 +507,17 @@ enum Backing {
     /// copy.
     ///
     /// Never host-mapped (`mapped_ptr` = `None`, so `upload`/`download` use the staging path).
-    /// Freed with a plain `vkFreeMemory` on drop (no unmap). Deliberately OUTSIDE the VRAM budget
-    /// accounting: this is a gated probe/transport capability, not wired into any model path, and
-    /// the import side aliases memory already owned by the exporting backend.
-    External { memory: vk::DeviceMemory },
+    /// Freed with a plain `vkFreeMemory` on drop (no unmap). The P2P buffers stay OUTSIDE the VRAM
+    /// budget accounting (`charged: false`): a gated probe/transport capability whose import side
+    /// aliases memory already owned by the exporting backend. The same-card exports the Level Zero
+    /// GEMMs read (`VulkanBackend::alloc_exportable`: weight blocks, the exchange arena) are model
+    /// memory and charged like any GpuOnly allocation, with a process-unique `export_id` that keys
+    /// their Level Zero imports (`ze.rs`; 0 for the P2P buffers).
+    External {
+        memory: vk::DeviceMemory,
+        charged: bool,
+        export_id: u64,
+    },
 }
 
 struct VkBuffer {
@@ -614,8 +625,15 @@ impl Drop for VkBuffer {
                 // so no unmap — just free the memory. On the export side this releases device A's
                 // pages once no importer still references the underlying dma-buf/fd (each side owns
                 // an independent `VkDeviceMemory` over the same pages, freed independently).
-                Backing::External { memory } => {
+                Backing::External {
+                    memory, charged, ..
+                } => {
                     self.shared.device.free_memory(*memory, None);
+                    if *charged {
+                        self.shared
+                            .device_used
+                            .fetch_sub(self.mem_size, Ordering::Relaxed);
+                    }
                 }
             }
             // Every OTHER variant owns `self.buffer` outright and must destroy it here. A `BdaSub`
@@ -1055,6 +1073,10 @@ pub struct VulkanBackend {
     /// whole device for a paged-MoE session before `moe_pager` was moved off it — see
     /// `backend_drop_frees_device_after_moe_pager`.
     bda_weight_arena: Mutex<Option<BdaWeightArena>>,
+    /// The Level Zero GEMM bridge and its exchange arena (`ze.rs`, opt-in `INFR_ZE_GEMM`). Owned by
+    /// the backend handle for the same reason as the arenas above (their buffers and semaphore hold
+    /// `Arc<VulkanShared>` clones).
+    ze: crate::ze::ZeCell,
     /// The engine configuration this backend reads its knobs from — one value, held for the
     /// backend's whole life, borrowed (never cloned) at every read site.
     ///
@@ -1643,6 +1665,16 @@ impl VulkanBackend {
         // default single-device path is untouched, and no P2P handle type is offered.
         let has_ext_mem_fd = has_ext(c"VK_KHR_external_memory_fd");
         let has_ext_mem_dma_buf = has_ext(c"VK_EXT_external_memory_dma_buf");
+        // A property query needs the extension supported, not enabled.
+        let pci_bdf = has_ext(c"VK_EXT_pci_bus_info").then(|| {
+            let mut pci = vk::PhysicalDevicePCIBusInfoPropertiesEXT::default();
+            let mut p2 = vk::PhysicalDeviceProperties2::default().push_next(&mut pci);
+            unsafe { instance.get_physical_device_properties2(physical_device, &mut p2) };
+            format!(
+                "{:02x}:{:02x}.{:x}",
+                pci.pci_bus, pci.pci_device, pci.pci_function
+            )
+        });
         // External SEMAPHORE fd — the tensor-parallel all-reduce orders a peer's cross-device read
         // after this device's GPU-side signal with NO host round-trip: export a timeline semaphore as
         // an fd here, import it on the peer, signal a value on this device's submit and wait it on the
@@ -2517,6 +2549,7 @@ impl VulkanBackend {
             moe_pager: Mutex::new(None),
             dense_pager: Mutex::new(None),
             bda_weight_arena: Mutex::new(None),
+            ze: Default::default(),
             cfg,
             shared: Arc::new(VulkanShared {
                 _entry: entry,
@@ -2537,6 +2570,7 @@ impl VulkanBackend {
                 push_descriptor,
                 external_memory_fd,
                 has_dma_buf: has_ext_mem_dma_buf,
+                pci_bdf,
                 external_semaphore_fd,
                 kernels: Mutex::new(HashMap::new()),
                 pipeline_cache,
@@ -3282,13 +3316,19 @@ impl VulkanBackend {
                 self.shared.max_mem_alloc_size
             )));
         }
-        let block_buf = self.make_buf_ex(
-            block_bytes as usize,
-            MemoryLocation::GpuOnly,
-            "resident-bda",
-            true,
-            true,
-        )?;
+        // With the Level Zero GEMMs on (`ze.rs`), blocks are dedicated exportable allocations its
+        // kernels read in place.
+        let block_buf = if self.ze_wanted() {
+            self.alloc_exportable(block_bytes as usize)?
+        } else {
+            self.make_buf_ex(
+                block_bytes as usize,
+                MemoryLocation::GpuOnly,
+                "resident-bda",
+                true,
+                true,
+            )?
+        };
         let buffer = block_buf.buffer;
         // `make_buf_ex(device_address=true)` already stored the block's address in `own_addr`;
         // reuse it instead of a second identical `get_buffer_device_address`.

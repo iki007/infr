@@ -58,6 +58,11 @@ impl TpExportSemaphore {
         self.fd
     }
 
+    /// The Vulkan semaphore itself, for a submit's wait/signal lists.
+    pub(crate) fn raw(&self) -> vk::Semaphore {
+        self.sem
+    }
+
     /// Signal `value` from the host (`vkSignalSemaphore`).
     pub fn host_signal(&self, value: u64) -> Result<()> {
         let info = vk::SemaphoreSignalInfo::default()

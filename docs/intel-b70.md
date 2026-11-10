@@ -47,6 +47,9 @@ INFR_DEV=Vulkan1 cargo test --release -p infr-vulkan --no-fail-fast -- --include
 | Qwen3.8-27B UD-Q4_K_M pp512 | 220            | 739       | 746              | 1087           |
 | Qwen3.8-27B UD-Q4_K_M tg128 | 13.8           | **28.8**  | 23.1             | 29.9           |
 
+With `INFR_ZE_GEMM=1` (prefill GEMMs as Level Zero DPAS kernels on the same card,
+`docs/level-zero.md`) pp512 is **5138** (4B) and **1013** (27B), greedy output unchanged.
+
 llama.cpp at `0f236bc21`; its 27B decode row is tg64. "infr first run" is
 `f568ff7`. "infr now" is after plan slice 10. Prefill moved in slices 2, 9 and 10,
 `INFR_NO_COOPMAT=1` still gives the first-run prefill numbers, and that is how
