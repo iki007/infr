@@ -210,7 +210,7 @@ pub fn parse(get: Get) -> Result<PartialConfig, ConfigError> {
     v.i8_coopmat = presence(get, "INFR_I8_COOPMAT");
     v.i8_row_scale = presence(get, "INFR_I8_ROW_SCALE");
     v.f16 = presence_inv(get, "INFR_NO_F16");
-    v.ze_gemm = presence(get, "INFR_ZE_GEMM");
+    v.ze_gemm = flag(get, "INFR_ZE_GEMM");
     v.i8_dot = presence_inv(get, "INFR_NO_I8DOT");
 
     v.gemm_warp = presence_inv(get, "INFR_NO_GEMM_WARP");

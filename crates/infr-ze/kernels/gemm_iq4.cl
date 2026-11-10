@@ -141,3 +141,103 @@ __kernel void gemm_iq4xs(__global const half* A, __global const uchar* W, __glob
         }
     }
 }
+
+// 16 bytes at `p`; `odd`: p sits 2 bytes past a dword boundary.
+inline uint4 ld16(__global const uchar* p, const int odd) {
+    if (!odd)
+        return vload4(0, (__global const uint*)p);
+    __global const uint* q = (__global const uint*)(p - 2);
+    const uint4 a = vload4(0, q);
+    const uint b = q[4];
+    return (uint4)((a.s0 >> 16) | (a.s1 << 16), (a.s1 >> 16) | (a.s2 << 16),
+                   (a.s2 >> 16) | (a.s3 << 16), (a.s3 >> 16) | (b << 16));
+}
+
+// An f16 at `p` (`odd` as for `ld16`).
+inline half ld_d(__global const uchar* p, const int odd) {
+    const uint w = *(__global const uint*)(p - 2 * odd);
+    return as_half((ushort)(odd ? (w >> 16) : w));
+}
+
+// IQ4_NL: 18-byte blocks of 32 (d, then 16 bytes: low nibbles = values 0..15, high = 16..31),
+// the same codebook as IQ4_XS. Blocks are walked in 36-byte pairs, which start dword-aligned when
+// K % 64 == 0: the even block's qs and the odd block's d sit 2 bytes off a dword (`ld16`/`ld_d`).
+#define IQ4NL_BLOCK(b, odd)                                                                      \
+    {                                                                                            \
+        uint4 q[2];                                                                              \
+        uint s2[2];                                                                              \
+        for (int j = 0; j < 2; j++) {                                                            \
+            __global const uchar* blk = rows[j] + (size_t)(b) * 18;                              \
+            s2[j] = as_uint((half2)(ld_d(blk, odd)));                                            \
+            q[j] = ld16(blk + 2, !(odd));                                                        \
+        }                                                                                        \
+        __attribute__((opencl_unroll_hint)) for (int h = 0; h < 2; h++) {                        \
+            const int k = (b) * 32 + h * 16;                                                     \
+            ushort a0[32], a1[32];                                                               \
+            intel_sub_group_2d_block_read_16b_32r16x1c((__global void*)A, K * 2, M, K * 2,       \
+                                                       (int2)(k, m0), a0);                       \
+            intel_sub_group_2d_block_read_16b_32r16x1c((__global void*)A, K * 2, M, K * 2,       \
+                                                       (int2)(k, m0 + 32), a1);                  \
+            int8 bb[2];                                                                          \
+            for (int j = 0; j < 2; j++) {                                                        \
+                uint4 x = h ? ((q[j] >> 4) & 0x0F0F0F0Fu) : (q[j] & 0x0F0F0F0Fu);                \
+                uint8 v;                                                                         \
+                v.s0 = lut[(x.s0 & 0xFu) | ((x.s0 >> 4) & 0xF0u)];                               \
+                v.s1 = lut[((x.s0 >> 16) & 0xFu) | ((x.s0 >> 20) & 0xF0u)];                      \
+                v.s2 = lut[(x.s1 & 0xFu) | ((x.s1 >> 4) & 0xF0u)];                               \
+                v.s3 = lut[((x.s1 >> 16) & 0xFu) | ((x.s1 >> 20) & 0xF0u)];                      \
+                v.s4 = lut[(x.s2 & 0xFu) | ((x.s2 >> 4) & 0xF0u)];                               \
+                v.s5 = lut[((x.s2 >> 16) & 0xFu) | ((x.s2 >> 20) & 0xF0u)];                      \
+                v.s6 = lut[(x.s3 & 0xFu) | ((x.s3 >> 4) & 0xF0u)];                               \
+                v.s7 = lut[((x.s3 >> 16) & 0xFu) | ((x.s3 >> 20) & 0xF0u)];                      \
+                bb[j] = scale_b(v, s2[j]);                                                       \
+            }                                                                                    \
+            for (int i = 0; i < 4; i++) {                                                        \
+                short8 ai = as_short8(vload8(0, &a0[i * 8]));                                    \
+                acc[i][0] = intel_sub_group_f16_f16_matrix_mad_k16(ai, bb[0], acc[i][0]);        \
+                acc[i][1] = intel_sub_group_f16_f16_matrix_mad_k16(ai, bb[1], acc[i][1]);        \
+            }                                                                                    \
+            for (int i = 0; i < 4; i++) {                                                        \
+                short8 ai = as_short8(vload8(0, &a1[i * 8]));                                    \
+                acc[4 + i][0] = intel_sub_group_f16_f16_matrix_mad_k16(ai, bb[0], acc[4 + i][0]); \
+                acc[4 + i][1] = intel_sub_group_f16_f16_matrix_mad_k16(ai, bb[1], acc[4 + i][1]); \
+            }                                                                                    \
+        }                                                                                        \
+    }
+
+// K % 64 == 0 (block pairs).
+__attribute__((intel_reqd_sub_group_size(16)))
+__attribute__((reqd_work_group_size(128, 1, 1)))
+__kernel void gemm_iq4nl(__global const half* A, __global const uchar* W, __global float* C,
+                         int M, int N, int K) {
+    __local uint lut[256];
+    for (int i = get_local_id(0); i < 256; i += 128)
+        lut[i] = as_uint((half2)((half)KV[i & 15], (half)KV[i >> 4]));
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    const int sg = get_sub_group_id();
+    const int lane = get_sub_group_local_id();
+    const int m0 = get_group_id(0) * WG_M + (sg >> 1) * SG_M;
+    const int n0 = get_group_id(1) * WG_N + (sg & 1) * SG_N;
+    const size_t rowb = (size_t)(K / 32) * 18;
+    __global const uchar* rows[2];
+    rows[0] = W + (size_t)(n0 + lane) * rowb;
+    rows[1] = rows[0] + 16 * rowb;
+
+    float8 acc[8][2];
+    for (int i = 0; i < 8; i++) {
+        acc[i][0] = 0.0f;
+        acc[i][1] = 0.0f;
+    }
+    for (int bp = 0; bp < K / 64; bp++) {
+        IQ4NL_BLOCK(2 * bp, 0)
+        IQ4NL_BLOCK(2 * bp + 1, 1)
+    }
+    for (int i = 0; i < 8; i++) {
+        for (int j = 0; j < 2; j++) {
+            intel_sub_group_2d_block_write_32b_8r16x1c(
+                (__global void*)C, N * 4, M, N * 4, (int2)(n0 + j * 16, m0 + i * 8),
+                (__private uint*)&acc[i][j]);
+        }
+    }
+}

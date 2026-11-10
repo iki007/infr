@@ -238,9 +238,11 @@ cfg_struct! {
         i8_row_scale: bool = false,
         /// `INFR_NO_F16` (inverted).
         f16: bool = true,
-        /// `INFR_ZE_GEMM`: run the prefill GEMMs of Intel Xe2 devices as Level Zero DPAS kernels
-        /// on the same card (`infr-ze`, `docs/level-zero.md`), between Vulkan segments.
-        ze_gemm: bool = false,
+        /// `INFR_ZE_GEMM` (`0` turns it off): on Intel Xe2 cards with Level Zero, run the prefill
+        /// GEMMs and the ops joining them as Level Zero kernels on the same card (`infr-ze`,
+        /// `docs/level-zero.md`), between Vulkan segments. Without Level Zero (or off Xe2) the
+        /// Vulkan path runs unchanged.
+        ze_gemm: bool = true,
         /// `INFR_NO_I8DOT` (inverted).
         i8_dot: bool = true,
 

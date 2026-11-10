@@ -24,13 +24,29 @@ use crate::VulkanBackend;
 
 /// Can `dt` run as an offloaded GEMM (a Level Zero kernel exists for it)?
 pub(crate) fn ze_dtype(dt: DType) -> bool {
-    matches!(dt, DType::Q4K | DType::Q5K | DType::Iq4Xs)
+    weight_block(dt).is_some()
 }
 
-/// The shapes the kernels take: N a multiple of their 64-column workgroup tile, K of the
-/// 256-value superblock, and a prefill-sized M.
-pub(crate) fn ze_shape(m: usize, in_f: usize, out_f: usize) -> bool {
-    m >= 256 && out_f.is_multiple_of(64) && in_f.is_multiple_of(256)
+/// `(values, bytes)` of `dt`'s block as the Level Zero kernels walk it, and the K multiple they
+/// need: Q6_K / Q3_K / IQ4_NL blocks are 2-byte multiples, walked in dword-aligned PAIRS.
+fn weight_block(dt: DType) -> Option<(usize, usize, usize)> {
+    Some(match dt {
+        DType::Q4K => (256, 144, 256),
+        DType::Q5K => (256, 176, 256),
+        DType::Iq4Xs => (256, 136, 256),
+        DType::Q6K => (256, 210, 512),
+        DType::Q3K => (256, 110, 512),
+        DType::Iq4Nl => (32, 18, 64),
+        _ => return None,
+    })
+}
+
+/// The shapes the kernels take: N a multiple of their 64-column workgroup tile, K of the format's
+/// block (pair), and a prefill-sized M.
+pub(crate) fn ze_shape(dt: DType, m: usize, in_f: usize, out_f: usize) -> bool {
+    weight_block(dt).is_some_and(|(_, _, kmul)| {
+        m >= 256 && out_f.is_multiple_of(64) && in_f.is_multiple_of(kmul)
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -73,6 +89,9 @@ mod imp {
         q4k: infr_ze::Kernel,
         q5k: infr_ze::Kernel,
         iq4xs: infr_ze::Kernel,
+        q6k: infr_ze::Kernel,
+        q3k: infr_ze::Kernel,
+        iq4nl: infr_ze::Kernel,
         rmsnorm: infr_ze::Kernel,
         swiglu: infr_ze::Kernel,
         add: infr_ze::Kernel,
@@ -99,9 +118,11 @@ mod imp {
             let kq = infr_ze::kernels::gemm_kquant().ok_or("infr-ze built without ocloc")?;
             let iq = infr_ze::kernels::gemm_iq4().ok_or("infr-ze built without ocloc")?;
             let ew = infr_ze::kernels::elementwise().ok_or("infr-ze built without ocloc")?;
+            let k16 = infr_ze::kernels::gemm_kq16().ok_or("infr-ze built without ocloc")?;
             let kq = gpu.module(kq).map_err(|e| e.to_string())?;
             let iq = gpu.module(iq).map_err(|e| e.to_string())?;
             let ew = gpu.module(ew).map_err(|e| e.to_string())?;
+            let k16 = gpu.module(k16).map_err(|e| e.to_string())?;
             let kernel = |m: &std::rc::Rc<infr_ze::Module>, name: &str, wg: u32| {
                 let k = m.kernel(name).map_err(|e| e.to_string())?;
                 k.group_size(wg, 1, 1).map_err(|e| e.to_string())?;
@@ -111,6 +132,11 @@ mod imp {
                 kernel(&kq, "gemm_q4k", 128)?,
                 kernel(&kq, "gemm_q5k", 128)?,
                 kernel(&iq, "gemm_iq4xs", 128)?,
+            );
+            let (q6k, q3k, iq4nl) = (
+                kernel(&k16, "gemm_q6k", 128)?,
+                kernel(&k16, "gemm_q3k", 128)?,
+                kernel(&iq, "gemm_iq4nl", 128)?,
             );
             let (rmsnorm, swiglu, add, to_f16) = (
                 kernel(&ew, "rmsnorm", 256)?,
@@ -128,6 +154,9 @@ mod imp {
                 q4k,
                 q5k,
                 iq4xs,
+                q6k,
+                q3k,
+                iq4nl,
                 rmsnorm,
                 swiglu,
                 add,
@@ -184,13 +213,9 @@ mod imp {
             in_f: usize,
             out_f: usize,
         ) -> Result<()> {
-            let blk = match dt {
-                DType::Q4K => 144,
-                DType::Q5K => 176,
-                DType::Iq4Xs => 136,
-                _ => return Err(be(format!("ze gemm: no Level Zero kernel for {dt:?}"))),
-            };
-            let w_off_b = w_off / 256 * blk;
+            let (vals, bytes, _) = weight_block(dt)
+                .ok_or_else(|| be(format!("ze gemm: no Level Zero kernel for {dt:?}")))?;
+            let w_off_b = w_off / vals * bytes;
             let mut g = self.0.lock().unwrap();
             let (a_id, a_off) = g.import(be_, a16)?;
             let (w_id, w_base) = g.import(be_, w)?;
@@ -199,7 +224,10 @@ mod imp {
             let k = match dt {
                 DType::Q4K => &g.q4k,
                 DType::Q5K => &g.q5k,
-                _ => &g.iq4xs,
+                DType::Iq4Xs => &g.iq4xs,
+                DType::Q6K => &g.q6k,
+                DType::Q3K => &g.q3k,
+                _ => &g.iq4nl,
             };
             let e = |r: infr_ze::Result<()>| r.map_err(|e| be(format!("ze gemm: {e}")));
             e(k.arg_buf_at(1, &g.imports[&w_id], w_base + w_off_b))?;
@@ -401,7 +429,7 @@ mod imp {
                         Ok(b) => Some(b),
                         Err(e) => {
                             tracing::warn!(
-                                "[infr] INFR_ZE_GEMM: Level Zero unavailable ({e}); prefill GEMMs stay on Vulkan"
+                                "[infr] Level Zero unavailable ({e}): prefill stays on Vulkan (install the Intel compute runtime for the faster Xe2 prefill, or set INFR_ZE_GEMM=0 to silence this)"
                             );
                             None
                         }

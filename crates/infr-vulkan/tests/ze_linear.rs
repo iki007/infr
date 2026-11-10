@@ -71,7 +71,14 @@ fn ze_linear_add_matches_vulkan_and_host() {
         eprintln!("skip: no Vulkan device");
         return;
     };
-    for dt in [DType::Q4K, DType::Q5K, DType::Iq4Xs] {
+    for dt in [
+        DType::Q4K,
+        DType::Q5K,
+        DType::Iq4Xs,
+        DType::Q6K,
+        DType::Q3K,
+        DType::Iq4Nl,
+    ] {
         for (m, in_f, out_f) in [
             (512usize, 1024usize, 512usize),
             (300, 2048, 1024),

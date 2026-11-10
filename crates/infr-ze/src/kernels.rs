@@ -41,3 +41,9 @@ pub fn gemm_iq4() -> Option<&'static [u8]> {
 pub fn elementwise() -> Option<&'static [u8]> {
     bin!("elementwise")
 }
+
+/// `kernels/gemm_kq16.cl`: the K-quants with one scale per 16 values and no min — kernels
+/// `gemm_q6k`, `gemm_q3k` (K % 512 == 0: superblock pairs).
+pub fn gemm_kq16() -> Option<&'static [u8]> {
+    bin!("gemm_kq16")
+}

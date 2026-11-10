@@ -1,8 +1,10 @@
 # Level Zero backend (`infr-ze`) — Intel Xe2, native
 
 Status (2026-11-10): **prefill GEMMs and the ops joining them run on Level Zero inside the Vulkan
-backend**, opt-in `INFR_ZE_GEMM=1` (`crates/infr-vulkan/src/ze.rs`): Qwen3.8-27B pp512 740 -> 1067
-t/s (llama.cpp SYCL 1087), Qwen3.5-4B 4172 -> 5811, greedy output unchanged. Backlog B102.
+backend**, on by default on Intel Xe2 cards with Level Zero (`INFR_ZE_GEMM=0` turns it off;
+`crates/infr-vulkan/src/ze.rs`): Qwen3.8-27B pp512 740 -> 1110
+t/s (llama.cpp SYCL 1087), Qwen3.5-4B 4172 -> 6278, greedy output unchanged. Long context is
+where it still trails SYCL (attention at depth — see the end). Backlog B102.
 
 ## Why
 
@@ -135,7 +137,7 @@ the limit.
 | Q5_K | 0.856 ms | 107 | 1.77 ms |
 | IQ4_XS | 1.291 ms | 71 | 1.78 ms |
 
-### Phase 3: the engine path (`INFR_ZE_GEMM=1`, `crates/infr-vulkan/src/ze.rs`)
+### Phase 3: the engine path (`crates/infr-vulkan/src/ze.rs`; default on since 2026-11-10, `INFR_ZE_GEMM=0` off)
 
 - **Weights**: with the knob on (and the card Intel Xe2 with dma-buf export, external timeline
   semaphores and `VK_EXT_pci_bus_info`), the resident weight blocks are dedicated exportable
@@ -190,9 +192,32 @@ output, timing only) it runs at 2198 t/s, so ~233 ms is everything but the offlo
 attention, DeltaNet, norms, the handoffs, and the ~10% of GEMM work in formats still on Vulkan
 (Q6_K, Q3_K, IQ4_NL, IQ3_S at ~45 TFLOPS, ~60 ms); the offloaded GEMMs take ~275 ms (~90 TFLOPS).
 
+**The 2-byte-aligned formats** (`kernels/gemm_kq16.cl`: Q6_K, Q3_K; `gemm_iq4.cl`: IQ4_NL).
+Their blocks are 210 / 110 / 18 bytes, so every other block starts 2 bytes off a dword, and IGC
+splits a per-lane `ushort` vector load into single-dword messages (Q6_K: 104 per superblock,
+24 TFLOPS). The kernels walk blocks in PAIRS, which start dword-aligned when K is a multiple of the
+pair (512 / 512 / 64): the odd block's loads are dword vector loads funnel-shifted by 2 bytes, a
+compile-time choice per pair half. m=512 5120 -> 17408: Q3_K 0.98 ms (93 TFLOPS), Q6_K 1.25 ms
+(73), IQ4_NL 1.36 ms (67, the IQ4_XS table). With them (and default on): 27B pp512 1067 -> 1110,
+4B 5811 -> 6278 (the 4B's Q6_K `ffn_down` no longer breaks its chains).
+
+### Long context (2026-11-10, Qwen3.8-27B, 1 rep, llama.cpp `-fa 1`)
+
+| t/s | infr | llama.cpp Vulkan | llama.cpp SYCL |
+| --- | --- | --- | --- |
+| pp512 @ d8192 | 703 | 375 | 1022 |
+| pp512 @ d32768 | 339 | 147 | 894 |
+| tg128 @ d8192 | 26.4 | 22.1 | 29.0 |
+| tg128 @ d32768 | 20.4 | 19.6 | 27.0 |
+
+(infr before the Q6_K/Q3_K/IQ4_NL kernels.) SYCL's prefill barely moves with depth; ours halves
+by 8k and again by 32k: the Vulkan flash attention (`attn_xmx_fa`) at depth is the gap (~7 TFLOPS
+effective at 32k). Decode at 32k spends ~14 ms per token on the 2 GB KV read (~150 GB/s; SYCL
+~3 ms). Next: attention on Level Zero (DPAS flash attention), then the decode KV read.
+
 ### Next
 
-- On by default on Intel Xe2 once it has run more models and longer prompts.
+- Attention at depth (prefill and decode) — the long-context gap above.
 - IQ4_XS: fewer SLM gathers — e.g. a byte-indexed table (k-pairs `(j, j+16)`, one index per byte)
   with the producer writing A in the matching k order.
-- Q6_K, Q3_K, IQ4_NL, IQ3_S, Q8_0; a packet-ordered grid for m > 512.
+- IQ3_S, Q8_0, Q2_K (not in the 27B/4B's GEMM paths).

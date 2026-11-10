@@ -5705,7 +5705,12 @@ fn ze_plan(
             ..
         } => {
             crate::ze::ze_dtype(graph.desc(*weight).dtype)
-                && crate::ze::ze_shape(*m as usize, *in_f as usize, *out_f as usize)
+                && crate::ze::ze_shape(
+                    graph.desc(*weight).dtype,
+                    *m as usize,
+                    *in_f as usize,
+                    *out_f as usize,
+                )
                 && arena(x)
                 && arena(dst)
                 && exportable(weight)

@@ -189,13 +189,15 @@ struct QFormat {
     name: &'static str,
     dtype: infr_core::DType,
     block_bytes: usize,
+    /// Values per block (256 for the superblock formats, 32 for IQ4_NL).
+    block_vals: usize,
     f16_fields: &'static [usize],
     wg_m: usize,
     wg_n: usize,
 }
 
 fn random_quant(fmt: &QFormat, n: usize, k: usize, seed: &mut u64) -> Vec<u8> {
-    let nb = k / 256;
+    let nb = k / fmt.block_vals;
     let mut w = vec![0u8; n * nb * fmt.block_bytes];
     for (i, b) in w.iter_mut().enumerate() {
         *b = ((lcg(seed) + 1.0) * 127.9) as u8 ^ (i as u8);
@@ -240,7 +242,7 @@ fn quant_gemm_probe(fmt: &QFormat, bin: &[u8]) {
         .map(|_| half::f16::from_f32(lcg(&mut seed)).to_f32())
         .collect();
     let wq = random_quant(fmt, n, k, &mut seed);
-    let row_bytes = k / 256 * fmt.block_bytes;
+    let row_bytes = k / fmt.block_vals * fmt.block_bytes;
     let wf: Vec<f32> = wq
         .chunks_exact(row_bytes)
         .flat_map(|r| infr_gguf::dequant::dequant_block(fmt.dtype, r).unwrap())
@@ -324,6 +326,7 @@ fn gemm_q4k_probe() {
         name: "gemm_q4k",
         dtype: infr_core::DType::Q4K,
         block_bytes: 144,
+        block_vals: 256,
         f16_fields: &[0, 2],
         wg_m: 256,
         wg_n: 64,
@@ -342,6 +345,7 @@ fn gemm_q5k_probe() {
         name: "gemm_q5k",
         dtype: infr_core::DType::Q5K,
         block_bytes: 176,
+        block_vals: 256,
         f16_fields: &[0, 2],
         wg_m: 256,
         wg_n: 64,
@@ -360,6 +364,64 @@ fn gemm_iq4xs_probe() {
         name: "gemm_iq4xs",
         dtype: infr_core::DType::Iq4Xs,
         block_bytes: 136,
+        block_vals: 256,
+        f16_fields: &[0],
+        wg_m: 256,
+        wg_n: 64,
+    };
+    quant_gemm_probe(&fmt, bin);
+}
+
+#[test]
+#[ignore = "requires a Level Zero GPU"]
+fn gemm_q6k_probe() {
+    let Some(bin) = infr_ze::kernels::gemm_kq16() else {
+        eprintln!("skip: no ocloc kernels");
+        return;
+    };
+    let fmt = QFormat {
+        name: "gemm_q6k",
+        dtype: infr_core::DType::Q6K,
+        block_bytes: 210,
+        block_vals: 256,
+        f16_fields: &[208],
+        wg_m: 256,
+        wg_n: 64,
+    };
+    quant_gemm_probe(&fmt, bin);
+}
+
+#[test]
+#[ignore = "requires a Level Zero GPU"]
+fn gemm_q3k_probe() {
+    let Some(bin) = infr_ze::kernels::gemm_kq16() else {
+        eprintln!("skip: no ocloc kernels");
+        return;
+    };
+    let fmt = QFormat {
+        name: "gemm_q3k",
+        dtype: infr_core::DType::Q3K,
+        block_bytes: 110,
+        block_vals: 256,
+        f16_fields: &[108],
+        wg_m: 256,
+        wg_n: 64,
+    };
+    quant_gemm_probe(&fmt, bin);
+}
+
+#[test]
+#[ignore = "requires a Level Zero GPU"]
+fn gemm_iq4nl_probe() {
+    let Some(bin) = infr_ze::kernels::gemm_iq4() else {
+        eprintln!("skip: no ocloc kernels");
+        return;
+    };
+    let fmt = QFormat {
+        name: "gemm_iq4nl",
+        dtype: infr_core::DType::Iq4Nl,
+        block_bytes: 18,
+        block_vals: 32,
         f16_fields: &[0],
         wg_m: 256,
         wg_n: 64,
