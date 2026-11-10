@@ -51,6 +51,44 @@ impl Drop for TpExportSemaphore {
     }
 }
 
+impl TpExportSemaphore {
+    /// The exported fd, still owned by this semaphore. An importer that consumes its fd (Vulkan,
+    /// Level Zero's `zeDeviceImportExternalSemaphoreExt`) must be handed a duplicate.
+    pub fn raw_fd(&self) -> RawFd {
+        self.fd
+    }
+
+    /// Signal `value` from the host (`vkSignalSemaphore`).
+    pub fn host_signal(&self, value: u64) -> Result<()> {
+        let info = vk::SemaphoreSignalInfo::default()
+            .semaphore(self.sem)
+            .value(value);
+        unsafe { self.shared.device.signal_semaphore(&info) }
+            .map_err(|e| be(format!("vkSignalSemaphore({value}): {e}")))
+    }
+
+    /// The current counter value (`vkGetSemaphoreCounterValue`).
+    pub fn counter_value(&self) -> Result<u64> {
+        unsafe { self.shared.device.get_semaphore_counter_value(self.sem) }
+            .map_err(|e| be(format!("vkGetSemaphoreCounterValue: {e}")))
+    }
+
+    /// Block the host until the counter reaches `value` or `timeout_ns` passes; `Ok(false)` on
+    /// timeout.
+    pub fn host_wait(&self, value: u64, timeout_ns: u64) -> Result<bool> {
+        let sems = [self.sem];
+        let vals = [value];
+        let info = vk::SemaphoreWaitInfo::default()
+            .semaphores(&sems)
+            .values(&vals);
+        match unsafe { self.shared.device.wait_semaphores(&info, timeout_ns) } {
+            Ok(()) => Ok(true),
+            Err(vk::Result::TIMEOUT) => Ok(false),
+            Err(e) => Err(be(format!("vkWaitSemaphores({value}): {e}"))),
+        }
+    }
+}
+
 /// A timeline semaphore on the CONSUMER device that shares a [`TpExportSemaphore`]'s payload (imported
 /// from its fd). Waiting a value on it blocks until the producer signals that value.
 pub struct TpImportSemaphore {

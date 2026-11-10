@@ -115,6 +115,17 @@ impl P2pExport {
     pub fn handle_type(&self) -> P2pHandleType {
         self.handle_type
     }
+
+    /// The exported fd, still owned by this export. An importer that consumes its fd (Vulkan,
+    /// Level Zero) must be handed a duplicate.
+    pub fn raw_fd(&self) -> RawFd {
+        self.fd
+    }
+
+    /// Size of the backing allocation (`>= len_bytes()`).
+    pub fn mem_size(&self) -> u64 {
+        self.mem_size
+    }
 }
 
 impl Drop for P2pExport {

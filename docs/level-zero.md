@@ -1,7 +1,8 @@
 # Level Zero backend (`infr-ze`) — Intel Xe2, native
 
-Status: **phase 0 done** (2026-11-10). The device layer and a DPAS GEMM probe run on the Arc Pro
-B70; nothing in the engine uses the crate yet. Backlog B102.
+Status: **phase 0 and the interop phase done** (2026-11-10). The device layer, a DPAS GEMM probe and
+Vulkan ↔ Level Zero memory/semaphore sharing run on the Arc Pro B70; nothing in the engine uses the
+crate yet. Backlog B102.
 
 ## Why
 
@@ -52,11 +53,44 @@ weights in a real model are quantized (Q4_K / IQ4_XS ~ 0.5–0.6 B per element a
 the decode path's bandwidth bound is lower, and dequantizing in registers before DPAS (or
 TensorFold's int4-as-fp16-subnormal trick) is the next kernel question.
 
-## Next
+## Integration: hybrid (prefill GEMMs on Level Zero, the rest on Vulkan)
 
-The integration choice is open (see the session notes / the user's call):
+Chosen 2026-11-10 over a full fourth backend: Vulkan keeps every op, and the prefill GEMMs move to
+Level Zero kernels that read the Vulkan buffers in place.
 
-- **Prefill GEMMs on Level Zero, everything else on Vulkan**: the Vulkan arena and activations
-  exported as dma-buf and imported into Level Zero on the same device; per-format dequant-in-kernel
-  DPAS GEMMs; Vulkan timeline semaphores and Level Zero events for ordering.
-- **A full fourth backend**: every op of the graph in OpenCL C, model family by model family.
+### Phase 1: interop (done, `crates/infr-vulkan/tests/ze_interop.rs`)
+
+- **Memory**: a Vulkan buffer exported as a dma-buf (`VulkanBackend::p2p_export(.., DmaBuf)`) is
+  imported with `Gpu::import_dmabuf` (`zeMemAllocDevice` + `ze_external_memory_import_fd_t`).
+  Level Zero kernels read and write the Vulkan pages; 4 rounds of Vulkan-write → L0 read/write →
+  Vulkan-read over 1M floats are exact, and the reverse direction too.
+- **Ordering**: a Vulkan timeline semaphore (`tp_export_timeline`, `OPAQUE_FD`) is imported with
+  `Gpu::import_vk_timeline` (`ZE_extension_external_semaphores`,
+  `VK_TIMELINE_SEMAPHORE_FD`); `wait_semaphore` / `signal_semaphore` append GPU-side waits and
+  signals to the immediate command list. Appending an unmet wait does not block the host.
+- **fd ownership**: the Intel compute runtime (26.40) closes the fd it imports, for memory and
+  for semaphores (measured: the descriptor is gone after a successful import). The infr-ze imports
+  take an `OwnedFd`; callers pass a duplicate of the exporter's fd.
+
+Per-handoff cost (B70 `03:00.0`, 200 rounds; one round is a 16 KB Vulkan copy, a 4096-element L0
+add, a 16 KB Vulkan copy — two cross-API handoffs around ~µs of work):
+
+| ordering | per round |
+| --- | --- |
+| Vulkan only: the same two submits chained by the timeline, no L0 | 74 µs |
+| Vulkan → L0 → Vulkan, timeline semaphores (GPU-side) | 156–164 µs (63 µs of it host issue, overlapped) |
+| Vulkan → L0 → Vulkan, host fences | 270–310 µs |
+
+So an L0 segment between two Vulkan submits costs ~80 µs per round trip over a plain dependent
+Vulkan resubmit — kernel-driver scheduling of a cross-queue dependency, not work. For 27B prefill
+(64 layers), offloading every GEMM naively is ~8 handoffs per layer ≈ 512 per ubatch ≈ 20–30 ms
+against ~690 ms per 512 tokens today; moving the norms/elementwise ops between GEMMs into L0 later
+cuts that to ~2 per layer.
+
+### Next
+
+- Quantized DPAS GEMMs in OpenCL C (dequantize the W tile in registers into DPAS's B operand), one
+  per format the target models use, measured against the f16 probe and Vulkan `_x256`.
+- Exportable allocations for the weights and the activation arena (dedicated, dma-buf), then the
+  recorder split: end the command buffer at an offloaded GEMM, submit signalling the timeline, L0
+  waits / runs / signals, the next command buffer waits.

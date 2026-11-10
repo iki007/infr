@@ -47,6 +47,8 @@ macro_rules! ze {
 /// The opened loader and its entry points.
 pub struct Ze {
     f: Fns,
+    /// `ZE_extension_external_semaphores`, when the loader exports it.
+    sem: Option<ExtSemFns>,
     _lib: libloading::Library,
 }
 
@@ -64,7 +66,9 @@ impl Ze {
         // SAFETY: the symbols are the Level Zero API with the signatures declared in `ffi`.
         let f = unsafe { Fns::load(&lib) }.map_err(Error::Load)?;
         ze!(f, zeInit(ZE_INIT_FLAG_GPU_ONLY))?;
-        Ok(Arc::new(Ze { f, _lib: lib }))
+        // SAFETY: as above, for the extension's entry points.
+        let sem = unsafe { ExtSemFns::load(&lib) }.ok();
+        Ok(Arc::new(Ze { f, sem, _lib: lib }))
     }
 
     /// Every GPU device of every driver.
@@ -234,6 +238,128 @@ impl Gpu {
             ptr,
             len: bytes,
         })
+    }
+
+    /// Import `bytes` bytes of a Linux dma-buf (another API's allocation on this device, e.g. a
+    /// Vulkan buffer exported with `VK_EXT_external_memory_dma_buf`) as device memory: kernels on
+    /// this GPU then read and write the exporter's pages.
+    ///
+    /// The driver takes `fd` (the Intel compute runtime closes an fd it imports — measured, not
+    /// stated by the spec), so pass a duplicate of an fd the exporter keeps. On failure the fd may
+    /// leak rather than risk a double close.
+    #[cfg(unix)]
+    pub fn import_dmabuf(&self, fd: std::os::fd::OwnedFd, bytes: usize) -> Result<DevBuf> {
+        use std::os::fd::IntoRawFd;
+        let import = ze_external_memory_import_fd_t {
+            stype: ZE_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMPORT_FD,
+            p_next: std::ptr::null(),
+            flags: ZE_EXTERNAL_MEMORY_TYPE_FLAG_DMA_BUF,
+            fd: fd.into_raw_fd(),
+        };
+        let desc = ze_device_mem_alloc_desc_t {
+            stype: ZE_STRUCTURE_TYPE_DEVICE_MEM_ALLOC_DESC,
+            p_next: &import as *const _ as *const c_void,
+            flags: 0,
+            ordinal: 0,
+        };
+        let mut ptr = std::ptr::null_mut();
+        ze!(
+            self.f(),
+            zeMemAllocDevice(
+                self.inner.ctx,
+                &desc,
+                bytes.max(1),
+                64,
+                self.inner.device,
+                &mut ptr
+            )
+        )?;
+        Ok(DevBuf {
+            inner: self.inner.clone(),
+            ptr,
+            len: bytes,
+        })
+    }
+
+    fn sem_fns(&self) -> Result<&ExtSemFns> {
+        self.inner.ze.sem.as_ref().ok_or(Error::Call {
+            call: "ZE_extension_external_semaphores (not exported by this loader)",
+            code: 0x78000001, // ZE_RESULT_ERROR_UNSUPPORTED_FEATURE
+        })
+    }
+
+    /// Import a Vulkan timeline semaphore exported as an `OPAQUE_FD` (`vkGetSemaphoreFdKHR`), so
+    /// this GPU's command list can wait on values another API signals and signal values it waits
+    /// on, with no host round-trip. The driver takes `fd`, as in [`import_dmabuf`](Self::import_dmabuf).
+    #[cfg(unix)]
+    pub fn import_vk_timeline(&self, fd: std::os::fd::OwnedFd) -> Result<Semaphore> {
+        use std::os::fd::IntoRawFd;
+        let f = self.sem_fns()?;
+        let fd_desc = ze_external_semaphore_fd_ext_desc_t {
+            stype: ZE_STRUCTURE_TYPE_EXTERNAL_SEMAPHORE_FD_EXT_DESC,
+            p_next: std::ptr::null(),
+            fd: fd.into_raw_fd(),
+        };
+        let desc = ze_external_semaphore_ext_desc_t {
+            stype: ZE_STRUCTURE_TYPE_EXTERNAL_SEMAPHORE_EXT_DESC,
+            p_next: &fd_desc as *const _ as *const c_void,
+            flags: ZE_EXTERNAL_SEMAPHORE_EXT_FLAG_VK_TIMELINE_SEMAPHORE_FD,
+        };
+        let mut handle = std::ptr::null_mut();
+        ze!(
+            f,
+            zeDeviceImportExternalSemaphoreExt(self.inner.device, &desc, &mut handle)
+        )?;
+        Ok(Semaphore {
+            inner: self.inner.clone(),
+            handle,
+        })
+    }
+
+    /// Append a wait until `sem` reaches `value`: later commands start after it.
+    pub fn wait_semaphore(&self, sem: &Semaphore, value: u64) -> Result<()> {
+        let f = self.sem_fns()?;
+        let mut h = sem.handle;
+        let mut p = ze_external_semaphore_signal_params_ext_t {
+            stype: ZE_STRUCTURE_TYPE_EXTERNAL_SEMAPHORE_WAIT_PARAMS_EXT,
+            p_next: std::ptr::null(),
+            value,
+        };
+        ze!(
+            f,
+            zeCommandListAppendWaitExternalSemaphoreExt(
+                self.inner.cl,
+                1,
+                &mut h,
+                &mut p,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut()
+            )
+        )
+    }
+
+    /// Append a signal of `sem` to `value`, after every earlier command completes.
+    pub fn signal_semaphore(&self, sem: &Semaphore, value: u64) -> Result<()> {
+        let f = self.sem_fns()?;
+        let mut h = sem.handle;
+        let mut p = ze_external_semaphore_signal_params_ext_t {
+            stype: ZE_STRUCTURE_TYPE_EXTERNAL_SEMAPHORE_SIGNAL_PARAMS_EXT,
+            p_next: std::ptr::null(),
+            value,
+        };
+        ze!(
+            f,
+            zeCommandListAppendSignalExternalSemaphoreExt(
+                self.inner.cl,
+                1,
+                &mut h,
+                &mut p,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut()
+            )
+        )
     }
 
     /// Copy `data` into `buf` (from offset 0) and wait for it.
@@ -447,6 +573,21 @@ impl Drop for DevBuf {
     fn drop(&mut self) {
         // SAFETY: `ptr` was allocated in this context and is freed once.
         unsafe { (self.inner.ze.f.zeMemFree)(self.inner.ctx, self.ptr) };
+    }
+}
+
+/// An imported external semaphore, released on drop (after the work using it has completed).
+pub struct Semaphore {
+    inner: Rc<Inner>,
+    handle: Handle,
+}
+
+impl Drop for Semaphore {
+    fn drop(&mut self) {
+        if let Some(f) = self.inner.ze.sem.as_ref() {
+            // SAFETY: imported by `Gpu::import_vk_timeline`, released once.
+            unsafe { (f.zeDeviceReleaseExternalSemaphoreExt)(self.handle) };
+        }
     }
 }
 

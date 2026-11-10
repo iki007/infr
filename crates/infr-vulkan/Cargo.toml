@@ -41,3 +41,8 @@ memmap2.workspace = true
 # `*_matches_host` unit tests in `adapter.rs`).
 infr-testkit.workspace = true
 infr-plat.workspace = true
+
+# `tests/ze_interop.rs`: Vulkan buffers and timeline semaphores shared with Level Zero on the same
+# Intel GPU (B102 hybrid prefill).
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+infr-ze.workspace = true

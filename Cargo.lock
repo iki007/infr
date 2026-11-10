@@ -1392,6 +1392,7 @@ dependencies = [
  "infr-prof",
  "infr-prof-rt",
  "infr-testkit",
+ "infr-ze",
  "libc",
  "memmap2",
  "rayon",

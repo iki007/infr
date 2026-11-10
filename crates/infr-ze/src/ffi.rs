@@ -7,7 +7,7 @@
 //! handles are opaque pointers.
 #![allow(non_camel_case_types, non_snake_case, dead_code)]
 
-use std::ffi::{c_char, c_void};
+use std::ffi::{c_char, c_int, c_void};
 
 pub type ze_result_t = u32;
 pub const ZE_RESULT_SUCCESS: ze_result_t = 0;
@@ -28,6 +28,16 @@ pub const ZE_STRUCTURE_TYPE_HOST_MEM_ALLOC_DESC: u32 = 0x16;
 pub const ZE_STRUCTURE_TYPE_MODULE_DESC: u32 = 0x1b;
 pub const ZE_STRUCTURE_TYPE_KERNEL_DESC: u32 = 0x1d;
 pub const ZE_STRUCTURE_TYPE_PCI_EXT_PROPERTIES: u32 = 0x10008;
+pub const ZE_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMPORT_FD: u32 = 0x19;
+pub const ZE_STRUCTURE_TYPE_EXTERNAL_SEMAPHORE_EXT_DESC: u32 = 0x00020022;
+pub const ZE_STRUCTURE_TYPE_EXTERNAL_SEMAPHORE_FD_EXT_DESC: u32 = 0x00020024;
+pub const ZE_STRUCTURE_TYPE_EXTERNAL_SEMAPHORE_SIGNAL_PARAMS_EXT: u32 = 0x00020025;
+pub const ZE_STRUCTURE_TYPE_EXTERNAL_SEMAPHORE_WAIT_PARAMS_EXT: u32 = 0x00020026;
+
+pub const ZE_EXTERNAL_MEMORY_TYPE_FLAG_OPAQUE_FD: u32 = 1;
+pub const ZE_EXTERNAL_MEMORY_TYPE_FLAG_DMA_BUF: u32 = 2;
+pub const ZE_EXTERNAL_SEMAPHORE_EXT_FLAG_OPAQUE_FD: u32 = 1;
+pub const ZE_EXTERNAL_SEMAPHORE_EXT_FLAG_VK_TIMELINE_SEMAPHORE_FD: u32 = 1 << 7;
 
 pub const ZE_MODULE_FORMAT_IL_SPIRV: u32 = 0;
 pub const ZE_MODULE_FORMAT_NATIVE: u32 = 1;
@@ -111,6 +121,36 @@ pub struct ze_device_mem_alloc_desc_t {
 }
 
 #[repr(C)]
+pub struct ze_external_memory_import_fd_t {
+    pub stype: u32,
+    pub p_next: *const c_void,
+    pub flags: u32,
+    pub fd: c_int,
+}
+
+#[repr(C)]
+pub struct ze_external_semaphore_ext_desc_t {
+    pub stype: u32,
+    pub p_next: *const c_void,
+    pub flags: u32,
+}
+
+#[repr(C)]
+pub struct ze_external_semaphore_fd_ext_desc_t {
+    pub stype: u32,
+    pub p_next: *const c_void,
+    pub fd: c_int,
+}
+
+/// Also the layout of `ze_external_semaphore_wait_params_ext_t` (only `stype` differs).
+#[repr(C)]
+pub struct ze_external_semaphore_signal_params_ext_t {
+    pub stype: u32,
+    pub p_next: *const c_void,
+    pub value: u64,
+}
+
+#[repr(C)]
 pub struct ze_host_mem_alloc_desc_t {
     pub stype: u32,
     pub p_next: *const c_void,
@@ -175,12 +215,12 @@ pub struct ze_kernel_timestamp_result_t {
 }
 
 macro_rules! ze_fns {
-    ($( $name:ident : fn( $($arg:ty),* ) ; )*) => {
-        /// The resolved entry points (`ze*` symbols of `libze_loader`).
-        pub struct Fns {
+    ($(#[$doc:meta])* $s:ident { $( $name:ident : fn( $($arg:ty),* ) ; )* }) => {
+        $(#[$doc])*
+        pub struct $s {
             $( pub $name: unsafe extern "C" fn($($arg),*) -> ze_result_t, )*
         }
-        impl Fns {
+        impl $s {
             /// Resolve every entry point; the first missing symbol is the error.
             ///
             /// # Safety
@@ -199,6 +239,8 @@ macro_rules! ze_fns {
 }
 
 ze_fns! {
+    /// The core entry points (`ze*` symbols of `libze_loader`); all must resolve.
+    Fns {
     zeInit: fn(u32);
     zeDriverGet: fn(*mut u32, *mut Handle);
     zeDeviceGet: fn(Handle, *mut u32, *mut Handle);
@@ -229,4 +271,16 @@ ze_fns! {
     zeEventDestroy: fn(Handle);
     zeEventHostReset: fn(Handle);
     zeEventQueryKernelTimestamp: fn(Handle, *mut ze_kernel_timestamp_result_t);
+    }
+}
+
+ze_fns! {
+    /// `ZE_extension_external_semaphores` (loader 1.12+), resolved separately so an older loader
+    /// still opens: waiting on / signalling a Vulkan timeline semaphore from a command list.
+    ExtSemFns {
+    zeDeviceImportExternalSemaphoreExt: fn(Handle, *const ze_external_semaphore_ext_desc_t, *mut Handle);
+    zeDeviceReleaseExternalSemaphoreExt: fn(Handle);
+    zeCommandListAppendSignalExternalSemaphoreExt: fn(Handle, u32, *mut Handle, *mut ze_external_semaphore_signal_params_ext_t, Handle, u32, *mut Handle);
+    zeCommandListAppendWaitExternalSemaphoreExt: fn(Handle, u32, *mut Handle, *mut ze_external_semaphore_signal_params_ext_t, Handle, u32, *mut Handle);
+    }
 }
