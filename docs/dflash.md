@@ -59,7 +59,7 @@ greedy, on two raw prompts shared with llama-server's `/completion`:
 | engine (cards) | A: t/s | B: t/s | accept rate A / B |
 |---|---:|---:|---:|
 | infr, plain decode (1) | 28.7 | 28.7 | — |
-| **infr DFlash (1)** | **50.2** | **82.3** | 0.38 / 0.71 |
+| **infr DFlash (1)** | **51.5** | **89.0** | 0.38 / 0.72 |
 | infr DFlash, Vulkan verify (`INFR_ZE_SKINNY=0`) (1) | 38.3 | 67.8 | 0.34 / 0.71 |
 | tuned llama.cpp SYCL fork, DFlash + lookup (1) | 60 | 115 | 0.31 / 0.72 |
 | same fork, `-sm tensor` (2) | 74–77 | 143–145 | 0.32 / 0.72 |
@@ -67,14 +67,14 @@ greedy, on two raw prompts shared with llama-server's `/completion`:
 TensorFold's published B70 receipt (GPTQ 4/128, different prompts) is 122.9 t/s on code and 99.3
 on chat, with DFlash2 trees and copy drafting.
 
-A greedy cycle on code costs about 72 ms:
+A greedy cycle on code costs about 68 ms (6.0 tokens):
 
 | step | time |
 |---|---:|
-| 8-row verify (one Level Zero chain, `docs/level-zero.md` § Speculative verify) | ~58 ms |
-| drafter block forward and host selector | ~12 ms |
-| injection | ~2 ms |
-| state select | ~1 ms |
+| 8-row verify (one Level Zero chain, `docs/level-zero.md` § Speculative verify) | 58.1 ms |
+| draft: block forward (Level Zero, 4.0 ms of device time), 3 MB readback, host selector | 7.4 ms |
+| injection | 1.2 ms |
+| state select | 0.7 ms |
 
 The path there:
 
@@ -84,6 +84,7 @@ The path there:
 | + GPU embed gather in VERIFY (the host table took 2.3 s and 5 GB on first use) | 29.5 |
 | + batched snapshot copies, then the per-row state history (no re-prime, verify always 8 rows) | 39.9 |
 | + the verify forward as one Level Zero chain (512 tokens) | 50.2 |
+| + the drafter block forward on Level Zero (code: 82.3 → 89.0) | 51.5 |
 
 ## Testing
 
@@ -105,9 +106,8 @@ The path there:
 - **Drafter shape:** the drafter must be sliding-window. A full-attention drafter needs per-chunk
   injection during the prefill.
 - **Selector and head:** the selector and top-k run on the host, with 3 MB of logits read back
-  per draft. A GPU top-k would remove the download.
+  per draft (1.05 ms). A GPU top-k would remove the download.
 - **Draft length:** fixed at 7. An adaptive length (MTP's `n_dyn`) would cut wasted verify rows on
   low-acceptance text.
 - **Draft shape:** a single chain. Draft trees and context-copy drafting (llama.cpp's lookup
-  extension, TensorFold's copies) raise the tokens kept per verify; the drafter itself still runs on
-  Vulkan (~12 ms a cycle).
+  extension, TensorFold's copies) raise the tokens kept per verify.

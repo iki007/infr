@@ -631,6 +631,7 @@ fn skinny_probe(fmt: &QFormat, bin: Option<&[u8]>, m8: &str, m16: &str) {
         ),
         (48, 1024, &[(8, 1), (8, 4)][..]),
         (80, 2048, &[(8, 2), (13, 1)][..]),
+        (100, 1024, &[(8, 1), (8, 4)][..]),
     ] {
         let wq = random_quant(fmt, n, k, &mut seed);
         let row_bytes = k / fmt.block_vals * fmt.block_bytes;
@@ -921,5 +922,25 @@ fn skinny_q8_0_probe() {
         infr_ze::kernels::gemm_iq4(),
         "gemm_q8_0_m8",
         "gemm_q8_0_m16",
+    );
+}
+
+#[test]
+#[ignore = "requires a Level Zero GPU"]
+fn skinny_q4_0_probe() {
+    let fmt = QFormat {
+        name: "gemm_q4_0_m8",
+        dtype: infr_core::DType::Q4_0,
+        block_bytes: 18,
+        block_vals: 32,
+        f16_fields: &[0],
+        wg_m: 8,
+        wg_n: 256,
+    };
+    skinny_probe(
+        &fmt,
+        infr_ze::kernels::gemm_iq4(),
+        "gemm_q4_0_m8",
+        "gemm_q4_0_m16",
     );
 }

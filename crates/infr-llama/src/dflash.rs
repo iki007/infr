@@ -376,11 +376,14 @@ impl DflashSession {
         let hp = &d.hp;
         // The window plus one block of keys is all a draft reads, so a ring of that size (and a
         // little slack for an injection batch) never recycles a visible row.
+        // A multiple of 32 rows, so the Level Zero ring attention's 32-key blocks never straddle
+        // the wrap.
         let kv_rows = if hp.window > 0 && be.capabilities().kv_swa_ring {
             (hp.window + hp.block + 64).min(max_ctx + hp.block)
         } else {
             max_ctx + hp.block
-        };
+        }
+        .next_multiple_of(32);
         let kvrow = hp.nkv * hp.hd;
         let mut kc = Vec::new();
         let mut vc = Vec::new();
@@ -514,6 +517,8 @@ impl DflashSession {
         let (ne, kvrow) = (hp.ne, hp.nkv * hp.hd);
         let wf = hp.target_layers.len() * ne;
         let mut g = Graph::new();
+        // A verify-sized injection runs as one Level Zero chain on Xe2 (`Graph::small_chain`).
+        g.small_chain = rows <= 16;
         let f32d = |n: usize| TensorDesc::new(vec![n], DType::F32);
         let c = self.declare(&mut g, rows);
         let ring_id = g.input(f32d(ring_rows * wf));
@@ -638,6 +643,8 @@ impl DflashSession {
             0
         };
         let mut g = Graph::new();
+        // The draft block runs as one Level Zero chain on Xe2 (`Graph::small_chain`).
+        g.small_chain = true;
         let f32d = |n: usize| TensorDesc::new(vec![n], DType::F32);
         let c = self.declare(&mut g, b_);
         let inp = g.input(f32d(b_ * ne));

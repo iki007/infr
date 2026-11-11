@@ -368,6 +368,27 @@ DFlash on the 27B, 512 tokens, one B70:
 MTP: identical text, unchanged speed (its verifies are 2–4 rows). Prefill and decode do not enter
 the chain.
 
+**The DFlash drafter.** Its block forward (8 rows) and its injection chunks (up to 16 rows) set
+`Graph::small_chain`, which opens the same skinny path. Three more pieces cover the drafter's ops:
+
+- `block_conv` (`decode.cl`).
+- `attn_ring128` + `attn_combine_hd` (`attn_dec.cl`): 128-wide heads over the drafter's KV ring.
+  Canvas rows see `[lo, kv_len)`, the ring index wraps at `cap`, and chunks start at `lo & ~31`.
+- Ring `WriteKv` (two launches when it wraps), and skinny Q4_0 for the 98,580-row head.
+
+The skinny kernels also clamp their row reads (`min(n0 + lane, N - 1)`), so any N % 4 now runs.
+The block forward takes 4.0 ms of device time:
+
+- 2.13 ms is the body's Q4_K GEMMs.
+- 0.96 ms is the Q4_0 head (~300 GB/s).
+- A draft costs 7.4 ms of wall time, down from ~12. The remainder is the 3 MB logits readback
+  (1.05 ms), graph build (0.6 ms) and the host selector (0.45 ms).
+
+| prompt | Level Zero verify | + drafter | text |
+|---|---:|---:|---|
+| code | 82.3 t/s | 89.0 t/s | identical |
+| reasoning | 50.2 t/s | 51.5 t/s | not compared |
+
 The Vulkan alternative was tried and dropped. The prefill warp GEMM was built at 16 rows (`BM16`,
 8×16 fragments, `BK128`, split-K) and took 365–580 µs on the Q4_K 5120→17408 shape. That is slower
 than the multi-row GEMV's 333 µs: on ANV, dequant staged through shared memory plus barriers costs
@@ -378,8 +399,8 @@ more than the XMX math saves.
 - Verify: the remaining ~10 ms to SYCL's 41.5 ms is GEMM efficiency (IQ4_XS's codebook path is
   ~330 GB/s, the format the 27B uses most), an IQ3_S skinny kernel (4 GEMMs still on Vulkan) and
   the DeltaNet kernel (61 µs vs Vulkan's 44).
-- The DFlash drafter on Level Zero: its block conv, 128-wide ring/canvas attention and a Q4_0
-  skinny GEMM for its 98K head would take the draft from ~12 to ~5 ms a cycle.
+- DFlash draft: a GPU top-16 joining the chain would drop the 3 MB readback (~1.5 ms a cycle with
+  the host top-k).
 - The decode KV read at depth (above), and further prefill attention tuning.
 - IQ4_XS: fewer SLM gathers — e.g. a byte-indexed table (k-pairs `(j, j+16)`, one index per byte)
   with the producer writing A in the matching k order.

@@ -51,7 +51,7 @@ pub(crate) fn ze_shape(dt: DType, m: usize, in_f: usize, out_f: usize, skinny: b
     });
     let small = skinny
         && (2..=SKINNY_MAX_M).contains(&m)
-        && out_f.is_multiple_of(16)
+        && out_f.is_multiple_of(4)
         && skinny_block(dt).is_some_and(|(_, _, kmul)| in_f.is_multiple_of(kmul));
     prefill || small
 }
@@ -61,6 +61,7 @@ pub(crate) fn ze_shape(dt: DType, m: usize, in_f: usize, out_f: usize, skinny: b
 fn skinny_block(dt: DType) -> Option<(usize, usize, usize)> {
     match dt {
         DType::Q8_0 => Some((32, 34, 64)),
+        DType::Q4_0 => Some((32, 18, 64)),
         _ => weight_block(dt),
     }
 }
@@ -81,6 +82,7 @@ fn skinny_label(dt: DType) -> &'static str {
         DType::Iq4Xs => "gemm_sk_iq4xs",
         DType::Iq4Nl => "gemm_sk_iq4nl",
         DType::Q8_0 => "gemm_sk_q8_0",
+        DType::Q4_0 => "gemm_sk_q4_0",
         _ => "gemm_sk",
     }
 }
@@ -242,6 +244,8 @@ mod imp {
             }
             skinny.insert((DType::Q8_0, false), kernel(&iq, "gemm_q8_0_m8", 128)?);
             skinny.insert((DType::Q8_0, true), kernel(&iq, "gemm_q8_0_m16", 128)?);
+            skinny.insert((DType::Q4_0, false), kernel(&iq, "gemm_q4_0_m8", 128)?);
+            skinny.insert((DType::Q4_0, true), kernel(&iq, "gemm_q4_0_m16", 128)?);
             let dc = infr_ze::kernels::decode().ok_or("infr-ze built without ocloc")?;
             let ad = infr_ze::kernels::attn_dec().ok_or("infr-ze built without ocloc")?;
             let dc = gpu.module(dc).map_err(|e| e.to_string())?;
@@ -257,11 +261,14 @@ mod imp {
                 ("deltanet_hist", 128),
                 ("gated_rmsnorm", 128),
                 ("qk_norm_rope", 64),
+                ("block_conv", 256),
             ] {
                 dec.insert(name, kernel(&dc, name, wg)?);
             }
             dec.insert("attn_dec256", kernel(&ad, "attn_dec256", 32)?);
             dec.insert("attn_dec_combine", kernel(&ad, "attn_dec_combine", 256)?);
+            dec.insert("attn_ring128", kernel(&ad, "attn_ring128", 32)?);
+            dec.insert("attn_combine_hd", kernel(&ad, "attn_combine_hd", 256)?);
             let sum_splits = kernel(&ew, "sum_splits", 256)?;
             let partials = gpu.alloc(SKINNY_PARTIALS).map_err(|e| e.to_string())?;
             let vk_sem = be_.tp_export_timeline().map_err(|e| e.to_string())?;
@@ -696,6 +703,76 @@ mod imp {
             Ok(())
         }
 
+        /// The DFlash drafter's block attention (`attn_ring128` + `attn_combine_hd`): head dim 128,
+        /// every row sees keys `[lo, kv_len)`, K/V caches a ring of `cap` rows (cap % 32 == 0).
+        #[allow(clippy::too_many_arguments)]
+        pub(crate) fn attention_ring(
+            &self,
+            be_: &VulkanBackend,
+            q: &dyn Buffer,
+            kc: &dyn Buffer,
+            vc: &dyn Buffer,
+            o: &dyn Buffer,
+            rows: usize,
+            kv_len: usize,
+            nh: usize,
+            nkv: usize,
+            lo: usize,
+            cap: usize,
+            scale: f32,
+        ) -> Result<()> {
+            let span = kv_len - (lo & !31);
+            let chunk = span.div_ceil(16).next_multiple_of(32).clamp(64, 1024);
+            let nchunk = span.div_ceil(chunk).max(1);
+            let units = nchunk * rows * nh;
+            let mut g = self.0.lock().unwrap();
+            if g.attn_parts.as_ref().is_none_or(|(_, _, cap)| *cap < units) {
+                let c = units.next_power_of_two();
+                let po = g
+                    .gpu
+                    .alloc(c * 256 * 4)
+                    .map_err(|e| be(format!("ze alloc: {e}")))?;
+                let pml = g
+                    .gpu
+                    .alloc(c * 2 * 4)
+                    .map_err(|e| be(format!("ze alloc: {e}")))?;
+                g.attn_parts = Some((po, pml, c));
+            }
+            let ids = [q, kc, vc, o]
+                .iter()
+                .map(|b| g.import(be_, *b))
+                .collect::<Result<Vec<_>>>()?;
+            let g = &*g;
+            let (po, pml, _) = g.attn_parts.as_ref().expect("allocated above");
+            let e = |r: infr_ze::Result<()>| r.map_err(|e| be(format!("ze attention_ring: {e}")));
+            let k = &g.dec["attn_ring128"];
+            for (i, (id, off)) in ids[..3].iter().enumerate() {
+                e(k.arg_buf_at(i as u32, &g.imports[id], *off))?;
+            }
+            e(k.arg_buf(3, po))?;
+            e(k.arg_buf(4, pml))?;
+            for (i, v) in [rows, kv_len, nh, nkv, lo, cap, chunk].iter().enumerate() {
+                e(k.arg(5 + i as u32, *v as i32))?;
+            }
+            e(k.arg(12, scale))?;
+            e(g.gpu.launch_labeled(
+                k,
+                [nh as u32, nchunk as u32, rows.div_ceil(8) as u32],
+                "attn_ring128",
+            ))?;
+            let c = &g.dec["attn_combine_hd"];
+            e(c.arg_buf(0, po))?;
+            e(c.arg_buf(1, pml))?;
+            let (oid, ooff) = ids[3];
+            e(c.arg_buf_at(2, &g.imports[&oid], ooff))?;
+            e(c.arg(3, rows as i32))?;
+            e(c.arg(4, nh as i32))?;
+            e(c.arg(5, nchunk as i32))?;
+            e(c.arg(6, 128i32))?;
+            e(g.gpu
+                .launch_labeled(c, [(rows * nh) as u32, 1, 1], "attn_combine_hd"))
+        }
+
         /// Drop the import of a retired exportable allocation.
         fn forget(&self, export_id: u64) {
             self.0.lock().unwrap().imports.remove(&export_id);
@@ -958,6 +1035,24 @@ mod imp {
             _: &dyn Buffer,
             _: &dyn Buffer,
             _: &dyn Buffer,
+            _: usize,
+            _: usize,
+            _: usize,
+            _: usize,
+            _: usize,
+            _: f32,
+        ) -> Result<()> {
+            match *self {}
+        }
+        #[allow(clippy::too_many_arguments)]
+        pub(crate) fn attention_ring(
+            &self,
+            _: &VulkanBackend,
+            _: &dyn Buffer,
+            _: &dyn Buffer,
+            _: &dyn Buffer,
+            _: &dyn Buffer,
+            _: usize,
             _: usize,
             _: usize,
             _: usize,

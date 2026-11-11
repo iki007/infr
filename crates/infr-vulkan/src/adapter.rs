@@ -5796,11 +5796,10 @@ fn ze_plan(
     // turns it off): the rest of the layer joins the chain too, so a forward is a few Level Zero
     // chains instead of a hand-off around every GEMM.
     let skinny = be_.cfg().kernels.vulkan.ze_skinny;
-    // A target VERIFY only for now: a DFlash draft block also has 8-row GEMMs, but its block conv
-    // and canvas attention stay on Vulkan, and the hand-offs around them cost more than its GEMMs
-    // save (measured: draft 12 -> 18 ms a cycle).
+    // The target VERIFY, and the graphs a backend caller marks `small_chain` (the DFlash drafter's
+    // block and verify-sized injections).
     let small_graph = skinny
-        && graph.mtp_verify
+        && (graph.mtp_verify || graph.small_chain)
         && graph
             .ops
             .iter()
@@ -5873,6 +5872,46 @@ fn ze_plan(
                 && graph.desc(*v_cache).dtype == DType::F16
                 && graph.desc(*k_cache).numel() / (*n_kv as usize * 256) >= *kv_len as usize
                 && graph.desc(*v_cache).numel() / (*n_kv as usize * 256) >= *kv_len as usize
+                && direct(k_cache)
+                && direct(v_cache)
+        }
+        _ => false,
+    };
+    // The DFlash drafter's block attention (`attn_ring128`): head dim 128, a canvas mask, a ring
+    // cache of a multiple of 32 rows that holds the whole visible span.
+    let attention_ring = |op: &Op| match op {
+        Op::Attention {
+            q,
+            k_cache,
+            v_cache,
+            dst,
+            rows,
+            kv_len,
+            n_head,
+            n_kv,
+            head_dim,
+            mask: AttnMask::Canvas { lo },
+            sinks,
+            key_bias,
+            ..
+        } => {
+            let cap = graph.desc(*k_cache).numel() / (*n_kv as usize * 128).max(1);
+            small_graph
+                && *head_dim == 128
+                && crate::ze::ze_small(*rows as usize, true)
+                && *n_kv > 0
+                && *n_head > 0
+                && n_head % n_kv == 0
+                && sinks.is_none()
+                && key_bias.is_none()
+                && cap.is_multiple_of(32)
+                && graph.desc(*v_cache).numel() == graph.desc(*k_cache).numel()
+                && (*kv_len as usize).saturating_sub(lo & !31) <= cap
+                && *lo <= *kv_len as usize
+                && internal16(q)
+                && arena(dst)
+                && graph.desc(*k_cache).dtype == DType::F16
+                && graph.desc(*v_cache).dtype == DType::F16
                 && direct(k_cache)
                 && direct(v_cache)
         }
@@ -5984,15 +6023,23 @@ fn ze_plan(
                     cache,
                     rows,
                     row_stride,
-                    pos,
+                    ..
                 } => {
+                    // A ring cache (the DFlash drafter's) wraps: the write splits in two.
                     let cap = graph.desc(*cache).numel() / (*row_stride as usize).max(1);
                     graph.desc(*cache).dtype == DType::F16
                         && direct(cache)
                         && (arena(src) || internal16(src))
-                        && (*pos + *rows) as usize <= cap
+                        && *rows as usize <= cap
                 }
-                op => attention_dec(op),
+                Op::BlockConv {
+                    x,
+                    coeff,
+                    base,
+                    dst,
+                    ..
+                } => arena(x) && arena(coeff) && arena(dst) && f32t(base) && exportable(base),
+                op => attention_dec(op) || attention_ring(op),
             }
     };
     let candidate = |i: usize, op: &Op| match op {
@@ -6014,7 +6061,10 @@ fn ze_plan(
     let mut run: Vec<usize> = Vec::new();
     let flush = |run: &mut Vec<usize>, out: &mut std::collections::HashSet<usize>| {
         if run.iter().any(|&i| {
-            gemm(&graph.ops[i]) || attention(&graph.ops[i]) || attention_dec(&graph.ops[i])
+            gemm(&graph.ops[i])
+                || attention(&graph.ops[i])
+                || attention_dec(&graph.ops[i])
+                || attention_ring(&graph.ops[i])
         }) {
             out.extend(run.iter().copied());
         }
@@ -6102,6 +6152,7 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
                 } => vec![*q, *k, *v, *b, *a, *dst],
                 Op::QkNormRope { x, dst, .. } => vec![*x, *dst],
                 Op::WriteKv { src, .. } => vec![*src],
+                Op::BlockConv { x, coeff, dst, .. } => vec![*x, *coeff, *dst],
                 _ => vec![],
             };
             for t in ts {
@@ -6537,23 +6588,33 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
                     row_stride,
                     pos,
                 } => {
-                    use crate::ze::ZArg::{B, I, O};
-                    let n = rows * row_stride;
-                    let kernel = if graph.desc(*src).dtype == DType::F16 {
-                        "copy_f16"
+                    use crate::ze::ZArg::{I, O};
+                    let (rows, rs) = (*rows as usize, *row_stride as usize);
+                    let cap = graph.desc(*cache).numel() / rs.max(1);
+                    let (kernel, eb) = if graph.desc(*src).dtype == DType::F16 {
+                        ("copy_f16", 2)
                     } else {
-                        "store_f16"
+                        ("store_f16", 4)
                     };
-                    bridge.run(
-                        be_,
-                        kernel,
-                        &[
-                            B(r(*src)?),
-                            O(r(*cache)?, (*pos * *row_stride) as usize * 2),
-                            I(n as i32),
-                        ],
-                        [n.div_ceil(256), 1, 1],
-                    )?;
+                    // Row `pos % cap` on; a ring write crossing the end continues at row 0.
+                    let r0 = *pos as usize % cap;
+                    let n1 = rows.min(cap - r0);
+                    for (src_row, dst_row, nr) in [(0, r0, n1), (n1, 0, rows - n1)] {
+                        if nr == 0 {
+                            continue;
+                        }
+                        let n = nr * rs;
+                        bridge.run(
+                            be_,
+                            kernel,
+                            &[
+                                O(r(*src)?, src_row * rs * eb),
+                                O(r(*cache)?, dst_row * rs * 2),
+                                I(n as i32),
+                            ],
+                            [n.div_ceil(256) as u32, 1, 1],
+                        )?;
+                    }
                 }
                 Op::GatedAct {
                     gate,
@@ -6737,20 +6798,72 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
                     n_kv,
                     scale,
                     pos,
+                    mask,
                     ..
-                } if (*rows as usize) <= 16 => {
-                    bridge.attention_dec(
+                } if (*rows as usize) <= 16 => match mask {
+                    // The DFlash drafter's block: canvas mask over a ring cache, head dim 128.
+                    AttnMask::Canvas { lo } => {
+                        let cap = graph.desc(*k_cache).numel() / (*n_kv as usize * 128).max(1);
+                        bridge.attention_ring(
+                            be_,
+                            r(*q)?,
+                            r(*k_cache)?,
+                            r(*v_cache)?,
+                            r(*dst)?,
+                            *rows as usize,
+                            *kv_len as usize,
+                            *n_head as usize,
+                            *n_kv as usize,
+                            *lo,
+                            cap,
+                            *scale,
+                        )?;
+                    }
+                    _ => {
+                        bridge.attention_dec(
+                            be_,
+                            r(*q)?,
+                            r(*k_cache)?,
+                            r(*v_cache)?,
+                            r(*dst)?,
+                            *rows as usize,
+                            *kv_len as usize,
+                            *n_head as usize,
+                            *n_kv as usize,
+                            *pos as usize,
+                            *scale,
+                        )?;
+                    }
+                },
+                Op::BlockConv {
+                    x,
+                    coeff,
+                    base,
+                    dst,
+                    rows,
+                    dim,
+                    group,
+                    kernel,
+                    block,
+                    side,
+                } => {
+                    use crate::ze::ZArg::{B, I};
+                    bridge.run(
                         be_,
-                        r(*q)?,
-                        r(*k_cache)?,
-                        r(*v_cache)?,
-                        r(*dst)?,
-                        *rows as usize,
-                        *kv_len as usize,
-                        *n_head as usize,
-                        *n_kv as usize,
-                        *pos as usize,
-                        *scale,
+                        "block_conv",
+                        &[
+                            B(r(*x)?),
+                            B(r(*coeff)?),
+                            B(r(*base)?),
+                            B(r(*dst)?),
+                            I(*rows as i32),
+                            I(*dim as i32),
+                            I(*group as i32),
+                            I(*kernel as i32),
+                            I(*block as i32),
+                            I(*side as i32),
+                        ],
+                        [(rows * dim).div_ceil(256), 1, 1],
                     )?;
                 }
                 _ => unreachable!("ze_plan holds Level Zero ops only"),

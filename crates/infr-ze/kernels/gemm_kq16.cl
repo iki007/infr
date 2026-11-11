@@ -281,8 +281,8 @@ __kernel void gemm_q3k(__global const half* A, __global const uchar* W, __global
     const int s1 = min(nsb, s0 + per);                                                           \
     const size_t rowb = (size_t)nsb * BLK;                                                       \
     __global const uchar* row[2];                                                                \
-    row[0] = W + (size_t)(n0 + lane) * rowb;                                                     \
-    row[1] = n0 + 16 < N ? row[0] + 16 * rowb : row[0];                                          \
+    row[0] = W + (size_t)min(n0 + lane, N - 1) * rowb;                                           \
+    row[1] = W + (size_t)min(n0 + 16 + lane, N - 1) * rowb;                                      \
     float8 acc[2][2];                                                                            \
     for (int i = 0; i < 2; i++) {                                                                \
         acc[i][0] = 0.0f;                                                                        \

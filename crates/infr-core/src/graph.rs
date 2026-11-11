@@ -1470,6 +1470,11 @@ pub struct Graph {
     /// for prefill by ALSO unlocking it for MTP verify — which is what broke token-identity. See
     /// `infr_vulkan::adapter`'s `mrow_int8_dtype_ok` for the consumer.
     pub mtp_verify: bool,
+    /// A small-batch forward OTHER than the target verify that should still run as one Level Zero
+    /// chain on Intel Xe2 (`infr-vulkan`'s `ze_plan`): the DFlash drafter's block and its
+    /// verify-sized injections. Pure scheduling — no kernel choice that numerics depend on reads
+    /// it. `false` everywhere else.
+    pub small_chain: bool,
     /// Memoized [`Self::in_place_inputs`] — a graph invariant (which KV-cache `Input`s the ops
     /// mutate in place), computed lazily on first query and reused. `execute` calls it PER TOKEN;
     /// without this it re-scanned every op and re-allocated a `HashSet` each call. Interior-mutable

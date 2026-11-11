@@ -302,8 +302,10 @@ inline void gemm_iq4xs_sk(__global const half* A, __global const uchar* W, __glo
     const int s0 = get_group_id(1) * per;
     const int s1 = min(nsb, s0 + per);
     const size_t rowb = (size_t)nsb * BLK;
-    __global const uchar* row0 = W + (size_t)(n0 + lane) * rowb;
-    __global const uchar* row1 = n0 + 16 < N ? row0 + 16 * rowb : row0;
+    // Columns past N (N % 32 != 0: a 48-wide projection, a 98,580-row head) re-read the last row,
+    // and the bounded C write drops them.
+    __global const uchar* row0 = W + (size_t)min(n0 + lane, N - 1) * rowb;
+    __global const uchar* row1 = W + (size_t)min(n0 + 16 + lane, N - 1) * rowb;
     float8 acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     for (int s = s0; s < s1; s++) {
         __global const uchar* blk[2] = {row0 + s * BLK, row1 + s * BLK};
@@ -345,8 +347,8 @@ inline void gemm_iq4nl_sk(__global const half* A, __global const uchar* W, __glo
     const int p1 = min(npair, p0 + per);
     const size_t rowb = (size_t)(K / 32) * 18;
     __global const uchar* rows[2];
-    rows[0] = W + (size_t)(n0 + lane) * rowb;
-    rows[1] = n0 + 16 < N ? rows[0] + 16 * rowb : rows[0];
+    rows[0] = W + (size_t)min(n0 + lane, N - 1) * rowb;
+    rows[1] = W + (size_t)min(n0 + 16 + lane, N - 1) * rowb;
     float8 acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     for (int bp = p0; bp < p1; bp++) {
         __attribute__((opencl_unroll_hint))
@@ -384,8 +386,8 @@ inline void gemm_q8_0_sk(__global const half* A, __global const uchar* W, __glob
     const int p1 = min(npair, p0 + per);
     const size_t rowb = (size_t)(K / 32) * 34;
     __global const uchar* rows[2];
-    rows[0] = W + (size_t)(n0 + lane) * rowb;
-    rows[1] = n0 + 16 < N ? rows[0] + 16 * rowb : rows[0];
+    rows[0] = W + (size_t)min(n0 + lane, N - 1) * rowb;
+    rows[1] = W + (size_t)min(n0 + 16 + lane, N - 1) * rowb;
     float8 acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     for (int bp = p0; bp < p1; bp++) {
         __attribute__((opencl_unroll_hint))
@@ -428,3 +430,19 @@ IQ4_SKINNY(gemm_iq4nl_m8, gemm_iq4nl_sk, 1)
 IQ4_SKINNY(gemm_iq4nl_m16, gemm_iq4nl_sk, 2)
 IQ4_SKINNY(gemm_q8_0_m8, gemm_q8_0_sk, 1)
 IQ4_SKINNY(gemm_q8_0_m16, gemm_q8_0_sk, 2)
+
+// Q4_0 shares IQ4_NL's block layout (f16 d, then 16 bytes: low nibbles = values 0..15, high =
+// 16..31) and differs only in the value table: q - 8 instead of the codebook.
+#define Q4_0_SKINNY(name, mt)                                                                      \
+    __attribute__((intel_reqd_sub_group_size(16)))                                                 \
+    __attribute__((reqd_work_group_size(128, 1, 1)))                                               \
+    __kernel void name(__global const half* A, __global const uchar* W, __global float* C, int M,  \
+                       int N, int K, int nsplit) {                                                 \
+        __local uint lut[256];                                                                     \
+        for (int i = get_local_id(0); i < 256; i += 128)                                           \
+            lut[i] = as_uint((half2)((half)((i & 15) - 8), (half)((i >> 4) - 8)));                 \
+        barrier(CLK_LOCAL_MEM_FENCE);                                                              \
+        gemm_iq4nl_sk(A, W, C, M, N, K, nsplit, mt, lut);                                          \
+    }
+Q4_0_SKINNY(gemm_q4_0_m8, 1)
+Q4_0_SKINNY(gemm_q4_0_m16, 2)

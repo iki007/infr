@@ -250,3 +250,28 @@ __kernel void qk_norm_rope(__global const float* x, __global const float* nw, __
     for (int i = rope_dim + t; i < hd; i += 64)
         y[ob + i] = (half)(xs[i] * scale * nw[i]);
 }
+
+// DFlash2's dynamic two-tap block convolution (`Op::BlockConv`, `block_conv.comp`): per output
+// element, sum over taps of (coeff[t, c/group + G*(tap + kernel*side)] + base[c + dim*(tap +
+// kernel*side)]) * x[t - tap, c], the tap reading zero before its block's first row.
+__kernel void block_conv(__global const float* x, __global const float* coeff,
+                         __global const float* base, __global float* dst, int rows, int dim,
+                         int group, int kernel_, int block, int side) {
+    const int i = get_global_id(0);
+    if (i >= rows * dim)
+        return;
+    const int t = i / dim, c = i - t * dim;
+    const int ng = dim / group;
+    const int cw = 2 * kernel_ * ng;
+    const int taps = min(kernel_, block);
+    const int tb = t % block;
+    float acc = 0.0f;
+    for (int tap = 0; tap < taps; tap++) {
+        if (tb < tap)
+            break;
+        const int k = tap + kernel_ * side;
+        const float w = coeff[t * cw + c / group + ng * k] + base[c + dim * k];
+        acc += w * x[(t - tap) * dim + c];
+    }
+    dst[i] = acc;
+}
