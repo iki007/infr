@@ -245,13 +245,17 @@ impl DflashDrafter {
         let bytes = g.tensor_bytes("d2t").map_err(|e| anyhow!("{e}"))?;
         let d2t: Vec<u32> = match d2t_info.dtype {
             DType::I64 => bytes
-                .chunks_exact(8)
-                .map(|b| i64::from_le_bytes(b.try_into().expect("8 bytes")))
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|b| i64::from_le_bytes(*b))
                 .map(|v| u32::try_from(v).ok().filter(|&t| (t as usize) < hp.vocab))
                 .collect::<Option<_>>(),
             DType::I32 => bytes
-                .chunks_exact(4)
-                .map(|b| i32::from_le_bytes(b.try_into().expect("4 bytes")))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|b| i32::from_le_bytes(*b))
                 .map(|v| u32::try_from(v).ok().filter(|&t| (t as usize) < hp.vocab))
                 .collect::<Option<_>>(),
             dt => bail!("DFlash GGUF: d2t is {dt:?}, expected i64"),
