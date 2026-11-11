@@ -11,8 +11,8 @@
 //!
 //! The math follows llama.cpp's `src/models/dflash.cpp` (`graph<false>`, `build_dflash2_conv`,
 //! `build_dflash2_selector`) and `common/speculative.cpp` (`common_speculative_impl_draft_dflash`).
-//! The target side is [`crate::seam::SeamKv::enable_taps`]; the speculative loop is
-//! [`generate_dflash_spec_core`].
+//! The target side is `crate::seam::SeamKv::enable_taps`; the speculative loop is
+//! `generate_dflash_spec_core`.
 
 use anyhow::{anyhow, bail, ensure, Result};
 use infr_core::backend::{Backend, Bindings, Buffer, BufferUsage};
@@ -979,7 +979,7 @@ fn top_k(row: &[f32], k: usize) -> Vec<usize> {
     best.into_iter().map(|(_, i)| i).collect()
 }
 
-/// Per-run counters of [`generate_dflash_spec_core`] (the prompt prefill excluded).
+/// Per-run counters of `generate_dflash_spec_core` (the prompt prefill excluded).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct DflashTiming {
     pub draft_secs: f64,
@@ -1432,7 +1432,7 @@ pub(crate) fn generate_dflash_spec_vulkan_on(
     )
 }
 
-/// [`generate_dflash_spec_vulkan_on`] on a fresh Vulkan backend and target session.
+/// `generate_dflash_spec_vulkan_on` on a fresh Vulkan backend and target session.
 pub fn generate_dflash_spec_vulkan(
     model: &crate::SeamModel,
     drafter: &std::sync::Arc<DflashDrafter>,
