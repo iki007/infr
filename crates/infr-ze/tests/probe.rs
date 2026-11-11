@@ -602,3 +602,293 @@ fn attn_fa256_probe() {
         flops / med / 1e3
     );
 }
+
+/// The skinny (M <= 16) K-quant GEMMs (`gemm_q4k_m8` / `_m16`, `gemm_q5k_*` + `sum_splits`): host
+/// reference at a small shape with and without split-K, then the verify shapes of Qwen3.8-27B at
+/// m = 8 (kernel time, split-sum included, as weight GB/s).
+fn skinny_probe(fmt: &QFormat, bin: Option<&[u8]>, m8: &str, m16: &str) {
+    let (Some(g), Some(bin), Some(ew)) = (gpu(), bin, infr_ze::kernels::elementwise()) else {
+        eprintln!("skip: no Level Zero GPU or no ocloc kernels");
+        return;
+    };
+    let module = g.module(bin).unwrap();
+    let ewm = g.module(ew).unwrap();
+    let sum = ewm.kernel("sum_splits").unwrap();
+    sum.group_size(256, 1, 1).unwrap();
+    let kern = |name: &str| {
+        let k = module.kernel(name).unwrap();
+        k.group_size(128, 1, 1).unwrap();
+        k
+    };
+    let (k8, k16) = (kern(m8), kern(m16));
+    let mut seed = 5u64;
+    // correctness
+    let (n, k) = (512usize, 1024usize);
+    let wq = random_quant(fmt, n, k, &mut seed);
+    let row_bytes = k / fmt.block_vals * fmt.block_bytes;
+    let wf: Vec<f32> = wq
+        .chunks_exact(row_bytes)
+        .flat_map(|r| infr_gguf::dequant::dequant_block(fmt.dtype, r).unwrap())
+        .collect();
+    let dw = g.alloc(wq.len()).unwrap();
+    g.upload(&dw, &wq).unwrap();
+    for (m, nsplit) in [(8usize, 1usize), (5, 3), (13, 1), (16, 4)] {
+        let kk = if m <= 8 { &k8 } else { &k16 };
+        let a: Vec<f32> = (0..m * k)
+            .map(|_| half::f16::from_f32(lcg(&mut seed)).to_f32())
+            .collect();
+        let (da, dp, dc) = (
+            g.alloc(m * k * 2).unwrap(),
+            g.alloc(nsplit * m * n * 4).unwrap(),
+            g.alloc(m * n * 4).unwrap(),
+        );
+        g.upload(&da, &f16_bytes(&a)).unwrap();
+        kk.arg_buf(0, &da).unwrap();
+        kk.arg_buf(1, &dw).unwrap();
+        kk.arg_buf(2, if nsplit > 1 { &dp } else { &dc }).unwrap();
+        kk.arg(3, m as i32).unwrap();
+        kk.arg(4, n as i32).unwrap();
+        kk.arg(5, k as i32).unwrap();
+        kk.arg(6, nsplit as i32).unwrap();
+        g.launch(kk, [n.div_ceil(256) as u32, nsplit as u32, 1])
+            .unwrap();
+        if nsplit > 1 {
+            sum.arg_buf(0, &dp).unwrap();
+            sum.arg_buf(1, &dc).unwrap();
+            sum.arg(2, (m * n) as i32).unwrap();
+            sum.arg(3, nsplit as i32).unwrap();
+            g.launch(&sum, [(m * n).div_ceil(256) as u32, 1, 1])
+                .unwrap();
+        }
+        let mut out = vec![0u8; m * n * 4];
+        g.download(&dc, &mut out).unwrap();
+        let c: Vec<f32> = out
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|x| f32::from_le_bytes(*x))
+            .collect();
+        let (mut worst, mut big) = (0.0f64, 0.0f64);
+        for r in 0..m {
+            for col in 0..n {
+                let s: f64 = (0..k)
+                    .map(|i| a[r * k + i] as f64 * wf[col * k + i] as f64)
+                    .sum();
+                worst = worst.max((c[r * n + col] as f64 - s).abs());
+                big = big.max(s.abs());
+            }
+        }
+        println!("{m8} m={m} split={nsplit}: worst abs err {worst:.3e} (max |C| {big:.2})");
+        assert!(
+            worst < 2e-3 * big,
+            "{m8} m={m} split={nsplit} mismatch {worst}"
+        );
+    }
+    // timing at the 27B verify shapes
+    for (n, k) in [
+        (17408usize, 5120usize),
+        (5120, 17408),
+        (10240, 5120),
+        (5120, 6144),
+    ] {
+        let m = 8usize;
+        let wq = random_quant(fmt, n, k, &mut seed);
+        let a: Vec<f32> = (0..m * k).map(|_| lcg(&mut seed)).collect();
+        let (da, dw, dp, dc) = (
+            g.alloc(m * k * 2).unwrap(),
+            g.alloc(wq.len()).unwrap(),
+            g.alloc(16 * m * n * 4).unwrap(),
+            g.alloc(m * n * 4).unwrap(),
+        );
+        g.upload(&da, &f16_bytes(&a)).unwrap();
+        g.upload(&dw, &wq).unwrap();
+        let mut line = format!("{m8} m=8 {k}->{n} ({} MiB):", wq.len() >> 20);
+        for nsplit in [1usize, 2, 4, 8] {
+            if k / 256 < nsplit * 2 {
+                continue;
+            }
+            k8.arg_buf(0, &da).unwrap();
+            k8.arg_buf(1, &dw).unwrap();
+            k8.arg_buf(2, if nsplit > 1 { &dp } else { &dc }).unwrap();
+            k8.arg(3, m as i32).unwrap();
+            k8.arg(4, n as i32).unwrap();
+            k8.arg(5, k as i32).unwrap();
+            k8.arg(6, nsplit as i32).unwrap();
+            let mut t = g
+                .time_launches(&k8, [n.div_ceil(256) as u32, nsplit as u32, 1], 50)
+                .unwrap();
+            t.sort_by(|x, y| x.partial_cmp(y).unwrap());
+            let mut med = t[t.len() / 2];
+            if nsplit > 1 {
+                sum.arg_buf(0, &dp).unwrap();
+                sum.arg_buf(1, &dc).unwrap();
+                sum.arg(2, (m * n) as i32).unwrap();
+                sum.arg(3, nsplit as i32).unwrap();
+                let mut ts = g
+                    .time_launches(&sum, [(m * n).div_ceil(256) as u32, 1, 1], 50)
+                    .unwrap();
+                ts.sort_by(|x, y| x.partial_cmp(y).unwrap());
+                med += ts[ts.len() / 2];
+            }
+            line += &format!(
+                "  s{nsplit} {:6.1} us {:4.0} GB/s",
+                med / 1e3,
+                wq.len() as f64 / med
+            );
+        }
+        println!("{line}");
+    }
+}
+
+#[test]
+#[ignore = "requires a Level Zero GPU"]
+fn skinny_q4k_probe() {
+    let fmt = QFormat {
+        name: "gemm_q4k_m8",
+        dtype: infr_core::DType::Q4K,
+        block_bytes: 144,
+        block_vals: 256,
+        f16_fields: &[0, 2],
+        wg_m: 8,
+        wg_n: 256,
+    };
+    skinny_probe(
+        &fmt,
+        infr_ze::kernels::gemm_kquant(),
+        "gemm_q4k_m8",
+        "gemm_q4k_m16",
+    );
+}
+
+#[test]
+#[ignore = "requires a Level Zero GPU"]
+fn skinny_q5k_probe() {
+    let fmt = QFormat {
+        name: "gemm_q5k_m8",
+        dtype: infr_core::DType::Q5K,
+        block_bytes: 176,
+        block_vals: 256,
+        f16_fields: &[0, 2],
+        wg_m: 8,
+        wg_n: 256,
+    };
+    skinny_probe(
+        &fmt,
+        infr_ze::kernels::gemm_kquant(),
+        "gemm_q5k_m8",
+        "gemm_q5k_m16",
+    );
+}
+
+#[test]
+#[ignore = "requires a Level Zero GPU"]
+fn skinny_q6k_probe() {
+    let fmt = QFormat {
+        name: "gemm_q6k_m8",
+        dtype: infr_core::DType::Q6K,
+        block_bytes: 210,
+        block_vals: 256,
+        f16_fields: &[208],
+        wg_m: 8,
+        wg_n: 256,
+    };
+    skinny_probe(
+        &fmt,
+        infr_ze::kernels::gemm_kq16(),
+        "gemm_q6k_m8",
+        "gemm_q6k_m16",
+    );
+}
+
+#[test]
+#[ignore = "requires a Level Zero GPU"]
+fn skinny_q3k_probe() {
+    let fmt = QFormat {
+        name: "gemm_q3k_m8",
+        dtype: infr_core::DType::Q3K,
+        block_bytes: 110,
+        block_vals: 256,
+        f16_fields: &[108],
+        wg_m: 8,
+        wg_n: 256,
+    };
+    skinny_probe(
+        &fmt,
+        infr_ze::kernels::gemm_kq16(),
+        "gemm_q3k_m8",
+        "gemm_q3k_m16",
+    );
+}
+
+#[test]
+#[ignore = "requires a Level Zero GPU"]
+fn skinny_iq4xs_probe() {
+    let fmt = QFormat {
+        name: "gemm_iq4xs_m8",
+        dtype: infr_core::DType::Iq4Xs,
+        block_bytes: 136,
+        block_vals: 256,
+        f16_fields: &[0],
+        wg_m: 8,
+        wg_n: 256,
+    };
+    skinny_probe(
+        &fmt,
+        infr_ze::kernels::gemm_iq4(),
+        "gemm_iq4xs_m8",
+        "gemm_iq4xs_m16",
+    );
+}
+
+#[test]
+#[ignore = "requires a Level Zero GPU"]
+fn skinny_iq4nl_probe() {
+    let fmt = QFormat {
+        name: "gemm_iq4nl_m8",
+        dtype: infr_core::DType::Iq4Nl,
+        block_bytes: 18,
+        block_vals: 32,
+        f16_fields: &[0],
+        wg_m: 8,
+        wg_n: 256,
+    };
+    skinny_probe(
+        &fmt,
+        infr_ze::kernels::gemm_iq4(),
+        "gemm_iq4nl_m8",
+        "gemm_iq4nl_m16",
+    );
+}
+
+/// Host cost of appending a tiny kernel to the immediate command list (what a Level Zero chain pays
+/// per op), then of the device catching up.
+#[test]
+#[ignore = "requires a Level Zero GPU"]
+fn launch_overhead_probe() {
+    let (Some(g), Some(ew)) = (gpu(), infr_ze::kernels::elementwise()) else {
+        eprintln!("skip: no Level Zero GPU or no ocloc kernels");
+        return;
+    };
+    let m = g.module(ew).unwrap();
+    let k = m.kernel("sum_splits").unwrap();
+    k.group_size(256, 1, 1).unwrap();
+    let (p, c) = (g.alloc(4096 * 4).unwrap(), g.alloc(4096 * 4).unwrap());
+    k.arg_buf(0, &p).unwrap();
+    k.arg_buf(1, &c).unwrap();
+    k.arg(2, 4096i32).unwrap();
+    k.arg(3, 1i32).unwrap();
+    for n in [10usize, 200, 1000] {
+        let t0 = std::time::Instant::now();
+        for _ in 0..n {
+            g.launch(&k, [16, 1, 1]).unwrap();
+        }
+        let appended = t0.elapsed();
+        let mut out = vec![0u8; 16];
+        g.download(&c, &mut out).unwrap(); // synchronizes
+        println!(
+            "{n} launches: append {:.1} us each, append+drain {:.1} us each",
+            appended.as_secs_f64() * 1e6 / n as f64,
+            t0.elapsed().as_secs_f64() * 1e6 / n as f64
+        );
+    }
+}

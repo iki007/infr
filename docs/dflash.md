@@ -72,9 +72,11 @@ Each greedy cycle costs about 85 ms:
 | injection | ~2 ms |
 | state select | ~1 ms |
 
-The verify and the drafter are both bound by the 8-row multi-row GEMVs. They run at about
-250–430 GB/s, against about 470 GB/s for single-row decode and 608 GB/s peak. That kernel is the
-next lever, and it would speed up MTP as well.
+The verify and the drafter are both bound by the 8-row multi-row GEMVs, at about 150–250 GB/s.
+llama.cpp SYCL does an 8-token forward of this model in 41.5 ms, against our 69 ms. The Level
+Zero skinny DPAS GEMMs reach 300–520 GB/s at 8 rows, but routed through today's hybrid they lose
+to Vulkan↔Level Zero hand-offs (`docs/level-zero.md` § Skinny GEMMs, opt-in `INFR_ZE_SKINNY=1`).
+The next lever is running whole verify layers on Level Zero; it would lift MTP as well.
 
 The path there:
 

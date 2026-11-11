@@ -243,3 +243,77 @@ __kernel void gemm_q3k(__global const half* A, __global const uchar* W, __global
     }
     EPILOGUE
 }
+
+// ── Skinny GEMMs: M <= 16 rows (see gemm_kquant.cl's `gemm_kq_sk`) ─────────────────────────────
+// The superblock bodies above are reused unchanged: only the A tile (one DPAS row block of 8, or
+// two for 16 rows), the accumulators, the grid (256 columns per workgroup, K split over grid y in
+// superblock PAIRS) and the partial-C write change. `MT` is the row-block count.
+#undef DPAS_K16
+#define DPAS_K16(k, b0, b1)                                                                      \
+    {                                                                                            \
+        short8 a_[2];                                                                            \
+        if (MT == 1) {                                                                           \
+            intel_sub_group_2d_block_read_16b_8r16x1c((__global void*)A, K * 2, M, K * 2,        \
+                                                      (int2)(k, 0), (__private ushort*)&a_[0]);  \
+        } else {                                                                                 \
+            ushort a16_[16];                                                                     \
+            intel_sub_group_2d_block_read_16b_16r16x1c((__global void*)A, K * 2, M, K * 2,       \
+                                                       (int2)(k, 0), a16_);                      \
+            a_[0] = as_short8(vload8(0, a16_));                                                  \
+            a_[1] = as_short8(vload8(1, a16_));                                                  \
+        }                                                                                        \
+        for (int i = 0; i < MT; i++) {                                                           \
+            acc[i][0] = intel_sub_group_f16_f16_matrix_mad_k16(a_[i], b0, acc[i][0]);            \
+            acc[i][1] = intel_sub_group_f16_f16_matrix_mad_k16(a_[i], b1, acc[i][1]);            \
+        }                                                                                        \
+    }
+
+#undef PROLOGUE
+#define PROLOGUE(BLK)                                                                            \
+    const int sg = get_sub_group_id();                                                           \
+    const int lane = get_sub_group_local_id();                                                   \
+    const int n0 = get_group_id(0) * 256 + sg * 32;                                              \
+    if (n0 >= N)                                                                                 \
+        return;                                                                                  \
+    const int nsb = K / QK;                                                                      \
+    const int per = (((nsb + nsplit - 1) / nsplit) + 1) & ~1;                                    \
+    const int s0 = get_group_id(1) * per;                                                        \
+    const int s1 = min(nsb, s0 + per);                                                           \
+    const size_t rowb = (size_t)nsb * BLK;                                                       \
+    __global const uchar* row[2];                                                                \
+    row[0] = W + (size_t)(n0 + lane) * rowb;                                                     \
+    row[1] = row[0] + 16 * rowb;                                                                 \
+    float8 acc[2][2];                                                                            \
+    for (int i = 0; i < 2; i++) {                                                                \
+        acc[i][0] = 0.0f;                                                                        \
+        acc[i][1] = 0.0f;                                                                        \
+    }
+
+#undef EPILOGUE
+#define EPILOGUE                                                                                 \
+    __global float* Cs = C + (size_t)get_group_id(1) * M * N;                                    \
+    for (int i = 0; i < MT; i++) {                                                               \
+        for (int j = 0; j < 2; j++) {                                                            \
+            intel_sub_group_2d_block_write_32b_8r16x1c((__global void*)Cs, N * 4, M, N * 4,      \
+                                                       (int2)(n0 + j * 16, i * 8),               \
+                                                       (__private uint*)&acc[i][j]);             \
+        }                                                                                        \
+    }
+
+#define KQ16_SKINNY(name, BLKB, SB, MT_)                                                         \
+    __attribute__((intel_reqd_sub_group_size(16)))                                               \
+    __attribute__((reqd_work_group_size(128, 1, 1)))                                             \
+    __kernel void name(__global const half* A, __global const uchar* W, __global float* C,     \
+                       int M, int N, int K, int nsplit) {                                        \
+        const int MT = MT_;                                                                      \
+        PROLOGUE(BLKB)                                                                           \
+        for (int s = s0; s < s1; s += 2) {                                                       \
+            SB(s, 0)                                                                             \
+            SB(s + 1, 1)                                                                         \
+        }                                                                                        \
+        EPILOGUE                                                                                 \
+    }
+KQ16_SKINNY(gemm_q6k_m8, 210, Q6K_SB, 1)
+KQ16_SKINNY(gemm_q6k_m16, 210, Q6K_SB, 2)
+KQ16_SKINNY(gemm_q3k_m8, 110, Q3K_SB, 1)
+KQ16_SKINNY(gemm_q3k_m16, 110, Q3K_SB, 2)

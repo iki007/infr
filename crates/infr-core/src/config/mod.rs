@@ -243,6 +243,11 @@ cfg_struct! {
         /// `docs/level-zero.md`), between Vulkan segments. Without Level Zero (or off Xe2) the
         /// Vulkan path runs unchanged.
         ze_gemm: bool = true,
+        /// `INFR_ZE_SKINNY` (opt-in): also run 2..=16-row GEMMs — a speculative verify, a DFlash
+        /// draft block — as Level Zero skinny DPAS kernels. The kernels stream weights ~3x faster
+        /// than Vulkan's multi-row GEMV, but each layer still crosses back to Vulkan for its other
+        /// ops, and those hand-offs cost more than the GEMMs save (`docs/level-zero.md`).
+        ze_skinny: bool = false,
         /// `INFR_NO_I8DOT` (inverted).
         i8_dot: bool = true,
 

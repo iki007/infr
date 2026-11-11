@@ -297,8 +297,48 @@ head). Keeping its bit-identity with `attn_partial` (which MTP verify shares) me
 both together — more keys in flight per subgroup, or a Level Zero flash-decode with the g query
 heads as DPAS rows (whose handoffs the record-once decode replay would then have to carry).
 
+### Skinny GEMMs for speculative verify (2026-11-11, opt-in `INFR_ZE_SKINNY=1`)
+
+A DFlash or MTP verify runs the whole target on 8 rows. Vulkan's int8 multi-row GEMV
+(`native_mmv_mrow`) streams the weights at ~150–250 GB/s there. The 27B's 8-row verify forward
+takes 69 ms against 35 ms for one row; llama.cpp SYCL does pp8 in 41.5 ms (Vulkan 99 ms).
+
+The `gemm_*_m8` / `_m16` kernels (`gemm_kquant.cl`, `gemm_kq16.cl`, `gemm_iq4.cl`) work like this:
+
+- One DPAS row block: a subgroup owns 32 output columns and dequantizes them straight into B
+  operands, the same way the prefill kernels do.
+- K is split 4 ways over grid y, with `sum_splits` adding the partials. Without the split, a
+  5120-wide output is only 160 subgroups.
+
+Kernel time at m=8, weight GB/s (`tests/probe.rs` `skinny_*_probe`, split 4):
+
+| format | 5120→17408 | 17408→5120 | Vulkan mrow, same shape |
+|---|---:|---:|---:|
+| Q4_K | 451 | 517 | ~150 / ~250 |
+| Q5_K | 430 | 511 | |
+| Q6_K | 385 | 456 | |
+| Q3_K | 406 | 421 | |
+| IQ4_XS | 310 | 354 | |
+| IQ4_NL | 273 | 314 | |
+
+**Not on by default.** Routed through the hybrid chain, the 8-row verify gets slower: 85–94 ms
+against 69 ms. The DeltaNet recurrence, conv, norms, attention and the 48-wide beta/alpha
+projections stay on Vulkan, so a forward makes 135 Vulkan↔Level Zero hand-offs. The kernels do not
+explain the gap; the GPU sits idle at each queue switch. Back-to-back Level Zero launches cost
+1.8 µs of host time each, and an appended unmet semaphore wait does not block the host
+(`launch_overhead_probe`, `ze_interop`). A win needs whole layers on Level Zero, so a verify is one
+or two chains.
+
+The Vulkan alternative was tried and dropped. The prefill warp GEMM was built at 16 rows (`BM16`,
+8×16 fragments, `BK128`, split-K) and took 365–580 µs on the Q4_K 5120→17408 shape. That is slower
+than the multi-row GEMV's 333 µs: on ANV, dequant staged through shared memory plus barriers costs
+more than the XMX math saves.
+
 ### Next
 
+- Verify on Level Zero (above): port the remaining per-layer ops of a small-m forward (DeltaNet
+  recurrence and conv, gated norm, QK-norm/RoPE, the KV write, small-m attention) so a verify is
+  one chain. That is the path to SYCL's 41.5 ms for 8 rows, and it lifts DFlash and MTP together.
 - The decode KV read at depth (above), and further prefill attention tuning.
 - IQ4_XS: fewer SLM gathers — e.g. a byte-indexed table (k-pairs `(j, j+16)`, one index per byte)
   with the producer writing A in the matching k order.

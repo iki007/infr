@@ -41,13 +41,37 @@ fn weight_block(dt: DType) -> Option<(usize, usize, usize)> {
     })
 }
 
-/// The shapes the kernels take: N a multiple of their 64-column workgroup tile, K of the format's
-/// block (pair), and a prefill-sized M.
-pub(crate) fn ze_shape(dt: DType, m: usize, in_f: usize, out_f: usize) -> bool {
+/// The shapes the kernels take: K a multiple of the format's block (pair), and either a
+/// prefill-sized M (the tiled GEMMs: N a multiple of their 64-column tile) or a verify-sized one —
+/// 2..=16 rows, a speculative verify or a DFlash draft block (the skinny GEMMs, opt-in with
+/// `skinny`: N a multiple of 32). Single-row decode stays on Vulkan.
+pub(crate) fn ze_shape(dt: DType, m: usize, in_f: usize, out_f: usize, skinny: bool) -> bool {
     weight_block(dt).is_some_and(|(_, _, kmul)| {
-        m >= 256 && out_f.is_multiple_of(64) && in_f.is_multiple_of(kmul)
+        in_f.is_multiple_of(kmul)
+            && ((m >= 256 && out_f.is_multiple_of(64))
+                || (skinny && (2..=SKINNY_MAX_M).contains(&m) && out_f.is_multiple_of(32)))
     })
 }
+
+/// The skinny GEMMs' row cap (two DPAS row blocks).
+const SKINNY_MAX_M: usize = 16;
+
+/// K splits for a skinny GEMM: wide outputs already give every subgroup its own weight rows, a
+/// narrow one (a 5120-wide projection is 160 subgroups) splits K four ways so enough of them stream
+/// at once. Measured on the B70 at m=8: Q4_K 17408->5120 166 us unsplit, 97 us in 4 (517 GB/s).
+fn skinny_splits(dt: DType, in_f: usize, out_f: usize) -> usize {
+    let (vals, _, kmul) = weight_block(dt).expect("ze_shape admitted the dtype");
+    // Split units: superblocks, superblock pairs, or IQ4_NL block pairs.
+    let units = in_f / kmul.max(vals);
+    if out_f >= 32768 || units < 8 {
+        1
+    } else {
+        4
+    }
+}
+
+/// Bytes of the skinny GEMMs' split-K partials buffer: 4 splits of [16, 32768) f32.
+const SKINNY_PARTIALS: usize = 4 * SKINNY_MAX_M * 32768 * 4;
 
 #[cfg(target_os = "linux")]
 mod imp {
@@ -97,6 +121,11 @@ mod imp {
         swiglu: infr_ze::Kernel,
         add: infr_ze::Kernel,
         to_f16: infr_ze::Kernel,
+        /// The skinny (2..=16-row) GEMMs by `(dtype, two row blocks?)`.
+        skinny: HashMap<(DType, bool), infr_ze::Kernel>,
+        sum_splits: infr_ze::Kernel,
+        /// Split-K partials of the skinny GEMMs ([split][M][N] f32), Level Zero-owned.
+        partials: infr_ze::DevBuf,
         /// The Vulkan side of the timeline (signalled by segment submits, waited by the next).
         vk_sem: TpExportSemaphore,
         /// The same timeline imported into Level Zero.
@@ -148,6 +177,20 @@ mod imp {
                 kernel(&ew, "add", 256)?,
                 kernel(&ew, "to_f16", 256)?,
             );
+            let mut skinny = HashMap::new();
+            for (dt, m, base) in [
+                (DType::Q4K, &kq, "gemm_q4k"),
+                (DType::Q5K, &kq, "gemm_q5k"),
+                (DType::Iq4Xs, &iq, "gemm_iq4xs"),
+                (DType::Q6K, &k16, "gemm_q6k"),
+                (DType::Q3K, &k16, "gemm_q3k"),
+                (DType::Iq4Nl, &iq, "gemm_iq4nl"),
+            ] {
+                skinny.insert((dt, false), kernel(m, &format!("{base}_m8"), 128)?);
+                skinny.insert((dt, true), kernel(m, &format!("{base}_m16"), 128)?);
+            }
+            let sum_splits = kernel(&ew, "sum_splits", 256)?;
+            let partials = gpu.alloc(SKINNY_PARTIALS).map_err(|e| e.to_string())?;
             let vk_sem = be_.tp_export_timeline().map_err(|e| e.to_string())?;
             let fd = unsafe { std::os::fd::BorrowedFd::borrow_raw(vk_sem.raw_fd()) }
                 .try_clone_to_owned()
@@ -166,6 +209,9 @@ mod imp {
                 swiglu,
                 add,
                 to_f16,
+                skinny,
+                sum_splits,
+                partials,
                 vk_sem,
                 ze_sem,
                 value: 0,
@@ -226,6 +272,34 @@ mod imp {
             let (w_id, w_base) = g.import(be_, w)?;
             let (c_id, c_off) = g.import(be_, c)?;
             let g = &*g;
+            let e = |r: infr_ze::Result<()>| r.map_err(|e| be(format!("ze gemm: {e}")));
+            if m <= SKINNY_MAX_M {
+                // Skinny: one launch over all rows, K split into partials when N is narrow.
+                let k = &g.skinny[&(dt, m > 8)];
+                let nsplit = skinny_splits(dt, in_f, out_f);
+                e(k.arg_buf_at(0, &g.imports[&a_id], a_off))?;
+                e(k.arg_buf_at(1, &g.imports[&w_id], w_base + w_off_b))?;
+                if nsplit > 1 {
+                    e(k.arg_buf(2, &g.partials))?;
+                } else {
+                    e(k.arg_buf_at(2, &g.imports[&c_id], c_off))?;
+                }
+                e(k.arg(3, m as i32))?;
+                e(k.arg(4, out_f as i32))?;
+                e(k.arg(5, in_f as i32))?;
+                e(k.arg(6, nsplit as i32))?;
+                e(g.gpu
+                    .launch(k, [out_f.div_ceil(256) as u32, nsplit as u32, 1]))?;
+                if nsplit > 1 {
+                    let s = &g.sum_splits;
+                    e(s.arg_buf(0, &g.partials))?;
+                    e(s.arg_buf_at(1, &g.imports[&c_id], c_off))?;
+                    e(s.arg(2, (m * out_f) as i32))?;
+                    e(s.arg(3, nsplit as i32))?;
+                    e(g.gpu.launch(s, [(m * out_f).div_ceil(256) as u32, 1, 1]))?;
+                }
+                return Ok(());
+            }
             let k = match dt {
                 DType::Q4K => &g.q4k,
                 DType::Q5K => &g.q5k,
@@ -234,7 +308,6 @@ mod imp {
                 DType::Q3K => &g.q3k,
                 _ => &g.iq4nl,
             };
-            let e = |r: infr_ze::Result<()>| r.map_err(|e| be(format!("ze gemm: {e}")));
             e(k.arg_buf_at(1, &g.imports[&w_id], w_base + w_off_b))?;
             e(k.arg(4, out_f as i32))?;
             e(k.arg(5, in_f as i32))?;

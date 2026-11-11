@@ -1320,6 +1320,7 @@ fn migrated_keys_are_exactly_the_landed_slices() {
         "INFR_NO_MLA_SG",
         "INFR_ZE_GEMM",
         "INFR_DFLASH",
+        "INFR_ZE_SKINNY",
     ];
 
     let mut got: Vec<&str> = KEYS.iter().filter(|k| k.migrated).map(|k| k.env).collect();

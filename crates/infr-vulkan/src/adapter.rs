@@ -5807,6 +5807,7 @@ fn ze_plan(
                     *m as usize,
                     *in_f as usize,
                     *out_f as usize,
+                    be_.cfg().kernels.vulkan.ze_skinny,
                 )
                 && arena(x)
                 && arena(dst)
@@ -5875,13 +5876,14 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
     let mut ze_a16: Vec<usize> = Vec::new();
     if !ze_ops.is_empty() {
         let mut bytes = 0usize;
-        for op in &graph.ops {
+        for (i, op) in graph.ops.iter().enumerate() {
             if let Op::Linear { m, in_f, .. } = op {
                 let (m, in_f) = (*m as usize, *in_f as usize);
                 // Every `_x256`-sized A copy comes from the arena too (an offloaded Linear may
-                // share its producer's copy with a Vulkan one).
+                // share its producer's copy with a Vulkan one), and so does an offloaded skinny
+                // (verify-sized) Linear's.
                 let a16 = m.div_ceil(256) * 256 * in_f * 2;
-                if m >= 256 && !ze_a16.contains(&a16) {
+                if (m >= 256 || ze_ops.contains(&i)) && !ze_a16.contains(&a16) {
                     ze_a16.push(a16);
                     bytes += a16 + 256;
                 }

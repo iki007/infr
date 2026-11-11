@@ -184,3 +184,117 @@ __kernel void gemm_q5k(__global const half* A, __global const uchar* W, __global
                        int M, int N, int K) {
     gemm_kq(A, W, C, M, N, K, FMT_Q5K);
 }
+
+// ── Skinny GEMM: M <= 16 rows (a speculative verify / a DFlash draft block) ─────────────────────
+// The weight stream is the whole cost here, so the tile is one DPAS row block: a 16-lane subgroup
+// owns 32 output columns (lane l: W rows n0+l and n0+16+l, dequantized straight into DPAS B
+// operands exactly as `gemm_kq`) and the 8 (`mt` = 1) or 16 (`mt` = 2) rows of A. A workgroup is 8
+// subgroups along N (256 columns). Grid y splits K: workgroup row `s` covers superblocks
+// [s*per, (s+1)*per) and writes its partial C to slice `s` of `C` ([nsplit][M][N]) — summed by
+// `sum_splits` when nsplit > 1. Splitting keeps enough subgroups streaming weights when N is small
+// (a 5120-wide projection is only 160 subgroups).
+inline void gemm_kq_sk(__global const half* A, __global const uchar* W, __global float* C, int M,
+                       int N, int K, int nsplit, const int fmt, const int mt) {
+    const int BLK = fmt == FMT_Q5K ? 176 : 144;
+    const int QS = fmt == FMT_Q5K ? 48 : 16;
+    const int sg = get_sub_group_id();
+    const int lane = get_sub_group_local_id();
+    const int n0 = get_group_id(0) * 256 + sg * 32;
+    if (n0 >= N)
+        return;
+    const int nsb = K / QK;
+    const int per = (nsb + nsplit - 1) / nsplit;
+    const int s0 = get_group_id(1) * per;
+    const int s1 = min(nsb, s0 + per);
+    const size_t rowb = (size_t)nsb * BLK;
+    __global const uchar* row0 = W + (size_t)(n0 + lane) * rowb;
+    __global const uchar* row1 = row0 + 16 * rowb;
+
+    float8 acc[2][2];
+    for (int i = 0; i < 2; i++) {
+        acc[i][0] = 0.0f;
+        acc[i][1] = 0.0f;
+    }
+    for (int s = s0; s < s1; s++) {
+        half8 S[2], Mn[2];
+        __global const uchar* blk[2] = {row0 + s * BLK, row1 + s * BLK};
+        uint8 qh[2];
+        if (fmt == FMT_Q5K) {
+            qh[0] = vload8(0, (__global const uint*)(blk[0] + 16));
+            qh[1] = vload8(0, (__global const uint*)(blk[1] + 16));
+        }
+        for (int j = 0; j < 2; j++) {
+            uint4 hd = vload4(0, (__global const uint*)blk[j]);
+            half2 dd = as_half2(hd.s0);
+            uint scl = hd.s1 & 0x3F3F3F3Fu;
+            uint mnl = hd.s2 & 0x3F3F3F3Fu;
+            uint sch = (hd.s3 & 0x0F0F0F0Fu) | ((hd.s1 >> 2) & 0x30303030u);
+            uint mnh = ((hd.s3 >> 4) & 0x0F0F0F0Fu) | ((hd.s2 >> 2) & 0x30303030u);
+            S[j] = convert_half8(as_uchar8((uint2)(scl, sch))) * dd.s0;
+            Mn[j] = convert_half8(as_uchar8((uint2)(mnl, mnh))) * dd.s1;
+        }
+        __attribute__((opencl_unroll_hint))
+        for (int c = 0; c < 4; c++) {
+            uint s2[2][2], m2[2][2];
+            for (int j = 0; j < 2; j++) {
+                for (int h = 0; h < 2; h++) {
+                    s2[j][h] = as_uint((half2)(S[j][2 * c + h]));
+                    m2[j][h] = as_uint((half2)(-Mn[j][2 * c + h]));
+                }
+            }
+            uint8 q[2];
+            q[0] = vload8(0, (__global const uint*)(blk[0] + QS + c * 32));
+            q[1] = vload8(0, (__global const uint*)(blk[1] + QS + c * 32));
+            __attribute__((opencl_unroll_hint))
+            for (int kb = 0; kb < 4; kb++) {
+                const int k = s * QK + c * 64 + kb * 16;
+                short8 a[2];
+                if (mt == 1) {
+                    intel_sub_group_2d_block_read_16b_8r16x1c(
+                        (__global void*)A, K * 2, M, K * 2, (int2)(k, 0), (__private ushort*)&a[0]);
+                } else {
+                    ushort a16[16];
+                    intel_sub_group_2d_block_read_16b_16r16x1c(
+                        (__global void*)A, K * 2, M, K * 2, (int2)(k, 0), a16);
+                    a[0] = as_short8(vload8(0, a16));
+                    a[1] = as_short8(vload8(1, a16));
+                }
+                int8 b[2];
+                for (int j = 0; j < 2; j++) {
+                    uint4 w = (kb & 1) ? q[j].s4567 : q[j].s0123;
+                    uint4 nib = (kb & 2) ? ((w >> 4) & 0x0F0F0F0Fu) : (w & 0x0F0F0F0Fu);
+                    if (fmt == FMT_Q5K) {
+                        const int sb = 2 * c + (kb >> 1);
+                        uint4 hw = (kb & 1) ? qh[j].s4567 : qh[j].s0123;
+                        nib |= ((hw >> sb) & 0x01010101u) << 4;
+                    }
+                    b[j] = deq_b(nib, s2[j][kb >> 1], m2[j][kb >> 1]);
+                }
+                for (int i = 0; i < mt; i++) {
+                    acc[i][0] = intel_sub_group_f16_f16_matrix_mad_k16(a[i], b[0], acc[i][0]);
+                    acc[i][1] = intel_sub_group_f16_f16_matrix_mad_k16(a[i], b[1], acc[i][1]);
+                }
+            }
+        }
+    }
+    __global float* Cs = C + (size_t)get_group_id(1) * M * N;
+    for (int i = 0; i < mt; i++) {
+        for (int j = 0; j < 2; j++) {
+            intel_sub_group_2d_block_write_32b_8r16x1c((__global void*)Cs, N * 4, M, N * 4,
+                                                       (int2)(n0 + j * 16, i * 8),
+                                                       (__private uint*)&acc[i][j]);
+        }
+    }
+}
+
+#define SKINNY(name, fmt, mt)                                                                      \
+    __attribute__((intel_reqd_sub_group_size(16)))                                                 \
+    __attribute__((reqd_work_group_size(128, 1, 1)))                                               \
+    __kernel void name(__global const half* A, __global const uchar* W, __global float* C, int M,  \
+                       int N, int K, int nsplit) {                                                 \
+        gemm_kq_sk(A, W, C, M, N, K, nsplit, fmt, mt);                                             \
+    }
+SKINNY(gemm_q4k_m8, FMT_Q4K, 1)
+SKINNY(gemm_q4k_m16, FMT_Q4K, 2)
+SKINNY(gemm_q5k_m8, FMT_Q5K, 1)
+SKINNY(gemm_q5k_m16, FMT_Q5K, 2)

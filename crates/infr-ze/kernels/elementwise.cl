@@ -58,3 +58,15 @@ __kernel void to_f16(__global const float* x, __global half* y, int n) {
     if (i < (size_t)n)
         y[i] = (half)x[i];
 }
+
+// C[i] = sum over the `nsplit` K-split partials P[s][i] (the skinny GEMMs' second pass), in split
+// order — deterministic, unlike float atomics.
+__kernel void sum_splits(__global const float* P, __global float* C, int n, int nsplit) {
+    const int i = get_global_id(0);
+    if (i >= n)
+        return;
+    float s = 0.0f;
+    for (int k = 0; k < nsplit; k++)
+        s += P[(size_t)k * n + i];
+    C[i] = s;
+}

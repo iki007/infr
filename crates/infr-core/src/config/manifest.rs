@@ -171,6 +171,7 @@ knobs! {
     "INFR_I8_ROW_SCALE" => "kernels.vulkan.i8_row_scale", Presence,    Ignored, "1", migrated;
     "INFR_NO_F16"       => "kernels.vulkan.f16",          PresenceInv, Ignored, "1", migrated;
     "INFR_ZE_GEMM"      => "kernels.vulkan.ze_gemm",      Flag,        Ignored, "0", migrated;
+    "INFR_ZE_SKINNY"    => "kernels.vulkan.ze_skinny",    Presence,    Ignored, "1", migrated;
     "INFR_NO_I8DOT"     => "kernels.vulkan.i8_dot",       PresenceInv, Ignored, "1", migrated;
 
     // ── kernels.vulkan — GEMM / GEMV tiers ───────────────────────────────────
