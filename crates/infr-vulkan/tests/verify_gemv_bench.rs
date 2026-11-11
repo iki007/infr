@@ -2,6 +2,7 @@
 //! multi-row GEMV (`mrow`) at m = 1, 4, 8, as weight GB/s. An m=8 verify should stream the weights
 //! once, like m=1; the gap between the two columns is the verify's excess cost.
 //! Run: INFR_DEV=Vulkan1 cargo test --release -p infr-vulkan --test verify_gemv_bench -- --ignored --nocapture
+#[allow(dead_code)] // this bench uses only part of the shared helpers
 mod bench_support;
 
 use infr_core::backend::{Backend, BufferUsage};
