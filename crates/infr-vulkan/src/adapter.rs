@@ -2371,6 +2371,34 @@ fn lower_op(
         }
         // Batched strided copy = `rows` buffer-copy regions (cheap vkCmdCopyBuffer). Splits a
         // batched interleaved buffer (conv q|k|v) into packed per-row slices.
+        Op::BlockConv {
+            x,
+            coeff,
+            base,
+            dst,
+            rows,
+            dim,
+            group,
+            kernel,
+            block,
+            side,
+        } => {
+            if graph.desc(*base).dtype != infr_core::DType::F32 {
+                return Err(be("vulkan adapter: Op::BlockConv needs an f32 base weight"));
+            }
+            rec.block_conv(
+                r(*x)?,
+                r(*coeff)?,
+                r(*base)?,
+                r(*dst)?,
+                *rows as usize,
+                *dim as usize,
+                *group as usize,
+                *kernel as usize,
+                *block as usize,
+                *side as usize,
+            );
+        }
         Op::CopyStrided {
             src,
             src_off,
@@ -4070,7 +4098,32 @@ fn lower_op(
             head_v,
             eps,
             src_stride,
+            hist,
         } => {
+            // Speculative-verify state history: the token-serial kernel, which writes the state
+            // after every token (the chunked forms only materialize it at chunk ends).
+            if let Some(hist) = hist {
+                rec.deltanet_hist(
+                    r(*q)?,
+                    r(*k)?,
+                    r(*v)?,
+                    r(*b)?,
+                    r(*a)?,
+                    r(*a_coef)?,
+                    r(*dt_bias)?,
+                    r(*state)?,
+                    r(*dst)?,
+                    r(*hist)?,
+                    *rows as usize,
+                    *n_vhead as usize,
+                    *n_khead as usize,
+                    *head_k as usize,
+                    *head_v as usize,
+                    *eps,
+                    *src_stride as usize,
+                );
+                return Ok(());
+            }
             // Prefill AND multi-row batches (rows ≥ 2): the chunkwise delta rule processes up to 32
             // tokens per state traversal (matmuls + a triangular solve) instead of the token-serial
             // recurrence — the difference between rows and ⌈rows/32⌉ sequential state sweeps. The

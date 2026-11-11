@@ -225,8 +225,9 @@ and these exist to force one off when bisecting a correctness or perf problem.
   `INFR_*` twin and never had one).
 
 **`[spec]`** — MTP / speculative decode: `mtp`, `k`, `decode_chain`, `draft` (a
-draft-model path), the GPU-side sampling steps (`gpu_argmax`, `gpu_sample`,
-`gpu_embed`, …). MTP is currently parked; see the README.
+draft-model path), `dflash` (a DFlash2 drafter GGUF — see [dflash.md](dflash.md)),
+the GPU-side sampling steps (`gpu_argmax`, `gpu_sample`, `gpu_embed`, …). MTP is
+currently parked; see the README.
 
 **`[multi]`** — multi-GPU splits: `pipeline`, `tensor_parallel` (both need ≥ 2
 devices) and `expert_parallel` (≥ 1); too few devices is a hard error. The three

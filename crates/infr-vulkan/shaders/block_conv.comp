@@ -1,0 +1,41 @@
+#version 460
+// DFlash2 dynamic two-tap block convolution (Op::BlockConv — see its doc in infr-core's graph.rs and
+// `build_dflash2_conv` in llama.cpp's src/models/dflash.cpp):
+//
+//   dst[t, c] = sum_{tap < min(kernel, block), t % block >= tap}
+//       (coeff[t, c/group + G*(tap + kernel*side)] + base[c + dim*(tap + kernel*side)]) * x[t-tap, c]
+//
+// One thread per output element; the drafter runs it on an 8-row block, so it is a few microseconds
+// of elementwise work.
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+layout(push_constant) uniform PC {
+    uint rows;
+    uint dim;
+    uint group;
+    uint kernel;
+    uint block;
+    uint side;
+} pc;
+layout(binding = 0) readonly buffer XB { float x[]; };
+layout(binding = 1) readonly buffer CB { float coeff[]; };
+layout(binding = 2) readonly buffer BB { float base[]; };
+layout(binding = 3) writeonly buffer DB { float dst[]; };
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.rows * pc.dim) { return; }
+    uint t = i / pc.dim;
+    uint c = i - t * pc.dim;
+    uint ng = pc.dim / pc.group;
+    uint cw = 2u * pc.kernel * ng;
+    uint taps = min(pc.kernel, pc.block);
+    uint tb = t % pc.block;
+    float acc = 0.0;
+    for (uint tap = 0u; tap < taps; tap++) {
+        if (tb < tap) { break; }
+        uint k = tap + pc.kernel * pc.side;
+        float w = coeff[t * cw + c / pc.group + ng * k] + base[c + pc.dim * k];
+        acc += w * x[(t - tap) * pc.dim + c];
+    }
+    dst[i] = acc;
+}

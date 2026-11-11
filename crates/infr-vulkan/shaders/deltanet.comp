@@ -51,6 +51,11 @@ layout(binding = 5) readonly buffer ACB { float acoef[]; };   // [nv]  (ssm_a we
 layout(binding = 6) readonly buffer DTB { float dtbias[]; };  // [nv]
 layout(binding = 7) buffer SB { float state[]; };             // [nv*kd*vd] in/out
 layout(binding = 8) writeonly buffer OB { float outp[]; };    // [rows, nv*vd]
+#ifdef HIST
+// Speculative-verify state history (Op::DeltaNet::hist): the state after each token,
+// [rows, nv*kd*vd], so the caller can roll back to any accepted prefix without re-running it.
+layout(binding = 9) writeonly buffer HB { float hist[]; };
+#endif
 
 shared float qn[128];             // normalized q for the current token (kd ≤ 128)
 shared float kn[128];             // normalized k
@@ -151,6 +156,17 @@ void main() {
             }
             outp[vbase + d] = o;
         }
+#ifdef HIST
+        {
+            uint hbase = tk * pc.nv * pc.kd * pc.vd + sbase;
+            [[unroll]] for (uint r = 0u; r < RPG_MAX; r++) {
+                uint kk = k0 + r;
+                if (live && r < rpg && kk < pc.kd) {
+                    hist[hbase + kk * pc.vd + d] = sreg[r];
+                }
+            }
+        }
+#endif
         // The next token's first shared write (sq) comes after this token's last sq read; its
         // qn/kn, pkv and po writes each sit behind a barrier every reader here has passed.
     }

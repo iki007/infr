@@ -2237,6 +2237,46 @@ impl Backend for CpuBackend {
                         d[dof..dof + n].copy_from_slice(&s[so..so + n]);
                     }
                 }
+                Op::BlockConv {
+                    x,
+                    coeff,
+                    base,
+                    dst,
+                    rows,
+                    dim,
+                    group,
+                    kernel,
+                    block,
+                    side,
+                } => {
+                    let (rows, dim, group, kernel, block, side) = (
+                        rows as usize,
+                        dim as usize,
+                        group as usize,
+                        kernel as usize,
+                        block as usize,
+                        side as usize,
+                    );
+                    let ng = dim / group;
+                    let cw = 2 * kernel * ng;
+                    let xs = &vals[x.0 as usize];
+                    let cs = &vals[coeff.0 as usize];
+                    let bs = weight(base);
+                    let mut out = vec![0f32; rows * dim];
+                    for t in 0..rows {
+                        for tap in 0..kernel.min(block) {
+                            if t % block < tap {
+                                continue;
+                            }
+                            let k = tap + kernel * side;
+                            for c in 0..dim {
+                                let w = cs[t * cw + c / group + ng * k] + bs[c + dim * k];
+                                out[t * dim + c] += w * xs[(t - tap) * dim + c];
+                            }
+                        }
+                    }
+                    vals[dst.0 as usize] = out;
+                }
                 Op::CopyStrided {
                     src,
                     src_off,
@@ -3061,7 +3101,7 @@ impl Backend for CpuBackend {
                     head_v,
                     eps,
                     src_stride,
-                    ..
+                    hist,
                 } => {
                     let (rr, nv, nk, kd, vd) = (
                         rows as usize,
@@ -3100,28 +3140,62 @@ impl Backend for CpuBackend {
                     let af = vals[a.0 as usize].clone();
                     let acoef = weight(a_coef);
                     let dtb = weight(dt_bias);
-                    let st = &mut vals[state.0 as usize]; // [nv, kd, vd]
-                                                          // The token scan is inherently sequential (state S carries across tokens), but
-                                                          // value heads are fully independent — parallelize the per-head t-scan (see
-                                                          // `deltanet_scan`). Bit-identical to the old serial nest: same float ops, order.
-                    let out = deltanet_scan(
-                        self.pool(),
-                        &qf,
-                        &kf,
-                        &vf,
-                        &bf,
-                        &af,
-                        &acoef,
-                        &dtb,
-                        st,
-                        rr,
-                        nv,
-                        nk,
-                        kd,
-                        vd,
-                        eps,
-                    );
-                    vals[dst.0 as usize] = out;
+                    // Per-row state history (speculative verify): run the scan one row at a time —
+                    // the recurrence is per-token sequential anyway, so this is bit-identical — and
+                    // record the state after each row.
+                    if let Some(hist) = hist {
+                        let sn = nv * kd * vd;
+                        let mut out = vec![0f32; rr * nv * vd];
+                        let mut hv = vec![0f32; rr * sn];
+                        for t in 0..rr {
+                            let st = &mut vals[state.0 as usize];
+                            let o = deltanet_scan(
+                                self.pool(),
+                                &qf[t * nk * kd..(t + 1) * nk * kd],
+                                &kf[t * nk * kd..(t + 1) * nk * kd],
+                                &vf[t * nv * vd..(t + 1) * nv * vd],
+                                &bf[t * nv..(t + 1) * nv],
+                                &af[t * nv..(t + 1) * nv],
+                                &acoef,
+                                &dtb,
+                                st,
+                                1,
+                                nv,
+                                nk,
+                                kd,
+                                vd,
+                                eps,
+                            );
+                            out[t * nv * vd..(t + 1) * nv * vd].copy_from_slice(&o);
+                            hv[t * sn..(t + 1) * sn].copy_from_slice(&st[..sn]);
+                        }
+                        vals[dst.0 as usize] = out;
+                        let h = &mut vals[hist.0 as usize];
+                        h[..rr * sn].copy_from_slice(&hv);
+                    } else {
+                        let st = &mut vals[state.0 as usize]; // [nv, kd, vd]
+                                                              // The token scan is inherently sequential (state S carries across tokens), but
+                                                              // value heads are fully independent — parallelize the per-head t-scan (see
+                                                              // `deltanet_scan`). Bit-identical to the old serial nest: same float ops, order.
+                        let out = deltanet_scan(
+                            self.pool(),
+                            &qf,
+                            &kf,
+                            &vf,
+                            &bf,
+                            &af,
+                            &acoef,
+                            &dtb,
+                            st,
+                            rr,
+                            nv,
+                            nk,
+                            kd,
+                            vd,
+                            eps,
+                        );
+                        vals[dst.0 as usize] = out;
+                    }
                 }
                 Op::Mla {
                     q,

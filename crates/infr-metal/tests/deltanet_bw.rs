@@ -53,6 +53,7 @@ fn deltanet_layer_wall() {
             head_v: vd as u32,
             eps: 1e-6,
             src_stride: 0,
+            hist: None,
         });
         let bound = vec![
             (q, randv(rows * nk * kd, 1)),

@@ -66,6 +66,10 @@ at that index. It holds:
 - [mtp.md](mtp.md) — multi-token prediction (MTP) speculative decoding for
   qwen35's single NextN head (issue #33). Built, then **parked**: `INFR_MTP=1`
   is ignored; the doc says why and keeps the design record.
+- [dflash.md](dflash.md) — DFlash2 block-diffusion speculative decoding
+  (`INFR_DFLASH=<drafter.gguf>`): target-layer taps, drafter injection, the
+  selector lattice, and the per-row DeltaNet state history that makes rollback a
+  single copy. 1.4× plain decode on Qwen3.8-27B (B70).
 - [deepseek.md](deepseek.md) — the DeepSeek family port plan (V1 → V2/V3 → V3.2
   → V4), staged around the fact that only the first two stages have a model
   small enough to develop against. V2/V3 (`deepseek2`) and V3.2 (`deepseek32`)

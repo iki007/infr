@@ -665,6 +665,7 @@ fn deltanet_chunked_parity() {
         head_v: vd as u32,
         eps: 1e-6,
         src_stride: 0,
+        hist: None,
     });
     let (qi, ki, vi) = (
         gen(rows * nk * kd, 1),
@@ -730,6 +731,7 @@ fn deltanet_parity() {
         head_v: vd as u32,
         eps: 1e-6,
         src_stride: 0,
+        hist: None,
     });
     let (qi, ki, vi) = (
         gen(rows * nk * kd, 1),
@@ -6087,5 +6089,160 @@ fn compress_pool_all_neg_inf_window_is_zero() {
             e < CP_TOL,
             "{be}: the sentinel blocks disturbed the neighbouring block's average ({e:e})"
         );
+    }
+}
+
+/// `Op::DeltaNet::hist` (the speculative-verify state history, `docs/dflash.md`): CPU and Vulkan
+/// agree on every row's recorded state, and recording it does not change the op's output — the
+/// history kernel is the plain one plus stores.
+#[test]
+#[ignore = "requires a Vulkan GPU"]
+fn deltanet_hist_parity() {
+    let Some(vk) = gpu() else {
+        return;
+    };
+    let cpu = infr_cpu::CpuBackend::new();
+    let (rows, nv, nk, kd, vd) = (5usize, 4usize, 2usize, 32usize, 32usize);
+    let sn = nv * kd * vd;
+    // `want_hist`: the graph outputs the history (dst internal) instead of dst.
+    let build = |with_hist: bool, want_hist: bool| {
+        let mut g = Graph::new();
+        // A speculative VERIFY graph: the one place a history is recorded, and where Vulkan runs
+        // the token-serial kernel with or without it (ordinary multi-row graphs go chunked).
+        g.mtp_verify = true;
+        let q = g.input(f32d(rows * nk * kd));
+        let k = g.input(f32d(rows * nk * kd));
+        let v = g.input(f32d(rows * nv * vd));
+        let b = g.input(f32d(rows * nv));
+        let a = g.input(f32d(rows * nv));
+        let a_coef = g.weight(f32d(nv));
+        let dt_bias = g.weight(f32d(nv));
+        let state = g.input(f32d(sn));
+        let dst = if want_hist {
+            g.internal(f32d(rows * nv * vd))
+        } else {
+            g.output(f32d(rows * nv * vd))
+        };
+        let hist = with_hist.then(|| {
+            if want_hist {
+                g.output(f32d(rows * sn))
+            } else {
+                g.internal(f32d(rows * sn))
+            }
+        });
+        g.push(Op::DeltaNet {
+            q,
+            k,
+            v,
+            b,
+            a,
+            a_coef,
+            dt_bias,
+            state,
+            dst,
+            rows: rows as u32,
+            n_vhead: nv as u32,
+            n_khead: nk as u32,
+            head_k: kd as u32,
+            head_v: vd as u32,
+            eps: 1e-6,
+            src_stride: 0,
+            hist,
+        });
+        (g, [q, k, v, b, a, state], [a_coef, dt_bias], dst, hist)
+    };
+    let data = [
+        gen(rows * nk * kd, 1),
+        gen(rows * nk * kd, 2),
+        gen(rows * nv * vd, 3),
+        gen(rows * nv, 4),
+        gen(rows * nv, 5),
+        gen(sn, 6),
+    ];
+    let wdata = [gen(nv, 8), gen(nv, 9)];
+    let go = |be: &dyn Backend, with_hist: bool, want_hist: bool| {
+        let (g, ins, ws, dst, hist) = build(with_hist, want_hist);
+        let ins: Vec<(TensorId, &[f32])> =
+            ins.iter().zip(&data).map(|(&i, d)| (i, &d[..])).collect();
+        let ws: Vec<(TensorId, &[f32])> =
+            ws.iter().zip(&wdata).map(|(&i, d)| (i, &d[..])).collect();
+        if want_hist {
+            run(be, &g, &ins, &ws, hist.unwrap(), rows * sn)
+        } else {
+            run(be, &g, &ins, &ws, dst, rows * nv * vd)
+        }
+    };
+    for (name, be) in [
+        ("cpu", &cpu as &dyn Backend),
+        ("vulkan", &vk as &dyn Backend),
+    ] {
+        assert_eq!(
+            go(be, false, false),
+            go(be, true, false),
+            "{name}: recording the history changed DeltaNet's output"
+        );
+    }
+    let (hc, hv) = (go(&cpu, true, true), go(&vk, true, true));
+    assert!(
+        maxerr(&hc, &hv) < 1e-3,
+        "DeltaNet history diverges: {:e}",
+        maxerr(&hc, &hv)
+    );
+    // Row r's state differs from row r-1's (the history really advances per row).
+    assert!(maxerr(&hc[..sn], &hc[sn..2 * sn]) > 0.0);
+}
+
+/// `Op::BlockConv` (DFlash2's dynamic two-tap block convolution) on CPU and Vulkan against a
+/// direct transcription of llama.cpp's `build_dflash2_conv`.
+#[test]
+#[ignore = "requires a Vulkan GPU"]
+fn block_conv_parity() {
+    let Some(vk) = gpu() else {
+        return;
+    };
+    let cpu = infr_cpu::CpuBackend::new();
+    let (rows, dim, group, kernel, block) = (16usize, 64usize, 16usize, 2usize, 8usize);
+    let ng = dim / group;
+    let cw = 2 * kernel * ng;
+    let x = gen(rows * dim, 1);
+    let coeff = gen(rows * cw, 2);
+    let base = gen(dim * kernel * 2, 3);
+    for side in 0..2usize {
+        let mut g = Graph::new();
+        let xi = g.input(f32d(rows * dim));
+        let ci = g.input(f32d(rows * cw));
+        let bi = g.weight(f32d(dim * kernel * 2));
+        let dst = g.output(f32d(rows * dim));
+        g.push(Op::BlockConv {
+            x: xi,
+            coeff: ci,
+            base: bi,
+            dst,
+            rows: rows as u32,
+            dim: dim as u32,
+            group: group as u32,
+            kernel: kernel as u32,
+            block: block as u32,
+            side: side as u32,
+        });
+        let mut want = vec![0f32; rows * dim];
+        for t in 0..rows {
+            for c in 0..dim {
+                for tap in 0..kernel.min(block) {
+                    if t % block < tap {
+                        continue;
+                    }
+                    let k = tap + kernel * side;
+                    let w = coeff[t * cw + c / group + ng * k] + base[c + dim * k];
+                    want[t * dim + c] += w * x[(t - tap) * dim + c];
+                }
+            }
+        }
+        let ins = [(xi, &x[..]), (ci, &coeff[..])];
+        let ws = [(bi, &base[..])];
+        let c = run(&cpu, &g, &ins, &ws, dst, rows * dim);
+        let v = run(&vk, &g, &ins, &ws, dst, rows * dim);
+        assert!(maxerr(&c, &want) < 1e-5, "cpu BlockConv side {side}");
+        assert!(maxerr(&v, &want) < 1e-5, "vulkan BlockConv side {side}");
     }
 }

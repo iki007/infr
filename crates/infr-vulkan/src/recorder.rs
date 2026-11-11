@@ -8219,7 +8219,52 @@ impl<'a> Recorder<'a> {
         eps: f32,
     ) {
         self.deltanet_impl(
-            q, k, v, blog, alpha, acoef, dtbias, state, out, rows, nv, nk, kd, vd, eps, 0,
+            q, k, v, blog, alpha, acoef, dtbias, state, out, rows, nv, nk, kd, vd, eps, 0, None,
+        );
+    }
+
+    /// [`Self::deltanet`] (packed, or strided when `src_stride > 0`) that ALSO writes the state
+    /// after every token to `hist` (`[rows, nv*kd*vd]`) — `Op::DeltaNet::hist`, the speculative
+    /// verify's rollback record. Same per-token arithmetic as the plain kernel.
+    #[allow(clippy::too_many_arguments)]
+    pub fn deltanet_hist(
+        &self,
+        q: &dyn Buffer,
+        k: &dyn Buffer,
+        v: &dyn Buffer,
+        blog: &dyn Buffer,
+        alpha: &dyn Buffer,
+        acoef: &dyn Buffer,
+        dtbias: &dyn Buffer,
+        state: &dyn Buffer,
+        out: &dyn Buffer,
+        hist: &dyn Buffer,
+        rows: usize,
+        nv: usize,
+        nk: usize,
+        kd: usize,
+        vd: usize,
+        eps: f32,
+        src_stride: usize,
+    ) {
+        self.deltanet_impl(
+            q,
+            k,
+            v,
+            blog,
+            alpha,
+            acoef,
+            dtbias,
+            state,
+            out,
+            rows,
+            nv,
+            nk,
+            kd,
+            vd,
+            eps,
+            src_stride,
+            Some(hist),
         );
     }
 
@@ -8245,6 +8290,7 @@ impl<'a> Recorder<'a> {
         vd: usize,
         eps: f32,
         src_stride: usize,
+        hist: Option<&dyn Buffer>,
     ) {
         // The shader keeps each thread's kd/8 state rows in a 16-entry register array and the
         // normalized q/k in `qn[128]`/`kn[128]`, so kd must be ≤ 128. qwen35 uses kd=128; assert so
@@ -8253,9 +8299,14 @@ impl<'a> Recorder<'a> {
             kd <= 128,
             "deltanet register/shared layout assumes kd ≤ 128, got {kd}"
         );
-        let kern = self
-            .be
-            .kernel("deltanet", crate::gemm::deltanet_spv(), 9, 32);
+        let kern = match hist {
+            Some(_) => self
+                .be
+                .kernel("deltanet_hist", crate::gemm::deltanet_hist_spv(), 10, 32),
+            None => self
+                .be
+                .kernel("deltanet", crate::gemm::deltanet_spv(), 9, 32),
+        };
         let mut push = [0u8; 32];
         push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(nv as u32).to_ne_bytes());
@@ -8268,20 +8319,23 @@ impl<'a> Recorder<'a> {
         // One workgroup per (value head, block of 16 state columns); local_size_x=128 (16 columns
         // × 8 key-row groups — see the shader header).
         let n_blk = vd.div_ceil(16);
+        let mut binds = vec![
+            Self::vkb(q),
+            Self::vkb(k),
+            Self::vkb(v),
+            Self::vkb(blog),
+            Self::vkb(alpha),
+            Self::vkb(acoef),
+            Self::vkb(dtbias),
+            Self::vkb(state),
+            Self::vkb(out),
+        ];
+        binds.extend(hist.map(Self::vkb));
         self.dispatch(
             kern,
-            &[
-                Self::vkb(q),
-                Self::vkb(k),
-                Self::vkb(v),
-                Self::vkb(blog),
-                Self::vkb(alpha),
-                Self::vkb(acoef),
-                Self::vkb(dtbias),
-                Self::vkb(state),
-                Self::vkb(out),
-            ],
-            2, // state (in/out) + out
+            &binds,
+            // state (in/out) + out (+ hist)
+            if hist.is_some() { 3 } else { 2 },
             &push,
             (nv * n_blk) as u32,
         );
@@ -8312,6 +8366,7 @@ impl<'a> Recorder<'a> {
     ) {
         self.deltanet_impl(
             q, k, v, blog, alpha, acoef, dtbias, state, out, rows, nv, nk, kd, vd, eps, src_stride,
+            None,
         );
     }
 
@@ -8786,6 +8841,43 @@ impl<'a> Recorder<'a> {
             1,
             &push,
             ((rows * nw) as u32).div_ceil(256),
+        );
+    }
+
+    /// DFlash2 dynamic two-tap block convolution (`block_conv.comp`, `Op::BlockConv`). One thread
+    /// per output element.
+    #[allow(clippy::too_many_arguments)]
+    pub fn block_conv(
+        &self,
+        x: &dyn Buffer,
+        coeff: &dyn Buffer,
+        base: &dyn Buffer,
+        dst: &dyn Buffer,
+        rows: usize,
+        dim: usize,
+        group: usize,
+        kernel: usize,
+        block: usize,
+        side: usize,
+    ) {
+        let kern = self
+            .be
+            .kernel("block_conv", crate::gemm::block_conv_spv(), 4, 24);
+        let mut push = [0u8; 24];
+        for (i, v) in [rows, dim, group, kernel, block, side].iter().enumerate() {
+            push[i * 4..i * 4 + 4].copy_from_slice(&(*v as u32).to_ne_bytes());
+        }
+        self.dispatch(
+            kern,
+            &[
+                Self::vkb(x),
+                Self::vkb(coeff),
+                Self::vkb(base),
+                Self::vkb(dst),
+            ],
+            1,
+            &push,
+            ((rows * dim) as u32).div_ceil(256),
         );
     }
 

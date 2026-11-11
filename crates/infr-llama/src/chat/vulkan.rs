@@ -33,6 +33,13 @@ pub struct DenseSeamChat {
     /// chat or `serve` turn does not re-upload the whole trunk (~15 GB / ~12 s on Qwen3.8-27B);
     /// the driver resets its token cache each call. MTP mode never builds the plain `session`.
     mtp_trunk: Option<crate::seam::SeamKv>,
+    /// DFlash mode (`INFR_DFLASH=<drafter.gguf>`, `docs/dflash.md`): the drafter, opened on the
+    /// first [`generate`](ChatModel::generate) (`wants_dflash`), and its resident session. DFlash
+    /// shares MTP's backend (`mtp_vk`) and target session (`mtp_trunk`) — the two modes are
+    /// exclusive, DFlash first — so a turn never uploads the target twice.
+    dflash: Option<std::sync::Arc<crate::dflash::DflashDrafter>>,
+    dflash_sess: Option<crate::dflash::DflashSession>,
+    dflash_checked: bool,
     /// Physical device this chat's session pins: `Some(idx)` = `VulkanN` (the multi-device path,
     /// `new_on`), `None` = the default device (`new`, byte-identical to before). Threaded into
     /// [`ensure_session`](Self::ensure_session) and [`ensure_mtp_backend`](Self::ensure_mtp_backend)
@@ -50,6 +57,9 @@ impl DenseSeamChat {
             mtp_checked: false,
             mtp_vk: None,
             mtp_trunk: None,
+            dflash: None,
+            dflash_sess: None,
+            dflash_checked: false,
             dev: None,
         }
     }
@@ -65,8 +75,30 @@ impl DenseSeamChat {
             mtp_checked: false,
             mtp_vk: None,
             mtp_trunk: None,
+            dflash: None,
+            dflash_sess: None,
+            dflash_checked: false,
             dev: Some(idx),
         }
+    }
+
+    /// DFlash mode: `INFR_DFLASH` names a drafter, opened (and checked against this target) once.
+    fn wants_dflash(&mut self) -> Result<bool> {
+        if self.dflash.is_some() {
+            return Ok(true);
+        }
+        if self.dflash_checked {
+            return Ok(false);
+        }
+        self.dflash_checked = true;
+        let Some(path) = self.model.engine_cfg().spec.dflash.clone() else {
+            return Ok(false);
+        };
+        self.dflash = Some(std::sync::Arc::new(crate::dflash::DflashDrafter::open(
+            &path,
+            self.model.config(),
+        )?));
+        Ok(true)
     }
 
     /// MTP mode is opt-in (`INFR_MTP=1`) and Vulkan-only this phase (the invariant test + the
@@ -144,7 +176,7 @@ impl ChatModel for DenseSeamChat {
     }
 
     fn warmup(&mut self) -> Result<()> {
-        if self.wants_mtp()? {
+        if self.wants_dflash()? || self.wants_mtp()? {
             // MTP mode runs on its own backend and trunk session; warming the plain session too
             // would upload the trunk weights a second time (on a 32 GB card that does not fit a
             // 27B). Instead one throwaway MTP turn uploads the trunk and compiles the pipelines.
@@ -164,6 +196,22 @@ impl ChatModel for DenseSeamChat {
         req: Option<&crate::sampling::RequestCtx>,
         on_piece: &mut dyn FnMut(&str),
     ) -> Result<GenStats> {
+        if self.wants_dflash()? {
+            self.ensure_mtp_backend()?;
+            let drafter = self.dflash.as_ref().expect("wants_dflash opened it");
+            let vk = self.mtp_vk.as_ref().expect("ensure_mtp_backend set it");
+            return crate::dflash::generate_dflash_spec_vulkan_on(
+                vk,
+                &self.model,
+                drafter,
+                &mut self.dflash_sess,
+                &mut self.mtp_trunk,
+                prompt,
+                max_new,
+                |p| on_piece(p),
+            )
+            .map(|(stats, _)| stats);
+        }
         if self.wants_mtp()? {
             self.ensure_mtp_backend()?;
             let head = self.mtp_head.as_ref().expect("wants_mtp loaded it");

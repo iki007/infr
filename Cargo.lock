@@ -1307,6 +1307,7 @@ dependencies = [
  "tokenizers 0.20.4",
  "toktrie_hf_tokenizers",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

@@ -382,7 +382,7 @@ impl Pager {
         // `cur_epoch == 0` assert.)
         let batches = self.cur_epoch != 0;
         let idx = self.lru.iter().position(|b| {
-            !(batches && self.epoch.get(b) == Some(&self.cur_epoch)) && !self.pinned.contains_key(b)
+            !(self.pinned.contains_key(b) || batches && self.epoch.get(b) == Some(&self.cur_epoch))
         })?;
         let victim = self.lru.remove(idx).expect("index from position()");
         let vslot = self

@@ -41,6 +41,7 @@ pub use weights::{weight_footprint, WeightFootprint};
 /// Re-exported here because the CLI reaches every GGUF concern through this crate rather than
 /// depending on `infr-gguf` directly, and a watch is opened beside each model load.
 pub use infr_gguf::watch::WeightWatch;
+pub mod dflash;
 pub mod mtp;
 mod quant;
 pub mod qwen35;

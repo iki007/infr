@@ -3947,6 +3947,40 @@ impl Backend for VulkanBackend {
         })
     }
 
+    fn copy_buffers(
+        &self,
+        copies: &[(&dyn Buffer, usize, &dyn Buffer, usize, usize)],
+    ) -> Result<()> {
+        // Same per-side extent checks as `copy_buffer`, all up front, then ONE submission: the
+        // copies write distinct destinations, so they need no barriers between them, and the
+        // one_shot's queue_wait_idle orders the batch against prior and following work.
+        let mut regions = Vec::with_capacity(copies.len());
+        for &(src, so, dst, d_off, bytes) in copies {
+            let (s, d) = (as_vk_buf(src)?, as_vk_buf(dst)?);
+            check_extent("copy_buffers", "out of", so + bytes, s.size)?;
+            check_extent("copy_buffers", "into", d_off + bytes, d.size)?;
+            regions.push((
+                s.buffer,
+                d.buffer,
+                vk::BufferCopy {
+                    src_offset: (s.sub_offset + so) as u64,
+                    dst_offset: (d.sub_offset + d_off) as u64,
+                    size: bytes as u64,
+                },
+            ));
+        }
+        if regions.is_empty() {
+            return Ok(());
+        }
+        self.one_shot(move |cmd| unsafe {
+            for (sb, db, region) in &regions {
+                self.shared
+                    .device
+                    .cmd_copy_buffer(cmd, *sb, *db, &[*region]);
+            }
+        })
+    }
+
     /// persistent mapped pointer.  Otherwise, creates a temporary staging buffer,
     /// writes there, then submits a `cmd_copy_buffer` to the compute queue.
     fn upload(&self, dst: &dyn Buffer, src: &[u8]) -> Result<()> {

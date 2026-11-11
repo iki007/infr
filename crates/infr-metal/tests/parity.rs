@@ -3590,6 +3590,7 @@ fn deltanet_parity() {
         head_v: vd as u32,
         eps: 1e-6,
         src_stride: 0,
+        hist: None,
     });
     let bound = vec![
         (q, f32_bytes(&rand_f32(nk * kd, 80))),
@@ -3656,6 +3657,7 @@ fn deltanet_multirow_case(rows: usize) {
         head_v: vd as u32,
         eps: 1e-6,
         src_stride: 0,
+        hist: None,
     });
     let bound = vec![
         (q, f32_bytes(&rand_f32(rows * nk * kd, 300))),

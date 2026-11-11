@@ -373,8 +373,8 @@ mod tests {
     const ALL_DTYPES: &[infr_core::DType] = {
         use infr_core::DType::*;
         &[
-            F32, F16, Bf16, I32, U32, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2K, Q3K, Q4K, Q5K, Q6K, Iq1S,
-            Iq1M, Iq2Xxs, Iq2Xs, Iq2S, Iq3Xxs, Iq3S, Iq4Nl, Iq4Xs, Tq1_0, Tq2_0, Q2_0, Mxfp4,
+            F32, F16, Bf16, I32, U32, I64, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2K, Q3K, Q4K, Q5K, Q6K,
+            Iq1S, Iq1M, Iq2Xxs, Iq2Xs, Iq2S, Iq3Xxs, Iq3S, Iq4Nl, Iq4Xs, Tq1_0, Tq2_0, Q2_0, Mxfp4,
             Nvfp4, I2S, Turbo2, Turbo3, Turbo4,
         ]
     };
@@ -386,7 +386,8 @@ mod tests {
         // ALL_DTYPES are updated, keeping ALL_DTYPES a true canonical enumeration.
         fn _covered(d: infr_core::DType) {
             match d {
-                F32 | F16 | Bf16 | I32 | U32 | Q4_0 | Q4_1 | Q5_0 | Q5_1 | Q8_0 | Q2K | Q3K
+                // I64: DFlash's `d2t` table, read on the host — never a Vulkan tensor.
+                F32 | F16 | Bf16 | I32 | U32 | I64 | Q4_0 | Q4_1 | Q5_0 | Q5_1 | Q8_0 | Q2K | Q3K
                 | Q4K | Q5K | Q6K | Iq1S | Iq1M | Iq2Xxs | Iq2Xs | Iq2S | Iq3Xxs | Iq3S | Iq4Nl
                 // I2S (BitNet i2_s): host-converted to f16 in the runner's wload, so it never
                 // reaches the Vulkan backend as I2S — no native kernel (all *_kernel_name/spv gates
@@ -395,7 +396,7 @@ mod tests {
             }
         }
         // Count sanity: the arm above and ALL_DTYPES must list the same number of variants.
-        assert_eq!(ALL_DTYPES.len(), 33);
+        assert_eq!(ALL_DTYPES.len(), 34);
     }
 
     /// AUDIT #1 drift guard: for EVERY `DType`, each `*_kernel_name` gate the recorder tests with

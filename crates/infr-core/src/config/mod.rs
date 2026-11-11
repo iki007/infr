@@ -478,6 +478,10 @@ cfg_struct! {
         mtp_reprime: bool = true,
         /// `INFR_NO_MTP_DRAFT_CHAIN` (inverted).
         mtp_draft_chain: bool = true,
+        /// `INFR_DFLASH`: a DFlash2 drafter GGUF (`general.architecture = dflash`) for the loaded
+        /// target. Set, generation drafts blocks with it and verifies them on the target — see
+        /// `docs/dflash.md`. Unset (the default) keeps ordinary decoding.
+        dflash: Option<PathBuf> = None,
         /// `INFR_SPEC_DRAFT`: draft-model path.
         draft: Option<PathBuf> = None,
         /// `INFR_SPEC_K`: draft-length upper bound.

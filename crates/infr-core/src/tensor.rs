@@ -10,6 +10,9 @@ pub enum DType {
     Bf16,
     I32,
     U32,
+    /// GGML_TYPE_I64 (27): a plain 8-byte integer table, never a weight — DFlash's `d2t`
+    /// draft→target vocabulary map is the one shipped model tensor of this type. Read on the host.
+    I64,
     // legacy round quants
     Q4_0,
     Q4_1,
@@ -130,6 +133,7 @@ impl DType {
         let sz = match self {
             DType::F32 | DType::I32 | DType::U32 => 4,
             DType::F16 | DType::Bf16 => 2,
+            DType::I64 => 8,
             _ => return None,
         };
         Some(n * sz)

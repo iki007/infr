@@ -1432,6 +1432,13 @@ pub(crate) fn gather_i32_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
+/// SPIR-V for DFlash2's dynamic two-tap block convolution (`block_conv.comp`, `Op::BlockConv`).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn block_conv_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/block_conv.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
 /// SPIR-V for the chained-decode id ring log (ring[pos & 63] = sampled id).
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn id_log_spv() -> &'static [u32] {
@@ -3262,6 +3269,13 @@ pub(crate) fn silu_mul_fused_q8_spv() -> &'static [u32] {
 pub(crate) fn deltanet_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(DELTANET_SPV_BYTES))
+}
+/// SPIR-V for [`deltanet_spv`]'s `-DHIST` build: also stores the state after every token.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn deltanet_hist_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/deltanet_hist.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
 }
 /// SPIR-V for the chunked-DeltaNet PREP pass (normalize + intra-chunk dot matrices).
 #[cfg_attr(infr_profile, infr_prof::instrument)]

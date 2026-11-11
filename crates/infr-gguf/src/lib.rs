@@ -345,6 +345,8 @@ fn ggml_type_to_dtype(t: u32) -> Result<DType> {
         // lookup TABLES that a kernel indexes with — DeepSeek V4's `blk.N.ffn_gate_tid2eid.weight`
         // hash-routing table (token id → expert ids) is the first one infr meets.
         26 => Ok(DType::I32),
+        // GGML_TYPE_I64: DFlash's `d2t` reduced-vocab → target-vocab table.
+        27 => Ok(DType::I64),
         29 => Ok(DType::Iq1M),  // GGML_TYPE_IQ1_M: 256 elems, 56 bytes/block
         30 => Ok(DType::Bf16),  // GGML_TYPE_BF16
         34 => Ok(DType::Tq1_0), // GGML_TYPE_TQ1_0: 256 elems, 54 bytes/block

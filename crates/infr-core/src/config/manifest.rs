@@ -276,6 +276,7 @@ knobs! {
     "INFR_NO_MTP_CKPT"        => "spec.mtp_ckpt",        PresenceInv, Ignored, "1",         migrated;
     "INFR_NO_MTP_REPRIME"     => "spec.mtp_reprime",     PresenceInv, Ignored, "1",         migrated;
     "INFR_NO_MTP_DRAFT_CHAIN" => "spec.mtp_draft_chain", PresenceInv, Ignored, "1",         migrated;
+    "INFR_DFLASH"             => "spec.dflash",          Path,        Ignored, "/tmp/d.gguf", migrated;
     "INFR_SPEC_DRAFT"         => "spec.draft",           Path,        Ignored, "/tmp/d.gguf", migrated;
     "INFR_SPEC_K"             => "spec.k",               Int,         Ignored, "4",         migrated;
     "INFR_SPEC_DEBUG"         => "spec.debug",           Presence,    Ignored, "1",         migrated;

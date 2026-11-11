@@ -569,6 +569,32 @@ pub trait Backend: Send + Sync {
         self.download(src, &mut tmp)?;
         self.upload(dst, &tmp)
     }
+    /// Several independent byte-range copies, `(src, src_off, dst, dst_off, bytes)` each — no two
+    /// may write overlapping destination ranges. Backends that pay a submit+wait per copy override
+    /// this with one submission for the whole batch (the DeltaNet snapshot copies one state buffer
+    /// per recurrent layer, ~100 of them per speculative cycle). The default copies one by one:
+    /// a whole-prefix copy through [`copy_buffer`](Self::copy_buffer), an offset copy as a host
+    /// bounce of both buffers.
+    fn copy_buffers(
+        &self,
+        copies: &[(&dyn Buffer, usize, &dyn Buffer, usize, usize)],
+    ) -> Result<()> {
+        for &(src, so, dst, d_off, bytes) in copies {
+            if so == 0 && d_off == 0 {
+                self.copy_buffer(src, dst, bytes)?;
+                continue;
+            }
+            check_copy_bytes(so + bytes, src.len_bytes())?;
+            check_copy_bytes(d_off + bytes, dst.len_bytes())?;
+            let mut sv = vec![0u8; so + bytes];
+            self.download(src, &mut sv)?;
+            let mut dv = vec![0u8; dst.len_bytes()];
+            self.download(dst, &mut dv)?;
+            dv[d_off..d_off + bytes].copy_from_slice(&sv[so..so + bytes]);
+            self.upload(dst, &dv)?;
+        }
+        Ok(())
+    }
 
     // ---- execution (compile once per shape, execute per token/step) ----
     fn compile(&self, graph: &Graph) -> Result<Box<dyn Plan>>;

@@ -337,6 +337,7 @@ pub fn parse(get: Get) -> Result<PartialConfig, ConfigError> {
     p.spec.mtp_ckpt = presence_inv(get, "INFR_NO_MTP_CKPT");
     p.spec.mtp_reprime = presence_inv(get, "INFR_NO_MTP_REPRIME");
     p.spec.mtp_draft_chain = presence_inv(get, "INFR_NO_MTP_DRAFT_CHAIN");
+    p.spec.dflash = opt_path(get, "INFR_DFLASH");
     p.spec.draft = opt_path(get, "INFR_SPEC_DRAFT");
     p.spec.k = num(get, "INFR_SPEC_K");
     p.spec.debug = presence(get, "INFR_SPEC_DEBUG");

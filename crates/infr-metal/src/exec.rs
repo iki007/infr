@@ -1421,6 +1421,7 @@ fn op_name(op: &Op) -> &'static str {
         Op::GatherI32 { .. } => "GatherI32",
         Op::Copy { .. } => "Copy",
         Op::CopyStrided { .. } => "CopyStrided",
+        Op::BlockConv { .. } => "BlockConv",
         Op::MoeFfn { .. } => "MoeFfn",
         Op::Conv1dSilu { .. } => "Conv1dSilu",
         Op::DeltaNet { .. } => "DeltaNet",
@@ -5203,7 +5204,14 @@ impl MetalBackend {
                 head_v,
                 eps,
                 src_stride,
+                hist,
             } => {
+                if hist.is_some() {
+                    // The speculative-verify state history (DFlash) is CPU + Vulkan only.
+                    return Err(Error::Unsupported(
+                        "Metal Op::DeltaNet with a per-row state history not implemented".into(),
+                    ));
+                }
                 // Strided q/k/v from a shared conv_out buffer is the INFR_DELTA_STRIDED experimental
                 // decode path (Vulkan-only); the runner always emits src_stride == 0 for the Metal
                 // graph (separate packed q/k/v buffers via CopyStrided).
@@ -5894,6 +5902,12 @@ impl MetalBackend {
                     "Metal Op::GatherI32 (DeepSeek V4 ffn_gate_tid2eid hash routing) not \
                      implemented — Metal's device MoE path refuses V4's sqrt-softplus gating too"
                         .into(),
+                ));
+            }
+            Op::BlockConv { .. } => {
+                // DFlash2's block convolution — the DFlash drafter runs on CPU + Vulkan only.
+                return Err(Error::Unsupported(
+                    "Metal Op::BlockConv (DFlash2 drafter) not implemented".into(),
                 ));
             }
         }

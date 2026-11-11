@@ -565,6 +565,8 @@ fn main() {
         // of a push constant (see `Op::Softmax::scale_buf`'s doc + `Recorder::softmax_dyn`).
         ("softmax", "softmax_dyn", &["-DUSE_SCALE_BUF"]),
         ("deltanet", "deltanet", &[]),
+        // Speculative-verify variant that also stores the state after every token (Op::DeltaNet::hist).
+        ("deltanet", "deltanet_hist", &["-DHIST"]),
         // Strided variant: q/k/v read from single convout buffer with offsets (env-gated).
         ("deltanet_chunked", "deltanet_chunked", &[]),
         ("deltanet_prep", "deltanet_prep", &[]),
@@ -579,6 +581,8 @@ fn main() {
         ("conv1d_silu_par", "conv1d_silu_par", &[]),
         ("conv1d_shift", "conv1d_shift", &[]),
         ("copy_strided", "copy_strided", &[]),
+        // DFlash2 dynamic two-tap block convolution (Op::BlockConv).
+        ("block_conv", "block_conv", &[]),
         ("mul_sigmoid", "mul_sigmoid", &[]),
         ("mul_sigmoid", "mul_sigmoid_q8", &["-DQ8"]),
         ("mul_sigmoid", "mul_sigmoid_y16", &["-DY16"]),

@@ -963,6 +963,32 @@ pub enum Op {
         dst_off: u32,
         n: u32,
     },
+    /// DFlash2's dynamic two-tap block convolution (`build_dflash2_conv` in llama.cpp's
+    /// `src/models/dflash.cpp`): rows are tokens grouped into blocks of `block` consecutive rows,
+    /// and each channel mixes its own value with the one `tap` rows earlier IN THE SAME BLOCK
+    /// (zero padding at a block's start), weighted per token by a group-shared dynamic
+    /// coefficient plus a per-channel static base:
+    ///
+    /// ```text
+    /// dst[t, c] = Σ_{tap < min(kernel, block), t % block >= tap}
+    ///     (coeff[t, g(c) + G*(tap + kernel*side)] + base[c + dim*(tap + kernel*side)]) * x[t - tap, c]
+    /// ```
+    ///
+    /// with `G = dim / group` groups of `group` channels and `g(c) = c / group`. `coeff` is the
+    /// `[rows, 2*kernel*G]` output of the layer's `conv_proj`; `base` is the f32 `[2, kernel, dim]`
+    /// weight. `side` picks the pre (0) or post (1) half of both. `dst` must not alias `x`.
+    BlockConv {
+        x: TensorId,
+        coeff: TensorId,
+        base: TensorId,
+        dst: TensorId,
+        rows: u32,
+        dim: u32,
+        group: u32,
+        kernel: u32,
+        block: u32,
+        side: u32,
+    },
     /// Batched strided copy: for `rows` rows, copy `n` elements
     /// `src[src_off + r*src_stride ..] -> dst[dst_off + r*dst_stride ..]`. Used to split a batched
     /// `[rows, cc]` interleaved buffer (e.g. conv output q|k|v) into packed `[rows, n]` slices in one
@@ -1124,6 +1150,11 @@ pub enum Op {
         /// q at offset 0, k at n_khead*head_k, v at 2*n_khead*head_k within each row.
         /// Eliminates 3 CopyStrided dispatches per DeltaNet layer (qwen35).
         src_stride: u32,
+        /// Per-row state history `[rows, n_vhead·head_k·head_v]`: when set, the state as it stands
+        /// after each row's update is ALSO written to `hist[row]` — what a speculative verify
+        /// needs to roll the recurrence back to any accepted prefix without re-running it (see
+        /// `docs/dflash.md`). `None` everywhere else.
+        hist: Option<TensorId>,
     },
     /// qwen35moe Qwen2-MoE-style shared-expert combine: `dst[r,c] = moe[r,c] + sigmoid(gate[r]) *
     /// shexp[r,c]` for `rows` rows of `n` elements. `moe` is the routed-MoE branch's output
@@ -1180,6 +1211,7 @@ impl Op {
             Op::GatherI32 { .. } => "GatherI32",
             Op::Copy { .. } => "Copy",
             Op::CopyStrided { .. } => "CopyStrided",
+            Op::BlockConv { .. } => "BlockConv",
             Op::MoeFfn { .. } => "MoeFfn",
             Op::Conv1dSilu { .. } => "Conv1dSilu",
             Op::DeltaNet { .. } => "DeltaNet",
@@ -1340,6 +1372,13 @@ impl Op {
             } => (vec![ids, table], vec![dst]),
             Op::Copy { src, dst, .. } => (vec![src], vec![dst]),
             Op::CopyStrided { src, dst, .. } => (vec![src], vec![dst]),
+            Op::BlockConv {
+                x,
+                coeff,
+                base,
+                dst,
+                ..
+            } => (vec![x, coeff, base], vec![dst]),
             Op::MoeFfn {
                 x,
                 router_x,
@@ -1374,11 +1413,13 @@ impl Op {
                 dt_bias,
                 state,
                 dst,
+                hist,
                 ..
-            } => (
-                vec![q, k, v, b, a, a_coef, dt_bias, state],
-                vec![state, dst],
-            ),
+            } => {
+                let mut w = vec![state, dst];
+                w.extend(hist);
+                (vec![q, k, v, b, a, a_coef, dt_bias, state], w)
+            }
             Op::MoeSharedExpertAdd {
                 moe,
                 shexp,

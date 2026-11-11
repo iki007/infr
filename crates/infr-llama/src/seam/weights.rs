@@ -360,6 +360,41 @@ pub(crate) struct SeamKv {
     /// rewind by cache truncation the way a per-position KV cache can — see the `c.qwen35` branch in
     /// `generate_dense_backend`'s `start` computation). `None` for every non-MTP caller.
     pub(super) mtp_delta_ckpt: Option<MtpDeltaCkpt>,
+    /// DFlash target-layer feature taps (`docs/dflash.md`): when set, every forward this session
+    /// runs also copies the INPUT of each listed layer (the residual stream entering it) for
+    /// every row it processes into a ring indexed by absolute position. `None` everywhere except
+    /// the DFlash speculative driver, which enables it with [`SeamKv::enable_taps`].
+    pub(super) taps: Option<TapRing>,
+    /// Speculative-verify recurrent-state history (`docs/dflash.md`): when set, every VERIFY
+    /// forward of at most `max_rows` rows records each DeltaNet layer's state after every row (and
+    /// its conv inputs), so [`SeamKv::spec_hist_select`] can roll the recurrence back to any
+    /// accepted prefix with one batched copy instead of a snapshot restore + re-prefill.
+    pub(super) spec_hist: Option<SpecHist>,
+}
+
+/// The buffers behind [`SeamKv::spec_hist`]. Per DeltaNet layer `layers[i]`: `s[i]` holds
+/// `max_rows` states (`s_elems` f32 each, the state after verify row `r` at slot `r`), and `c[i]`
+/// is `[km1 + max_rows, cc]`: the conv state the verify started from, then its `rows` conv inputs
+/// — so the conv state after row `r` is the contiguous rows `r+1 .. r+1+km1`.
+pub(crate) struct SpecHist {
+    pub(crate) max_rows: usize,
+    pub(super) layers: Vec<usize>,
+    pub(super) s: Vec<Box<dyn Buffer>>,
+    pub(super) c: Vec<Box<dyn Buffer>>,
+    pub(super) s_elems: usize,
+    pub(super) cc: usize,
+    pub(super) km1: usize,
+    /// `(start position, rows)` of the last VERIFY that recorded a history, if it is still live.
+    pub(super) last: Option<(usize, usize)>,
+}
+
+/// The device ring [`SeamKv::taps`] writes: `rows` slots of `layers.len() * n_embd` f32, slot
+/// `pos % rows` holding position `pos`'s captured layer inputs concatenated in `layers` order —
+/// exactly the `[n_tap * n_embd]` feature row DFlash's `fc` projection consumes.
+pub(crate) struct TapRing {
+    pub(crate) layers: Vec<usize>,
+    pub(crate) rows: usize,
+    pub(crate) buf: Box<dyn Buffer>,
 }
 
 /// The device-resident DeltaNet-state snapshot backing [`SeamKv::mtp_snapshot_delta`] — one
@@ -422,6 +457,140 @@ impl SeamKv {
         self.cached.clear();
     }
 
+    /// Turn on DFlash target-layer taps (see [`SeamKv::taps`]): allocate the `rows`-slot ring for
+    /// the inputs of `layers` and make every later forward of this session fill it. Idempotent
+    /// for the same request; a different one reallocates.
+    pub(crate) fn enable_taps(
+        &mut self,
+        be: &dyn Backend,
+        cfg: &Config,
+        layers: &[usize],
+        rows: usize,
+    ) -> AResult<()> {
+        if let Some(t) = &self.taps {
+            if t.layers == layers && t.rows == rows {
+                return Ok(());
+            }
+        }
+        if let Some(&l) = layers.iter().find(|&&l| l >= cfg.n_layer) {
+            return Err(anyhow!(
+                "tap layer {l} is past the target's {} layers",
+                cfg.n_layer
+            ));
+        }
+        let buf = be
+            .alloc(
+                rows * layers.len() * cfg.n_embd * 4,
+                BufferUsage::Activations,
+            )
+            .map_err(|e| anyhow!("{e}"))?;
+        self.taps = Some(TapRing {
+            layers: layers.to_vec(),
+            rows,
+            buf,
+        });
+        Ok(())
+    }
+
+    /// The tap ring [`SeamKv::enable_taps`] allocated, if any.
+    pub(crate) fn taps(&self) -> Option<&TapRing> {
+        self.taps.as_ref()
+    }
+
+    /// Turn on the speculative-verify state history (see [`SeamKv::spec_hist`]) for verifies of up
+    /// to `max_rows` rows. A no-op on a model without DeltaNet layers (nothing to roll back there:
+    /// attention KV rows past the accepted prefix are simply overwritten later). Returns whether a
+    /// history is active.
+    pub(crate) fn enable_spec_hist(
+        &mut self,
+        be: &dyn Backend,
+        cfg: &Config,
+        max_rows: usize,
+    ) -> AResult<bool> {
+        if self
+            .spec_hist
+            .as_ref()
+            .is_some_and(|h| h.max_rows >= max_rows)
+        {
+            return Ok(true);
+        }
+        let layers: Vec<usize> = (0..cfg.n_layer)
+            .filter(|&l| cfg.qwen35 && !cfg.is_qwen35_attn_layer(l))
+            .collect();
+        if layers.is_empty() {
+            return Ok(false);
+        }
+        let s_elems = cfg.q35_num_v_heads() * cfg.q35_head_k_dim() * cfg.q35_head_v_dim();
+        let cc = cfg.q35_conv_channels();
+        let km1 = cfg.ssm_d_conv - 1;
+        let mut s = Vec::with_capacity(layers.len());
+        let mut c = Vec::with_capacity(layers.len());
+        for _ in &layers {
+            s.push(
+                be.alloc(max_rows * s_elems * 4, BufferUsage::Activations)
+                    .map_err(|e| anyhow!("{e}"))?,
+            );
+            c.push(
+                be.alloc((km1 + max_rows) * cc * 4, BufferUsage::Activations)
+                    .map_err(|e| anyhow!("{e}"))?,
+            );
+        }
+        self.spec_hist = Some(SpecHist {
+            max_rows,
+            layers,
+            s,
+            c,
+            s_elems,
+            cc,
+            km1,
+            last: None,
+        });
+        Ok(true)
+    }
+
+    /// Keep only the first `keep` rows of the last recorded VERIFY: set every DeltaNet layer's
+    /// state (and conv state) to what it was right after row `keep - 1`, and truncate the cached
+    /// tokens to match. Attention layers need nothing — their rows past the prefix are overwritten
+    /// by the next forward. Errors when no history covers the request.
+    pub(crate) fn spec_hist_select(&mut self, be: &dyn Backend, keep: usize) -> AResult<()> {
+        let h = self
+            .spec_hist
+            .as_mut()
+            .ok_or_else(|| anyhow!("spec_hist_select: no state history enabled"))?;
+        let (start, rows) = h
+            .last
+            .take()
+            .ok_or_else(|| anyhow!("spec_hist_select: the last verify recorded no history"))?;
+        if keep == 0 || keep > rows {
+            return Err(anyhow!(
+                "spec_hist_select: keep {keep} outside the verify's 1..={rows} rows"
+            ));
+        }
+        if keep < rows {
+            let (sb, cb) = (h.s_elems * 4, h.cc * 4);
+            let mut copies: Vec<(&dyn Buffer, usize, &dyn Buffer, usize, usize)> = Vec::new();
+            for (i, &l) in h.layers.iter().enumerate() {
+                copies.push((
+                    h.s[i].as_ref(),
+                    (keep - 1) * sb,
+                    self.vbufs[l].as_ref(),
+                    0,
+                    sb,
+                ));
+                copies.push((
+                    h.c[i].as_ref(),
+                    keep * cb,
+                    self.kbufs[l].as_ref(),
+                    0,
+                    h.km1 * cb,
+                ));
+            }
+            be.copy_buffers(&copies).map_err(|e| anyhow!("{e}"))?;
+        }
+        self.cached.truncate(start + keep);
+        Ok(())
+    }
+
     /// Fork a fresh conversation slot: same (Arc-shared) weights, its own zero KV + IO buffers.
     /// Snapshot the qwen35 DeltaNet recurrent state (every DeltaNet layer's conv + S buffers) plus
     /// the current `cached` length into the device-resident [`MtpDeltaCkpt`] (allocated once on the
@@ -458,20 +627,24 @@ impl SeamKv {
         }
         let cached_len = self.cached.len();
         let ck = self.mtp_delta_ckpt.as_ref().expect("just ensured Some");
+        let mut copies: Vec<(&dyn Buffer, usize, &dyn Buffer, usize, usize)> = Vec::new();
         for (i, &l) in ck.layers.iter().enumerate() {
-            be.copy_buffer(
+            copies.push((
                 self.kbufs[l].as_ref(),
+                0,
                 ck.kbufs[i].as_ref(),
+                0,
                 self.kbufs[l].len_bytes(),
-            )
-            .map_err(|e| anyhow!("{e}"))?;
-            be.copy_buffer(
+            ));
+            copies.push((
                 self.vbufs[l].as_ref(),
+                0,
                 ck.vbufs[i].as_ref(),
+                0,
                 self.vbufs[l].len_bytes(),
-            )
-            .map_err(|e| anyhow!("{e}"))?;
+            ));
         }
+        be.copy_buffers(&copies).map_err(|e| anyhow!("{e}"))?;
         self.mtp_delta_ckpt
             .as_mut()
             .expect("just ensured Some")
@@ -487,20 +660,24 @@ impl SeamKv {
         let Some(ck) = self.mtp_delta_ckpt.as_ref() else {
             return Ok(());
         };
+        let mut copies: Vec<(&dyn Buffer, usize, &dyn Buffer, usize, usize)> = Vec::new();
         for (i, &l) in ck.layers.iter().enumerate() {
-            be.copy_buffer(
+            copies.push((
                 ck.kbufs[i].as_ref(),
+                0,
                 self.kbufs[l].as_ref(),
+                0,
                 ck.kbufs[i].len_bytes(),
-            )
-            .map_err(|e| anyhow!("{e}"))?;
-            be.copy_buffer(
+            ));
+            copies.push((
                 ck.vbufs[i].as_ref(),
+                0,
                 self.vbufs[l].as_ref(),
+                0,
                 ck.vbufs[i].len_bytes(),
-            )
-            .map_err(|e| anyhow!("{e}"))?;
+            ));
         }
+        be.copy_buffers(&copies).map_err(|e| anyhow!("{e}"))?;
         self.cached.truncate(ck.cached_len);
         Ok(())
     }
@@ -615,6 +792,8 @@ impl SeamKv {
             sc_ping_write: 0,
             sc_temp_inv_buf: None,
             mtp_delta_ckpt: None,
+            taps: None,
+            spec_hist: None,
         })
     }
 

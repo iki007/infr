@@ -123,7 +123,11 @@ fn bind_layer_io<'a>(
     kbufs: &'a [Box<dyn Buffer>],
     vbufs: &'a [Box<dyn Buffer>],
     wbufs: &'a [Box<dyn Buffer>],
+    tap_buf: Option<&'a dyn Buffer>,
 ) {
+    if let (Some(tid), Some(tb)) = (h.taps, tap_buf) {
+        b.bind(tid, tb);
+    }
     if let (Some(rid), Some((rb, _))) = (h.rope_freqs, rf_buf) {
         b.bind(rid, rb.as_ref());
     }
@@ -353,6 +357,13 @@ pub(super) struct DecodeHandles {
     k_cache: Vec<TensorId>,
     v_cache: Vec<TensorId>,
     weights: Vec<TensorId>, // flat, in declaration == upload order
+    // DFlash target-layer taps (`SeamKv::taps`): the position-indexed feature ring Input, `Some`
+    // only while the session has taps enabled.
+    taps: Option<TensorId>,
+    // Speculative-verify state history inputs, one `(S history, conv history)` pair per DeltaNet
+    // layer in layer order — empty unless this is a VERIFY build of a session with
+    // `SeamKv::spec_hist` and the batch fits its row cap.
+    dn_hist: Vec<(TensorId, TensorId)>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1260,6 +1271,8 @@ pub(crate) fn generate_dense_backend(
             sc_ping_write: 0,
             sc_temp_inv_buf: None,
             mtp_delta_ckpt: None,
+            taps: None,
+            spec_hist: None,
         });
     }
     let SeamKv {
@@ -1285,6 +1298,8 @@ pub(crate) fn generate_dense_backend(
         sc_ping_write,
         sc_temp_inv_buf,
         mtp_delta_ckpt: _,
+        taps,
+        spec_hist,
         // The env-derived local `kv_ring` above is this same value on every call (stable env),
         // so the struct field is only read by fork/seed (which have no backend caps at hand).
         kv_ring: _,
@@ -1297,6 +1312,17 @@ pub(crate) fn generate_dense_backend(
         layer_has_epb,
     } = weights.as_ref();
     let max_ctx = *max_ctx;
+    // A recorded verify history describes only the forward that wrote it; this call is another.
+    if let Some(h) = spec_hist.as_mut() {
+        h.last = None;
+    }
+    // DFlash taps (`SeamKv::taps`): which layer inputs every graph below copies into the ring, and
+    // the ring itself for binding.
+    let tap_spec: Option<(Vec<usize>, usize)> = taps.as_ref().map(|t| (t.layers.clone(), t.rows));
+    let tap_buf: Option<&dyn Buffer> = taps.as_ref().map(|t| t.buf.as_ref());
+    // Speculative-verify state history (`SeamKv::spec_hist`): the row cap a VERIFY must fit to
+    // record one. Only the VERIFY build (`mtp_verify`) emits it.
+    let hist_rows: Option<usize> = spec_hist.as_ref().map(|h| h.max_rows);
     if prompt.len() + max_new + 1 > max_ctx {
         return Err(anyhow!(
             "prompt {} + gen {} exceeds the session KV capacity {max_ctx}",
@@ -2576,7 +2602,35 @@ pub(crate) fn generate_dense_backend(
             }
         }
 
+        let tap_ring = tap_spec
+            .as_ref()
+            .map(|(ls, rows)| g.input(f32d(rows * ls.len() * ne)));
+        let hist_cap = hist_rows.filter(|&mr| mtp_verify && batch <= mr);
+        let mut dn_hist: Vec<(TensorId, TensorId)> = Vec::new();
         for (l, lw) in lw.iter().enumerate().take(l_end).skip(l_first) {
+            // DFlash taps: copy this layer's INPUT rows (the residual stream entering it) into the
+            // position-indexed ring — slot `pos % rows`, column block `k` of the tap's index.
+            if let (Some(ring), Some((ls, rows))) = (tap_ring, &tap_spec) {
+                if let Some(k) = ls.iter().position(|&x| x == l) {
+                    let w = ls.len() * ne;
+                    let mut r = batch.saturating_sub(*rows);
+                    while r < batch {
+                        let slot = (start_pos + r) % rows;
+                        let n = (batch - r).min(rows - slot);
+                        g.push(Op::CopyStrided {
+                            src: hidden,
+                            src_off: (r * ne) as u32,
+                            src_stride: ne as u32,
+                            dst: ring,
+                            dst_off: (slot * w + k * ne) as u32,
+                            dst_stride: w as u32,
+                            rows: n as u32,
+                            n: ne as u32,
+                        });
+                        r += n;
+                    }
+                }
+            }
             // Per-layer dims (gemma4 SWA vs full; uniform for every other model).
             let hd = c.layer_head_dim(l);
             let nkv = c.layer_n_kv(l);
@@ -2674,6 +2728,30 @@ pub(crate) fn generate_dense_backend(
                     out_f: q35_di as u32,
                     w_off: 0,
                 });
+                // Speculative-verify history: the conv state this verify starts from, then its raw
+                // conv inputs (see `SpecHist`); the DeltaNet below records its per-row state.
+                let hist_ids = hist_cap.map(|mr| {
+                    let km1 = c.ssm_d_conv - 1;
+                    let s_elems = q35_nv * q35_kd * q35_vd;
+                    let sid = g.input(f32d(mr * s_elems));
+                    let cid = g.input(f32d((km1 + mr) * q35_cc));
+                    g.push(Op::Copy {
+                        src: k_cache[l],
+                        src_off: 0,
+                        dst: cid,
+                        dst_off: 0,
+                        n: (km1 * q35_cc) as u32,
+                    });
+                    g.push(Op::Copy {
+                        src: dn_qkvbuf,
+                        src_off: 0,
+                        dst: cid,
+                        dst_off: (km1 * q35_cc) as u32,
+                        n: (batch * q35_cc) as u32,
+                    });
+                    dn_hist.push((sid, cid));
+                    sid
+                });
                 g.push(Op::Conv1dSilu {
                     x: dn_qkvbuf,
                     weight: dw.conv1d,
@@ -2762,6 +2840,7 @@ pub(crate) fn generate_dense_backend(
                     head_v: q35_vd as u32,
                     eps: 1e-6,
                     src_stride: if delta_strided { q35_cc as u32 } else { 0 },
+                    hist: hist_ids,
                 });
                 // silu-gated RMSNorm per v-head: rmsnorm(out, ssm_norm) then * silu(z). Fused into
                 // ONE dispatch when the backend supports it (see `fuse_gated_rmsnorm`'s doc) — the
@@ -4521,6 +4600,8 @@ pub(crate) fn generate_dense_backend(
                 k_cache,
                 v_cache,
                 weights,
+                taps: tap_ring,
+                dn_hist,
             },
         )
     };
@@ -4800,6 +4881,7 @@ pub(crate) fn generate_dense_backend(
             &kbufs[..],
             &vbufs[..],
             &wbufs[..],
+            tap_buf,
         );
         if plan_sc {
             if dyn_sc {
@@ -4967,22 +5049,36 @@ pub(crate) fn generate_dense_backend(
         if c.moe.is_some() || ple.is_some() {
             return Err(anyhow!("speculative verify: dense non-E2B models only"));
         }
-        let vf_scale = if gemma { (ne as f32).sqrt() } else { 1.0 };
         let m = prompt.len() - start;
-        let mut vf_hidden: Vec<f32> = Vec::with_capacity(m * ne);
-        let token_embd = token_embd.get()?; // host embed gather → materialize the table
-        for &tok in &prompt[start..] {
-            let base = tok as usize * ne;
-            vf_hidden.extend(token_embd[base..base + ne].iter().map(|&x| x * vf_scale));
-        }
+        // The rows' embeddings: gathered on the device from the resident table when the decode
+        // loop does (`gpu_embed`) — only the m token ids cross the bus — else host-gathered from
+        // the dequantized table (which costs materializing all of it on first use).
+        let vf_in_buf = if gpu_embed {
+            let ids: Vec<i32> = prompt[start..].iter().map(|&t| t as i32).collect();
+            let b = be
+                .alloc(m * 4, BufferUsage::Staging)
+                .map_err(|e| anyhow!("{e}"))?;
+            be.upload(b.as_ref(), bytemuck::cast_slice(&ids))
+                .map_err(|e| anyhow!("{e}"))?;
+            b
+        } else {
+            let vf_scale = if gemma { (ne as f32).sqrt() } else { 1.0 };
+            let mut vf_hidden: Vec<f32> = Vec::with_capacity(m * ne);
+            let token_embd = token_embd.get()?; // host embed gather → materialize the table
+            for &tok in &prompt[start..] {
+                let base = tok as usize * ne;
+                vf_hidden.extend(token_embd[base..base + ne].iter().map(|&x| x * vf_scale));
+            }
+            let b = be
+                .alloc(m * ne * 4, BufferUsage::Staging)
+                .map_err(|e| anyhow!("{e}"))?;
+            be.upload(b.as_ref(), bytemuck::cast_slice(&vf_hidden))
+                .map_err(|e| anyhow!("{e}"))?;
+            b
+        };
         let vf_positions: Vec<i32> = (start as i32..(start + m) as i32).collect();
-        let vf_hidden_buf = be
-            .alloc(m * ne * 4, BufferUsage::Staging)
-            .map_err(|e| anyhow!("{e}"))?;
         let vf_pos_buf = be
             .alloc(m * 4, BufferUsage::Staging)
-            .map_err(|e| anyhow!("{e}"))?;
-        be.upload(vf_hidden_buf.as_ref(), bytemuck::cast_slice(&vf_hidden))
             .map_err(|e| anyhow!("{e}"))?;
         be.upload(vf_pos_buf.as_ref(), bytemuck::cast_slice(&vf_positions))
             .map_err(|e| anyhow!("{e}"))?;
@@ -5008,19 +5104,12 @@ pub(crate) fn generate_dense_backend(
             && caps.argmax_rows
             && ec.spec.gpu_argmax
             && ec.spec.gpu_mtp_accept;
-        // The m×vocab verify logits: device-local when only the per-row argmax ids come back (the
-        // GPU accept path never downloads them), host-visible only when they are downloaded. On an
-        // Arc Pro B70 the LM head's scattered stores into host memory cost ~5.5 ms per ROW (see
-        // `SeamKv::logits_dev`), i.e. most of an MTP verify.
+        // The m×vocab verify logits, device-local whether or not they are downloaded: on an Arc
+        // Pro B70 the LM head's scattered stores into host-visible memory cost ~5.5 ms per ROW
+        // (see `SeamKv::logits_dev`), while the full-logits paths (a temp > 0 accept rule, a
+        // grammar, the host fallback) pay one bulk device→host copy after the forward instead.
         let vf_logits_buf = be
-            .alloc(
-                m * c.vocab * 4,
-                if gpu_verify_ids {
-                    BufferUsage::Activations
-                } else {
-                    BufferUsage::Staging
-                },
-            )
+            .alloc(m * c.vocab * 4, BufferUsage::Activations)
             .map_err(|e| anyhow!("{e}"))?;
         let t_vbuild0 = std::time::Instant::now();
         let (vg, vh) = build(
@@ -5033,9 +5122,9 @@ pub(crate) fn generate_dense_backend(
             want_h,
             gpu_verify_ids,
             false,
-            false,
-            true, // mtp_verify: this IS the speculative-VERIFY batched forward
-            None, // span: the whole model in one graph
+            gpu_embed, // use_ids: in-graph embed gather (see `vf_in_buf`)
+            true,      // mtp_verify: this IS the speculative-VERIFY batched forward
+            None,      // span: the whole model in one graph
         );
         let vbuild_secs = t_vbuild0.elapsed().as_secs_f64();
         let t_vcompile0 = std::time::Instant::now();
@@ -5050,7 +5139,13 @@ pub(crate) fn generate_dense_backend(
             None
         };
         let mut vb = Bindings::new();
-        vb.bind(vh.hidden, vf_hidden_buf.as_ref());
+        bind_step_input(
+            &mut vb,
+            &vh,
+            gpu_embed,
+            vf_in_buf.as_ref(),
+            vf_in_buf.as_ref(),
+        );
         vb.bind(vh.positions, vf_pos_buf.as_ref());
         bind_layer_io(
             &mut vb,
@@ -5061,6 +5156,7 @@ pub(crate) fn generate_dense_backend(
             &kbufs[..],
             &vbufs[..],
             &wbufs[..],
+            tap_buf,
         );
         vb.bind(
             vh.logits.expect("verify build has logits"),
@@ -5081,9 +5177,19 @@ pub(crate) fn generate_dense_backend(
         if let (Some(ho), Some(hb)) = (vh.h_out, &vf_h_buf) {
             vb.bind(ho, hb.as_ref());
         }
+        if let Some(h) = spec_hist.as_ref() {
+            for (i, &(sid, cid)) in vh.dn_hist.iter().enumerate() {
+                vb.bind(sid, h.s[i].as_ref());
+                vb.bind(cid, h.c[i].as_ref());
+            }
+        }
         let t0 = std::time::Instant::now();
         be.execute(vplan.as_ref(), &vb)
             .map_err(|e| anyhow!("{e}"))?;
+        drop(vb);
+        if let Some(h) = spec_hist.as_mut() {
+            h.last = (!vh.dn_hist.is_empty()).then_some((start, m));
+        }
         let vexec_secs = t0.elapsed().as_secs_f64();
         let t_vdl0 = std::time::Instant::now();
         if let (Some(out_ids), Some(ib)) = (verify_ids, &vf_ids_buf) {
@@ -5466,6 +5572,7 @@ pub(crate) fn generate_dense_backend(
                     &kbufs[..],
                     &vbufs[..],
                     &wbufs[..],
+                    tap_buf,
                 );
                 debug_assert!(
                     pf_h.logits.is_none(),
@@ -5570,7 +5677,10 @@ pub(crate) fn generate_dense_backend(
         // whether THIS position is the one being sampled, which the static replay tape can't
         // express. Force the ordinary per-token rebuild path below when a caller wants the tap —
         // slower, but this is a validation-only hook (see `h_out`'s doc), never a hot path.
-        && h_out.is_none();
+        && h_out.is_none()
+        // DFlash taps write at the step's STATIC position (the copy offset is baked into the
+        // graph), so a session with taps enabled takes the per-token rebuild too.
+        && tap_spec.is_none();
     let ro = if dyn_replay {
         // `compile` builds pipelines and records the replay tape into the shared command pool —
         // GPU work, so it takes a turn like any step.
@@ -5602,6 +5712,7 @@ pub(crate) fn generate_dense_backend(
             &kbufs[..],
             &vbufs[..],
             &wbufs[..],
+            tap_buf,
         );
         b.bind(h.logits.expect("decode build has logits"), step_logits);
         if let Some(tid) = h.tok_id {
@@ -5863,6 +5974,7 @@ pub(crate) fn generate_dense_backend(
                 &kbufs[..],
                 &vbufs[..],
                 &wbufs[..],
+                tap_buf,
             );
             b.bind(h.logits.expect("decode build has logits"), step_logits);
             if let Some(tid) = h.tok_id {
