@@ -46,6 +46,8 @@ fn dflash_greedy_matches_plain_greedy() {
     cfg.prof.stages = std::env::var("INFR_PROF_STAGES").is_ok_and(|v| v == "1");
     cfg.prof.ops = std::env::var("INFR_PROF_OPS").is_ok_and(|v| v == "1");
     cfg.prof.op_shapes = std::env::var("INFR_PROF_OP_SHAPES").is_ok_and(|v| v == "1");
+    // The Level Zero verify chain (on by default; `INFR_ZE_SKINNY=0` for the Vulkan verify).
+    cfg.kernels.vulkan.ze_skinny = std::env::var("INFR_ZE_SKINNY").map_or(true, |v| v != "0");
     // Sampled decoding (Qwen's recommended temp/top-k/top-p): the speculative-sampling accept path.
     let temp: Option<f32> = std::env::var("INFR_DFLASH_TEMP")
         .ok()
@@ -63,7 +65,12 @@ fn dflash_greedy_matches_plain_greedy() {
     let drafter = std::sync::Arc::new(
         infr_llama::dflash::DflashDrafter::open(&draft, model.config()).expect("drafter"),
     );
-    let prompt = model.render_chat(PROMPT).expect("render chat");
+    // INFR_DFLASH_RAW_PROMPT=<file>: an already-rendered prompt (e.g. one shared with llama-server's
+    // /completion for a like-for-like comparison) instead of the built-in chat-rendered one.
+    let prompt = match std::env::var("INFR_DFLASH_RAW_PROMPT") {
+        Ok(path) => std::fs::read_to_string(path).expect("read raw prompt"),
+        Err(_) => model.render_chat(PROMPT).expect("render chat"),
+    };
     if let Ok(path) = std::env::var("INFR_DFLASH_DUMP_PROMPT") {
         std::fs::write(path, &prompt).expect("dump prompt");
     }
@@ -110,6 +117,9 @@ fn dflash_greedy_matches_plain_greedy() {
         tm.reprimes,
         tm.reprime_secs * 1e3,
     );
+    if let Ok(path) = std::env::var("INFR_DFLASH_DUMP_OUT") {
+        std::fs::write(path, &spec).expect("dump output");
+    }
     if skip_plain || temp.is_some() {
         return;
     }

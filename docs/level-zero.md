@@ -297,18 +297,20 @@ head). Keeping its bit-identity with `attn_partial` (which MTP verify shares) me
 both together — more keys in flight per subgroup, or a Level Zero flash-decode with the g query
 heads as DPAS rows (whose handoffs the record-once decode replay would then have to carry).
 
-### Skinny GEMMs for speculative verify (2026-11-11, opt-in `INFR_ZE_SKINNY=1`)
+### Speculative verify on Level Zero (2026-11-11, default on, `INFR_ZE_SKINNY=0` off)
 
-A DFlash or MTP verify runs the whole target on 8 rows. Vulkan's int8 multi-row GEMV
+A DFlash or MTP verify runs the whole target on 2–16 rows. Vulkan's int8 multi-row GEMV
 (`native_mmv_mrow`) streams the weights at ~150–250 GB/s there. The 27B's 8-row verify forward
-takes 69 ms against 35 ms for one row; llama.cpp SYCL does pp8 in 41.5 ms (Vulkan 99 ms).
+took 69 ms against 35 ms for one row; llama.cpp SYCL does pp8 in 41.5 ms (Vulkan 99 ms).
 
-The `gemm_*_m8` / `_m16` kernels (`gemm_kquant.cl`, `gemm_kq16.cl`, `gemm_iq4.cl`) work like this:
+**Skinny GEMMs.** The `gemm_*_m8` / `_m16` kernels (`gemm_kquant.cl`, `gemm_kq16.cl`,
+`gemm_iq4.cl`, also Q8_0) work like this:
 
 - One DPAS row block: a subgroup owns 32 output columns and dequantizes them straight into B
   operands, the same way the prefill kernels do.
-- K is split 4 ways over grid y, with `sum_splits` adding the partials. Without the split, a
-  5120-wide output is only 160 subgroups.
+- K is split 4 ways over grid y, with `sum_splits` adding the partials (up to 16 ways for a
+  narrow output). Without the split, a 5120-wide output is only 160 subgroups.
+- An N % 16 guard covers the 48-wide beta/alpha projections.
 
 Kernel time at m=8, weight GB/s (`tests/probe.rs` `skinny_*_probe`, split 4):
 
@@ -321,13 +323,50 @@ Kernel time at m=8, weight GB/s (`tests/probe.rs` `skinny_*_probe`, split 4):
 | IQ4_XS | 310 | 354 | |
 | IQ4_NL | 273 | 314 | |
 
-**Not on by default.** Routed through the hybrid chain, the 8-row verify gets slower: 85–94 ms
-against 69 ms. The DeltaNet recurrence, conv, norms, attention and the 48-wide beta/alpha
-projections stay on Vulkan, so a forward makes 135 Vulkan↔Level Zero hand-offs. The kernels do not
-explain the gap; the GPU sits idle at each queue switch. Back-to-back Level Zero launches cost
-1.8 µs of host time each, and an appended unmet semaphore wait does not block the host
-(`launch_overhead_probe`, `ze_interop`). A win needs whole layers on Level Zero, so a verify is one
-or two chains.
+**The whole layer joins the chain.** GEMMs alone lost: routed through the hybrid chain, the verify
+got slower (85–94 ms), because the DeltaNet recurrence, conv, norms and attention stayed on Vulkan.
+A forward made 135 Vulkan↔Level Zero hand-offs, and the GPU sat idle at each queue switch.
+(Back-to-back Level Zero launches cost 1.8 µs of host time each, and an appended unmet semaphore
+wait does not block the host: `launch_overhead_probe`, `ze_interop`.)
+
+`decode.cl` and `attn_dec.cl` now carry the rest of a verify layer:
+
+- copies and strided copies (including the DFlash taps);
+- the f16 KV store and SiLU / interleaved-sigmoid gated activations;
+- the conv1d+SiLU, and the DeltaNet recurrence with its per-row state history;
+- the gated RMSNorm, and QK-norm + NeoX RoPE, written straight into the KV cache when fused;
+- split-K DPAS attention over the cache with a combine pass.
+
+Caches, recurrent state, the verify history and the tap ring are exportable (`KvCache`)
+allocations that Level Zero imports in place. A verify graph (`Graph::mtp_verify`, every Linear
+2..=16 rows) is now five chains: only its 4 IQ3_S GEMMs and the argmax stay on Vulkan.
+
+Two hand-off bugs are pinned down in the adapter's comments:
+
+- The adapter's `mmv_memo` names an f16 copy only at m >= 256; below that it is Vulkan's int8
+  GEMV copy. A skinny GEMM now keeps its own `ze_a16_memo`; sharing the memo fed stale A and
+  garbled text.
+- The RMSNorm writes the next skinny GEMM's f16 A copy.
+
+**Results.** Verify device time is 51.9 ms per 8-row forward (`INFR_PROF_OPS` prints a
+`[prof:ze]` table from per-launch timestamps):
+
+| kernels | ms |
+|---|---:|
+| GEMMs | 45 |
+| DeltaNet | 2.9 |
+| RMSNorm | 1.4 |
+| everything else | ~1 each |
+
+DFlash on the 27B, 512 tokens, one B70:
+
+| prompt | before | Level Zero verify | text |
+|---|---:|---:|---|
+| code | 67.8 t/s | 82.3 t/s | identical |
+| reasoning | 38.3 t/s | 50.2 t/s | near-tie rounding differs |
+
+MTP: identical text, unchanged speed (its verifies are 2–4 rows). Prefill and decode do not enter
+the chain.
 
 The Vulkan alternative was tried and dropped. The prefill warp GEMM was built at 16 rows (`BM16`,
 8×16 fragments, `BK128`, split-K) and took 365–580 µs on the Q4_K 5120→17408 shape. That is slower
@@ -336,9 +375,11 @@ more than the XMX math saves.
 
 ### Next
 
-- Verify on Level Zero (above): port the remaining per-layer ops of a small-m forward (DeltaNet
-  recurrence and conv, gated norm, QK-norm/RoPE, the KV write, small-m attention) so a verify is
-  one chain. That is the path to SYCL's 41.5 ms for 8 rows, and it lifts DFlash and MTP together.
+- Verify: the remaining ~10 ms to SYCL's 41.5 ms is GEMM efficiency (IQ4_XS's codebook path is
+  ~330 GB/s, the format the 27B uses most), an IQ3_S skinny kernel (4 GEMMs still on Vulkan) and
+  the DeltaNet kernel (61 µs vs Vulkan's 44).
+- The DFlash drafter on Level Zero: its block conv, 128-wide ring/canvas attention and a Q4_0
+  skinny GEMM for its 98K head would take the draft from ~12 to ~5 ms a cycle.
 - The decode KV read at depth (above), and further prefill attention tuning.
 - IQ4_XS: fewer SLM gathers — e.g. a byte-indexed table (k-pairs `(j, j+16)`, one index per byte)
   with the producer writing A in the matching k order.

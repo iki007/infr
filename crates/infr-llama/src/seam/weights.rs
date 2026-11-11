@@ -478,11 +478,9 @@ impl SeamKv {
                 cfg.n_layer
             ));
         }
+        // KvCache: an exportable allocation the Level Zero verify chain imports in place.
         let buf = be
-            .alloc(
-                rows * layers.len() * cfg.n_embd * 4,
-                BufferUsage::Activations,
-            )
+            .alloc(rows * layers.len() * cfg.n_embd * 4, BufferUsage::KvCache)
             .map_err(|e| anyhow!("{e}"))?;
         self.taps = Some(TapRing {
             layers: layers.to_vec(),
@@ -527,11 +525,11 @@ impl SeamKv {
         let mut c = Vec::with_capacity(layers.len());
         for _ in &layers {
             s.push(
-                be.alloc(max_rows * s_elems * 4, BufferUsage::Activations)
+                be.alloc(max_rows * s_elems * 4, BufferUsage::KvCache)
                     .map_err(|e| anyhow!("{e}"))?,
             );
             c.push(
-                be.alloc((km1 + max_rows) * cc * 4, BufferUsage::Activations)
+                be.alloc((km1 + max_rows) * cc * 4, BufferUsage::KvCache)
                     .map_err(|e| anyhow!("{e}"))?,
             );
         }

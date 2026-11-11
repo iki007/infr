@@ -52,3 +52,16 @@ pub fn gemm_kq16() -> Option<&'static [u8]> {
 pub fn attn_fa() -> Option<&'static [u8]> {
     bin!("attn_fa")
 }
+
+/// `kernels/decode.cl`: the verify-sized (2..=16-row) ops between the GEMMs of a qwen35 layer —
+/// copies, the KV row store, gated activations, the conv, the DeltaNet recurrence with its per-row
+/// state history, the gated RMSNorm and QK-norm + RoPE.
+pub fn decode() -> Option<&'static [u8]> {
+    bin!("decode")
+}
+
+/// `kernels/attn_dec.cl`: split-K DPAS attention for a verify-sized batch (`attn_dec256`, head
+/// dim 256) and the merge of its chunk partials (`attn_dec_combine`).
+pub fn attn_dec() -> Option<&'static [u8]> {
+    bin!("attn_dec")
+}

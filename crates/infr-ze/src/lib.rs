@@ -161,6 +161,31 @@ impl Drop for Inner {
 pub struct Gpu {
     inner: Rc<Inner>,
     pub info: DeviceInfo,
+    /// Per-launch timestamps while a profile is open ([`Gpu::profile_begin`]).
+    prof: std::cell::RefCell<Option<Prof>>,
+}
+
+/// A profile in progress: one timestamp event per labelled launch.
+struct Prof {
+    inner: Rc<Inner>,
+    pool: Handle,
+    events: Vec<Handle>,
+    labels: Vec<&'static str>,
+    used: usize,
+    active: bool,
+}
+
+impl Drop for Prof {
+    fn drop(&mut self) {
+        // SAFETY: the events and pool were created by `profile_begin` in this context; a profile
+        // is only dropped with the GPU, after every command using them has completed.
+        unsafe {
+            for &ev in &self.events {
+                (self.inner.ze.f.zeEventDestroy)(ev);
+            }
+            (self.inner.ze.f.zeEventPoolDestroy)(self.pool);
+        }
+    }
 }
 
 impl Gpu {
@@ -209,6 +234,7 @@ impl Gpu {
                 cl,
             }),
             info,
+            prof: std::cell::RefCell::new(None),
         })
     }
 
@@ -490,6 +516,96 @@ impl Gpu {
                 std::ptr::null_mut()
             )
         )
+    }
+
+    /// Start (or restart) a profile of up to `cap` launches: every [`Gpu::launch_labeled`] until
+    /// [`Gpu::profile_take`] records its device time under its label.
+    pub fn profile_begin(&self, cap: u32) -> Result<()> {
+        let mut p = self.prof.borrow_mut();
+        if p.as_ref().is_none_or(|p| (p.events.len() as u32) < cap) {
+            *p = None;
+            let pdesc = ze_event_pool_desc_t {
+                stype: ZE_STRUCTURE_TYPE_EVENT_POOL_DESC,
+                p_next: std::ptr::null(),
+                flags: ZE_EVENT_POOL_FLAG_HOST_VISIBLE | ZE_EVENT_POOL_FLAG_KERNEL_TIMESTAMP,
+                count: cap,
+            };
+            let mut pool = std::ptr::null_mut();
+            let mut dev = self.inner.device;
+            ze!(
+                self.f(),
+                zeEventPoolCreate(self.inner.ctx, &pdesc, 1, &mut dev, &mut pool)
+            )?;
+            let mut prof = Prof {
+                inner: self.inner.clone(),
+                pool,
+                events: Vec::with_capacity(cap as usize),
+                labels: Vec::with_capacity(cap as usize),
+                used: 0,
+                active: false,
+            };
+            for i in 0..cap {
+                let edesc = ze_event_desc_t {
+                    stype: ZE_STRUCTURE_TYPE_EVENT_DESC,
+                    p_next: std::ptr::null(),
+                    index: i,
+                    signal: ZE_EVENT_SCOPE_FLAG_HOST,
+                    wait: ZE_EVENT_SCOPE_FLAG_HOST,
+                };
+                let mut ev = std::ptr::null_mut();
+                ze!(self.f(), zeEventCreate(pool, &edesc, &mut ev))?;
+                prof.events.push(ev);
+            }
+            *p = Some(prof);
+        }
+        let p = p.as_mut().expect("created above");
+        p.used = 0;
+        p.labels.clear();
+        p.active = true;
+        Ok(())
+    }
+
+    /// [`Gpu::launch`], timed under `label` while a profile is open (and has room).
+    pub fn launch_labeled(&self, k: &Kernel, groups: [u32; 3], label: &'static str) -> Result<()> {
+        let ev = {
+            let mut p = self.prof.borrow_mut();
+            match p.as_mut() {
+                Some(p) if p.active && p.used < p.events.len() => {
+                    let ev = p.events[p.used];
+                    p.used += 1;
+                    p.labels.push(label);
+                    ev
+                }
+                _ => std::ptr::null_mut(),
+            }
+        };
+        self.launch_ev(k, groups, ev)
+    }
+
+    /// Wait for the device, then return the open profile's `(label, ns)` rows and close it.
+    pub fn profile_take(&self) -> Result<Vec<(&'static str, f64)>> {
+        self.sync()?;
+        let mut p = self.prof.borrow_mut();
+        let Some(p) = p.as_mut().filter(|p| p.active) else {
+            return Ok(Vec::new());
+        };
+        let ns = self.info.timer_ns as f64;
+        let mask = if self.info.ts_bits >= 64 {
+            u64::MAX
+        } else {
+            (1u64 << self.info.ts_bits) - 1
+        };
+        let mut out = Vec::with_capacity(p.used);
+        for i in 0..p.used {
+            let mut t = ze_kernel_timestamp_result_t::default();
+            ze!(self.f(), zeEventQueryKernelTimestamp(p.events[i], &mut t))?;
+            let d = t.global.kernel_end.wrapping_sub(t.global.kernel_start) & mask;
+            out.push((p.labels[i], d as f64 * ns));
+            ze!(self.f(), zeEventHostReset(p.events[i]))?;
+        }
+        p.used = 0;
+        p.active = false;
+        Ok(out)
     }
 
     /// Time `reps` back-to-back launches of `k` with kernel timestamps; returns the device time of

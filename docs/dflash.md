@@ -50,41 +50,40 @@ semantics: llama.cpp's `src/models/dflash.cpp` (`graph<false>`, `build_dflash2_c
 
 ## Numbers
 
-Arc Pro B70 (`Vulkan1`), Qwen3.8-27B UD-Q4_K_M, the shipped DFlash2 Q4_K_M drafter, 256 tokens on
-the reasoning-heavy prompt in `crates/infr-llama/tests/dflash.rs`:
+Arc Pro B70 (`Vulkan1`), Qwen3.8-27B UD-Q4_K_M, the shipped DFlash2 Q4_K_M drafter, 512 tokens
+greedy, on two raw prompts shared with llama-server's `/completion`:
 
-| engine | mode | t/s | accept rate (drafted tokens) |
-|---|---|---:|---:|
-| infr | plain decode | 28.7 | — |
-| infr | DFlash, greedy | 39.9 (1.39×) | 0.36 |
-| infr | DFlash, temp 0.6 / top-k 20 / top-p 0.95 | 41.2 (1.44× plain sampled) | 0.40 |
-| llama.cpp Vulkan | DFlash, greedy, same rendered prompt | 25.4 | 0.30 |
+- **A:** the reasoning-heavy chat prompt in `crates/infr-llama/tests/dflash.rs`.
+- **B:** a code task with thinking off.
 
-That prompt drafts poorly on both engines; code continues further per block.
+| engine (cards) | A: t/s | B: t/s | accept rate A / B |
+|---|---:|---:|---:|
+| infr, plain decode (1) | 28.7 | 28.7 | — |
+| **infr DFlash (1)** | **50.2** | **82.3** | 0.38 / 0.71 |
+| infr DFlash, Vulkan verify (`INFR_ZE_SKINNY=0`) (1) | 38.3 | 67.8 | 0.34 / 0.71 |
+| tuned llama.cpp SYCL fork, DFlash + lookup (1) | 60 | 115 | 0.31 / 0.72 |
+| same fork, `-sm tensor` (2) | 74–77 | 143–145 | 0.32 / 0.72 |
 
-Each greedy cycle costs about 85 ms:
+TensorFold's published B70 receipt (GPTQ 4/128, different prompts) is 122.9 t/s on code and 99.3
+on chat, with DFlash2 trees and copy drafting.
+
+A greedy cycle on code costs about 72 ms:
 
 | step | time |
 |---|---:|
-| 8-row verify | ~70 ms |
-| drafter block forward | ~9 ms |
-| host selector | ~3 ms |
+| 8-row verify (one Level Zero chain, `docs/level-zero.md` § Speculative verify) | ~58 ms |
+| drafter block forward and host selector | ~12 ms |
 | injection | ~2 ms |
 | state select | ~1 ms |
 
-The verify and the drafter are both bound by the 8-row multi-row GEMVs, at about 150–250 GB/s.
-llama.cpp SYCL does an 8-token forward of this model in 41.5 ms, against our 69 ms. The Level
-Zero skinny DPAS GEMMs reach 300–520 GB/s at 8 rows, but routed through today's hybrid they lose
-to Vulkan↔Level Zero hand-offs (`docs/level-zero.md` § Skinny GEMMs, opt-in `INFR_ZE_SKINNY=1`).
-The next lever is running whole verify layers on Level Zero; it would lift MTP as well.
-
 The path there:
 
-| change | t/s |
+| change | t/s (prompt A, 256 tokens) |
 |---|---:|
 | first end-to-end run | 21.6 |
 | + GPU embed gather in VERIFY (the host table took 2.3 s and 5 GB on first use) | 29.5 |
 | + batched snapshot copies, then the per-row state history (no re-prime, verify always 8 rows) | 39.9 |
+| + the verify forward as one Level Zero chain (512 tokens) | 50.2 |
 
 ## Testing
 
@@ -109,3 +108,6 @@ The path there:
   per draft. A GPU top-k would remove the download.
 - **Draft length:** fixed at 7. An adaptive length (MTP's `n_dyn`) would cut wasted verify rows on
   low-acceptance text.
+- **Draft shape:** a single chain. Draft trees and context-copy drafting (llama.cpp's lookup
+  extension, TensorFold's copies) raise the tokens kept per verify; the drafter itself still runs on
+  Vulkan (~12 ms a cycle).

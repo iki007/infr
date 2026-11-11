@@ -622,67 +622,78 @@ fn skinny_probe(fmt: &QFormat, bin: Option<&[u8]>, m8: &str, m16: &str) {
     };
     let (k8, k16) = (kern(m8), kern(m16));
     let mut seed = 5u64;
-    // correctness
-    let (n, k) = (512usize, 1024usize);
-    let wq = random_quant(fmt, n, k, &mut seed);
-    let row_bytes = k / fmt.block_vals * fmt.block_bytes;
-    let wf: Vec<f32> = wq
-        .chunks_exact(row_bytes)
-        .flat_map(|r| infr_gguf::dequant::dequant_block(fmt.dtype, r).unwrap())
-        .collect();
-    let dw = g.alloc(wq.len()).unwrap();
-    g.upload(&dw, &wq).unwrap();
-    for (m, nsplit) in [(8usize, 1usize), (5, 3), (13, 1), (16, 4)] {
-        let kk = if m <= 8 { &k8 } else { &k16 };
-        let a: Vec<f32> = (0..m * k)
-            .map(|_| half::f16::from_f32(lcg(&mut seed)).to_f32())
+    // correctness, including outputs that are a multiple of 16 but not of 32 (a 48-wide projection)
+    for (n, k, cases) in [
+        (
+            512usize,
+            1024usize,
+            &[(8usize, 1usize), (5, 3), (13, 1), (16, 4)][..],
+        ),
+        (48, 1024, &[(8, 1), (8, 4)][..]),
+        (80, 2048, &[(8, 2), (13, 1)][..]),
+    ] {
+        let wq = random_quant(fmt, n, k, &mut seed);
+        let row_bytes = k / fmt.block_vals * fmt.block_bytes;
+        let wf: Vec<f32> = wq
+            .chunks_exact(row_bytes)
+            .flat_map(|r| infr_gguf::dequant::dequant_block(fmt.dtype, r).unwrap())
             .collect();
-        let (da, dp, dc) = (
-            g.alloc(m * k * 2).unwrap(),
-            g.alloc(nsplit * m * n * 4).unwrap(),
-            g.alloc(m * n * 4).unwrap(),
-        );
-        g.upload(&da, &f16_bytes(&a)).unwrap();
-        kk.arg_buf(0, &da).unwrap();
-        kk.arg_buf(1, &dw).unwrap();
-        kk.arg_buf(2, if nsplit > 1 { &dp } else { &dc }).unwrap();
-        kk.arg(3, m as i32).unwrap();
-        kk.arg(4, n as i32).unwrap();
-        kk.arg(5, k as i32).unwrap();
-        kk.arg(6, nsplit as i32).unwrap();
-        g.launch(kk, [n.div_ceil(256) as u32, nsplit as u32, 1])
-            .unwrap();
-        if nsplit > 1 {
-            sum.arg_buf(0, &dp).unwrap();
-            sum.arg_buf(1, &dc).unwrap();
-            sum.arg(2, (m * n) as i32).unwrap();
-            sum.arg(3, nsplit as i32).unwrap();
-            g.launch(&sum, [(m * n).div_ceil(256) as u32, 1, 1])
+        let dw = g.alloc(wq.len()).unwrap();
+        g.upload(&dw, &wq).unwrap();
+        for &(m, nsplit) in cases {
+            let kk = if m <= 8 { &k8 } else { &k16 };
+            let a: Vec<f32> = (0..m * k)
+                .map(|_| half::f16::from_f32(lcg(&mut seed)).to_f32())
+                .collect();
+            let (da, dp, dc) = (
+                g.alloc(m * k * 2).unwrap(),
+                g.alloc(nsplit * m * n * 4).unwrap(),
+                g.alloc(m * n * 4).unwrap(),
+            );
+            g.upload(&da, &f16_bytes(&a)).unwrap();
+            kk.arg_buf(0, &da).unwrap();
+            kk.arg_buf(1, &dw).unwrap();
+            kk.arg_buf(2, if nsplit > 1 { &dp } else { &dc }).unwrap();
+            kk.arg(3, m as i32).unwrap();
+            kk.arg(4, n as i32).unwrap();
+            kk.arg(5, k as i32).unwrap();
+            kk.arg(6, nsplit as i32).unwrap();
+            g.launch(kk, [n.div_ceil(256) as u32, nsplit as u32, 1])
                 .unwrap();
-        }
-        let mut out = vec![0u8; m * n * 4];
-        g.download(&dc, &mut out).unwrap();
-        let c: Vec<f32> = out
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|x| f32::from_le_bytes(*x))
-            .collect();
-        let (mut worst, mut big) = (0.0f64, 0.0f64);
-        for r in 0..m {
-            for col in 0..n {
-                let s: f64 = (0..k)
-                    .map(|i| a[r * k + i] as f64 * wf[col * k + i] as f64)
-                    .sum();
-                worst = worst.max((c[r * n + col] as f64 - s).abs());
-                big = big.max(s.abs());
+            if nsplit > 1 {
+                sum.arg_buf(0, &dp).unwrap();
+                sum.arg_buf(1, &dc).unwrap();
+                sum.arg(2, (m * n) as i32).unwrap();
+                sum.arg(3, nsplit as i32).unwrap();
+                g.launch(&sum, [(m * n).div_ceil(256) as u32, 1, 1])
+                    .unwrap();
             }
+            let mut out = vec![0u8; m * n * 4];
+            g.download(&dc, &mut out).unwrap();
+            let c: Vec<f32> = out
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|x| f32::from_le_bytes(*x))
+                .collect();
+            let (mut worst, mut big) = (0.0f64, 0.0f64);
+            for r in 0..m {
+                for col in 0..n {
+                    let s: f64 = (0..k)
+                        .map(|i| a[r * k + i] as f64 * wf[col * k + i] as f64)
+                        .sum();
+                    worst = worst.max((c[r * n + col] as f64 - s).abs());
+                    big = big.max(s.abs());
+                }
+            }
+            println!(
+                "{m8} n={n} m={m} split={nsplit}: worst abs err {worst:.3e} (max |C| {big:.2})"
+            );
+            assert!(
+                worst < 2e-3 * big,
+                "{m8} m={m} split={nsplit} mismatch {worst}"
+            );
         }
-        println!("{m8} m={m} split={nsplit}: worst abs err {worst:.3e} (max |C| {big:.2})");
-        assert!(
-            worst < 2e-3 * big,
-            "{m8} m={m} split={nsplit} mismatch {worst}"
-        );
     }
     // timing at the 27B verify shapes
     for (n, k) in [
@@ -891,4 +902,24 @@ fn launch_overhead_probe() {
             t0.elapsed().as_secs_f64() * 1e6 / n as f64
         );
     }
+}
+
+#[test]
+#[ignore = "requires a Level Zero GPU"]
+fn skinny_q8_0_probe() {
+    let fmt = QFormat {
+        name: "gemm_q8_0_m8",
+        dtype: infr_core::DType::Q8_0,
+        block_bytes: 34,
+        block_vals: 32,
+        f16_fields: &[0],
+        wg_m: 8,
+        wg_n: 256,
+    };
+    skinny_probe(
+        &fmt,
+        infr_ze::kernels::gemm_iq4(),
+        "gemm_q8_0_m8",
+        "gemm_q8_0_m16",
+    );
 }

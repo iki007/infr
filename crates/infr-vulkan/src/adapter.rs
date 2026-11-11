@@ -5791,6 +5791,24 @@ fn ze_plan(
         }
         _ => false,
     };
+    let plan = infr_core::fusion::plan_fusions(graph, &fusion_cfg(be_));
+    // A verify-sized graph (a speculative verify: every Linear 2..=16 rows; `INFR_ZE_SKINNY=0`
+    // turns it off): the rest of the layer joins the chain too, so a forward is a few Level Zero
+    // chains instead of a hand-off around every GEMM.
+    let skinny = be_.cfg().kernels.vulkan.ze_skinny;
+    // A target VERIFY only for now: a DFlash draft block also has 8-row GEMMs, but its block conv
+    // and canvas attention stay on Vulkan, and the hand-offs around them cost more than its GEMMs
+    // save (measured: draft 12 -> 18 ms a cycle).
+    let small_graph = skinny
+        && graph.mtp_verify
+        && graph
+            .ops
+            .iter()
+            .any(|o| matches!(o, Op::Linear { m, .. } if crate::ze::ze_small(*m as usize, true)))
+        && !graph
+            .ops
+            .iter()
+            .any(|o| matches!(o, Op::Linear { m, .. } if *m as usize > 16));
     let gemm = |op: &Op| match op {
         Op::Linear {
             x,
@@ -5801,21 +5819,183 @@ fn ze_plan(
             out_f,
             ..
         } => {
-            crate::ze::ze_dtype(graph.desc(*weight).dtype)
-                && crate::ze::ze_shape(
-                    graph.desc(*weight).dtype,
-                    *m as usize,
-                    *in_f as usize,
-                    *out_f as usize,
-                    be_.cfg().kernels.vulkan.ze_skinny,
-                )
-                && arena(x)
+            crate::ze::ze_shape(
+                graph.desc(*weight).dtype,
+                *m as usize,
+                *in_f as usize,
+                *out_f as usize,
+                small_graph,
+            ) && arena(x)
                 && arena(dst)
                 && exportable(weight)
         }
         _ => false,
     };
-    let candidate = |op: &Op| match op {
+    let f32t = |t: &TensorId| graph.desc(*t).dtype == DType::F32;
+    let internal16 = |t: &TensorId| {
+        graph.desc(*t).dtype == DType::F16
+            && matches!(graph.tensors[t.0 as usize].kind, TensorKind::Internal)
+    };
+    // An operand Level Zero imports in place: a bound exportable allocation (KV caches, recurrent
+    // state, a verify's state history, the DFlash tap ring) — never shadow-copied.
+    let direct = |t: &TensorId| {
+        !matches!(graph.tensors[t.0 as usize].kind, TensorKind::Internal) && exportable(t)
+    };
+    // Verify-sized attention (`attn_dec256`): head dim 256, causal, f16 Q and non-ring caches.
+    let attention_dec = |op: &Op| match op {
+        Op::Attention {
+            q,
+            k_cache,
+            v_cache,
+            dst,
+            rows,
+            kv_len,
+            n_head,
+            n_kv,
+            head_dim,
+            mask,
+            sinks,
+            key_bias,
+            ..
+        } => {
+            small_graph
+                && *head_dim == 256
+                && crate::ze::ze_small(*rows as usize, true)
+                && *n_kv > 0
+                && *n_head > 0
+                && n_head % n_kv == 0
+                && sinks.is_none()
+                && key_bias.is_none()
+                && matches!(mask, AttnMask::Causal)
+                && internal16(q)
+                && arena(dst)
+                && graph.desc(*k_cache).dtype == DType::F16
+                && graph.desc(*v_cache).dtype == DType::F16
+                && graph.desc(*k_cache).numel() / (*n_kv as usize * 256) >= *kv_len as usize
+                && graph.desc(*v_cache).numel() / (*n_kv as usize * 256) >= *kv_len as usize
+                && direct(k_cache)
+                && direct(v_cache)
+        }
+        _ => false,
+    };
+    // The rest of a verify-sized layer (`decode.cl`).
+    let small_op = |i: usize, op: &Op| {
+        small_graph
+            && match op {
+                Op::Copy { src, dst, .. } | Op::CopyStrided { src, dst, .. } => {
+                    f32t(src)
+                        && f32t(dst)
+                        && (arena(src) || direct(src))
+                        && (arena(dst) || direct(dst))
+                }
+                Op::GatedAct {
+                    gate,
+                    up,
+                    dst,
+                    act,
+                    up_off,
+                    up_stride,
+                    gate_stride,
+                    gate_block_width,
+                    swiglu_clamp,
+                    ..
+                } => {
+                    swiglu_clamp.is_none()
+                        && *up_off == 0
+                        && *up_stride == 0
+                        && match act {
+                            Activation::Silu => *gate_stride == 0 && *gate_block_width == 0,
+                            Activation::Sigmoid => true,
+                            Activation::Gelu => false,
+                        }
+                        && arena(gate)
+                        && arena(up)
+                        && arena(dst)
+                }
+                Op::GatedRmsNorm {
+                    x,
+                    weight,
+                    gate,
+                    dst,
+                    ..
+                } => arena(x) && arena(gate) && arena(dst) && f32t(weight) && exportable(weight),
+                Op::Conv1dSilu {
+                    x,
+                    weight,
+                    state,
+                    dst,
+                    ..
+                } => {
+                    arena(x)
+                        && arena(dst)
+                        && f32t(weight)
+                        && exportable(weight)
+                        && f32t(state)
+                        && direct(state)
+                }
+                Op::DeltaNet {
+                    q,
+                    k,
+                    v,
+                    b,
+                    a,
+                    a_coef,
+                    dt_bias,
+                    state,
+                    dst,
+                    hist,
+                    head_k,
+                    head_v,
+                    ..
+                } => {
+                    *head_k <= 128
+                        && [q, k, v, b, a, dst].iter().all(|t| arena(t))
+                        && exportable(a_coef)
+                        && exportable(dt_bias)
+                        && f32t(state)
+                        && direct(state)
+                        && hist.as_ref().is_none_or(|h| f32t(h) && direct(h))
+                        && *head_v > 0
+                }
+                Op::QkNormRope {
+                    x,
+                    weight,
+                    dst,
+                    head_dim,
+                    rope_dim,
+                    freq_factors,
+                    ..
+                } => {
+                    freq_factors.is_none()
+                        && *head_dim <= 512
+                        && rope_dim % 2 == 0
+                        && arena(x)
+                        && f32t(weight)
+                        && exportable(weight)
+                        && match plan.kv_write.get(&i) {
+                            Some(&(cache, _)) => {
+                                graph.desc(cache).dtype == DType::F16 && direct(&cache)
+                            }
+                            None => internal16(dst),
+                        }
+                }
+                Op::WriteKv {
+                    src,
+                    cache,
+                    rows,
+                    row_stride,
+                    pos,
+                } => {
+                    let cap = graph.desc(*cache).numel() / (*row_stride as usize).max(1);
+                    graph.desc(*cache).dtype == DType::F16
+                        && direct(cache)
+                        && (arena(src) || internal16(src))
+                        && (*pos + *rows) as usize <= cap
+                }
+                op => attention_dec(op),
+            }
+    };
+    let candidate = |i: usize, op: &Op| match op {
         Op::Add { a, b, dst, .. } => arena(a) && arena(b) && arena(dst),
         Op::RmsNorm { x, weight, dst, .. } => {
             arena(x) && arena(dst) && graph.desc(*weight).dtype == DType::F32 && exportable(weight)
@@ -5823,9 +6003,8 @@ fn ze_plan(
         Op::GatedActFused { gu, dst, act, .. } => {
             matches!(act, Activation::Silu) && arena(gu) && arena(dst)
         }
-        op => gemm(op) || attention(op),
+        op => gemm(op) || attention(op) || small_op(i, op),
     };
-    let plan = infr_core::fusion::plan_fusions(graph, &fusion_cfg(be_));
     let mut skip = plan.skip.clone();
     for &idx in plan.linear_add.keys() {
         if gemm(&graph.ops[idx]) {
@@ -5834,16 +6013,15 @@ fn ze_plan(
     }
     let mut run: Vec<usize> = Vec::new();
     let flush = |run: &mut Vec<usize>, out: &mut std::collections::HashSet<usize>| {
-        if run
-            .iter()
-            .any(|&i| gemm(&graph.ops[i]) || attention(&graph.ops[i]))
-        {
+        if run.iter().any(|&i| {
+            gemm(&graph.ops[i]) || attention(&graph.ops[i]) || attention_dec(&graph.ops[i])
+        }) {
             out.extend(run.iter().copied());
         }
         run.clear();
     };
     for (i, op) in infr_core::exec::live_ops(&graph.ops, &skip) {
-        if candidate(op) {
+        if candidate(i, op) {
             run.push(i);
         } else {
             flush(&mut run, &mut out);
@@ -5851,6 +6029,22 @@ fn ze_plan(
     }
     flush(&mut run, &mut out);
     out
+}
+
+/// Is the next live op a Level Zero GEMM reading `x` (`rows` x `dim`)? Then its producer can write
+/// the f16 A copy in place of the GEMM's own conversion.
+fn ze_gemm_next(
+    graph: &Graph,
+    ze_ops: &std::collections::HashSet<usize>,
+    idx: usize,
+    x: TensorId,
+    rows: usize,
+    dim: usize,
+) -> bool {
+    let next = idx + 1;
+    ze_ops.contains(&next)
+        && matches!(&graph.ops.get(next), Some(Op::Linear { x: nx, m, in_f, .. })
+            if *nx == x && *m as usize == rows && *in_f as usize == dim)
 }
 
 /// [`alloc_scratch`]'s byte size for an `Internal` tensor (leading dim padded to 64 rows).
@@ -5897,12 +6091,27 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
                 Op::RmsNorm { x, dst, .. } => vec![*x, *dst],
                 Op::GatedActFused { gu, dst, .. } => vec![*gu, *dst],
                 Op::Attention { q, dst, .. } => vec![*q, *dst],
+                // The verify-sized layer ops' activations (their state, cache and history operands
+                // are bound exportable allocations, imported in place below).
+                Op::Copy { src, dst, .. } | Op::CopyStrided { src, dst, .. } => vec![*src, *dst],
+                Op::GatedAct { gate, up, dst, .. } => vec![*gate, *up, *dst],
+                Op::GatedRmsNorm { x, gate, dst, .. } => vec![*x, *gate, *dst],
+                Op::Conv1dSilu { x, dst, .. } => vec![*x, *dst],
+                Op::DeltaNet {
+                    q, k, v, b, a, dst, ..
+                } => vec![*q, *k, *v, *b, *a, *dst],
+                Op::QkNormRope { x, dst, .. } => vec![*x, *dst],
+                Op::WriteKv { src, .. } => vec![*src],
                 _ => vec![],
             };
             for t in ts {
                 let internal = matches!(graph.tensors[t.0 as usize].kind, TensorKind::Internal);
+                // A bound exportable allocation is imported where it is: no arena copy.
+                let in_place = !internal && bindings.get(t).is_some_and(|b| be_.ze_operand_ok(b));
                 let fresh = if internal {
                     ze_dsts.insert(t.0 as usize)
+                } else if in_place {
+                    false
                 } else if !ze_shadow.contains(&t) {
                     ze_shadow.push(t);
                     true
@@ -6039,9 +6248,28 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
     // A run of Level Zero GEMMs on the same input (qkv + z, gate + up, q/k/v) is one chain: Level
     // Zero waits once and signals once, with no empty Vulkan segment between its GEMMs. `Some(v)`
     // while inside a chain whose first GEMM waited `v` (then `rec` is `None`).
+    let ze_prof = be_.cfg().prof.ops && !ze_ops.is_empty();
+    if ze_prof {
+        be_.ze_bridge()
+            .expect("ze_plan needs the bridge")
+            .profile_begin()?;
+    }
     let mut ze_chain: Option<u64> = None;
+    // The f16 A copy the last Level Zero GEMM made, valid only for the GEMM right after it.
+    let mut ze_a16_memo: Option<(TensorId, usize, usize)> = None;
+    // Set by a Level Zero producer that wrote the next skinny GEMM's f16 A copy itself (the
+    // RMSNorm's `y16`): becomes `ze_a16_memo` for the op right after it.
+    let mut ze_a16_next: Option<(TensorId, usize, usize)> = None;
     let mut live = infr_core::exec::live_ops(&graph.ops, &skip_op).peekable();
     while let Some((op_idx, op)) = live.next() {
+        if ze_ops.contains(&op_idx) && matches!(op, Op::Linear { .. }) {
+            if let Some(n) = ze_a16_next.take() {
+                ze_a16_memo = Some(n);
+            }
+        } else {
+            ze_a16_memo = None;
+            ze_a16_next = None;
+        }
         // ── shutdown (SIGINT/SIGTERM) ─────────────────────────────────────────────────────────
         // Polled HERE — at the op/submit boundary INSIDE the forward — and not merely between
         // tokens, because on the devices that split (§ the splitter above) a single forward is
@@ -6137,10 +6365,17 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
                 } => {
                     let (m, in_f, out_f) = (*m as usize, *in_f as usize, *out_f as usize);
                     let k16 = x256_a16(&mut pool, be_, m, in_f)?;
-                    if memo_prev != Some((*x, m, in_f)) {
+                    // `mmv_memo` names an f16 `_x256` copy only at m >= 256; below that it is the
+                    // Vulkan int8 GEMV's quantized copy. A skinny GEMM reuses only the f16 copy the
+                    // Level Zero GEMM right before it made (`ze_a16_memo`), and leaves the shared
+                    // memo clear so a Vulkan GEMV after it quantizes its own input.
+                    let have = ze_a16_memo == Some((*x, m, in_f))
+                        || (m >= 256 && memo_prev == Some((*x, m, in_f)));
+                    if !have {
                         bridge.to_f16(be_, r(*x)?, pool[&k16].as_ref(), m * in_f)?;
                     }
-                    mmv_memo = Some((*x, m, in_f));
+                    ze_a16_memo = Some((*x, m, in_f));
+                    mmv_memo = (m >= 256).then_some((*x, m, in_f));
                     let dt = graph.desc(*weight).dtype;
                     bridge.gemm(
                         be_,
@@ -6167,6 +6402,11 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
                         && prefill_x256_linear_next(be_, graph, op_idx, *dst, dim, rows)
                     {
                         mmv_memo = Some((*dst, rows, dim));
+                        Some(x256_a16(&mut pool, be_, rows, dim)?)
+                    } else if rows <= 16 && ze_gemm_next(graph, &ze_ops, op_idx, *dst, rows, dim) {
+                        // A skinny GEMM reads this next: write its f16 copy here, as the GEMM's
+                        // own `ze_a16_memo` hand-off would.
+                        ze_a16_next = Some((*dst, rows, dim));
                         Some(x256_a16(&mut pool, be_, rows, dim)?)
                     } else {
                         None
@@ -6225,7 +6465,7 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
                     mask,
                     pos,
                     ..
-                } => {
+                } if *rows as usize > 16 => {
                     let window = match mask {
                         AttnMask::SlidingWindow(w) => *w,
                         _ => 0,
@@ -6242,6 +6482,274 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
                         *n_kv as usize,
                         *pos as usize,
                         window,
+                        *scale,
+                    )?;
+                }
+                // ── The verify-sized layer ops (`decode.cl`, `attn_dec.cl`) ──
+                Op::Copy {
+                    src,
+                    src_off,
+                    dst,
+                    dst_off,
+                    n,
+                } => {
+                    use crate::ze::ZArg::{I, O};
+                    bridge.run(
+                        be_,
+                        "copy_f32",
+                        &[
+                            O(r(*src)?, *src_off as usize * 4),
+                            O(r(*dst)?, *dst_off as usize * 4),
+                            I(*n as i32),
+                        ],
+                        [n.div_ceil(256), 1, 1],
+                    )?;
+                }
+                Op::CopyStrided {
+                    src,
+                    src_off,
+                    src_stride,
+                    dst,
+                    dst_off,
+                    dst_stride,
+                    rows,
+                    n,
+                } => {
+                    use crate::ze::ZArg::{I, O};
+                    bridge.run(
+                        be_,
+                        "copy_strided",
+                        &[
+                            O(r(*src)?, *src_off as usize * 4),
+                            O(r(*dst)?, *dst_off as usize * 4),
+                            I(*rows as i32),
+                            I(*n as i32),
+                            I(*src_stride as i32),
+                            I(*dst_stride as i32),
+                        ],
+                        [(rows * n).div_ceil(256), 1, 1],
+                    )?;
+                }
+                Op::WriteKv {
+                    src,
+                    cache,
+                    rows,
+                    row_stride,
+                    pos,
+                } => {
+                    use crate::ze::ZArg::{B, I, O};
+                    let n = rows * row_stride;
+                    let kernel = if graph.desc(*src).dtype == DType::F16 {
+                        "copy_f16"
+                    } else {
+                        "store_f16"
+                    };
+                    bridge.run(
+                        be_,
+                        kernel,
+                        &[
+                            B(r(*src)?),
+                            O(r(*cache)?, (*pos * *row_stride) as usize * 2),
+                            I(n as i32),
+                        ],
+                        [n.div_ceil(256), 1, 1],
+                    )?;
+                }
+                Op::GatedAct {
+                    gate,
+                    up,
+                    dst,
+                    rows,
+                    nff,
+                    act,
+                    gate_stride,
+                    gate_block_width,
+                    ..
+                } => {
+                    use crate::ze::ZArg::{B, I};
+                    let n = rows * nff;
+                    bridge.run(
+                        be_,
+                        "gated_act",
+                        &[
+                            B(r(*gate)?),
+                            B(r(*up)?),
+                            B(r(*dst)?),
+                            I(n as i32),
+                            I(i32::from(matches!(act, Activation::Sigmoid))),
+                            I(*gate_stride as i32),
+                            I(*nff as i32),
+                            I(*gate_block_width as i32),
+                        ],
+                        [n.div_ceil(256), 1, 1],
+                    )?;
+                }
+                Op::GatedRmsNorm {
+                    x,
+                    weight,
+                    gate,
+                    dst,
+                    rows,
+                    n_head,
+                    head_dim,
+                    eps,
+                } => {
+                    use crate::ze::ZArg::{B, F, I};
+                    bridge.run(
+                        be_,
+                        "gated_rmsnorm",
+                        &[
+                            B(r(*x)?),
+                            B(r(*weight)?),
+                            B(r(*gate)?),
+                            B(r(*dst)?),
+                            I(*head_dim as i32),
+                            F(*eps),
+                        ],
+                        [rows * n_head, 1, 1],
+                    )?;
+                }
+                Op::Conv1dSilu {
+                    x,
+                    weight,
+                    state,
+                    dst,
+                    rows,
+                    channels,
+                    kernel,
+                } => {
+                    use crate::ze::ZArg::{B, I};
+                    bridge.run(
+                        be_,
+                        "conv1d_silu",
+                        &[
+                            B(r(*x)?),
+                            B(r(*weight)?),
+                            B(r(*state)?),
+                            B(r(*dst)?),
+                            I(*rows as i32),
+                            I(*channels as i32),
+                            I(*kernel as i32),
+                        ],
+                        [channels.div_ceil(256), 1, 1],
+                    )?;
+                }
+                Op::DeltaNet {
+                    q,
+                    k,
+                    v,
+                    b,
+                    a,
+                    a_coef,
+                    dt_bias,
+                    state,
+                    dst,
+                    rows,
+                    n_vhead,
+                    n_khead,
+                    head_k,
+                    head_v,
+                    eps,
+                    src_stride,
+                    hist,
+                } => {
+                    use crate::ze::ZArg::{B, F, I};
+                    let hist_buf = match hist {
+                        Some(h) => r(*h)?,
+                        None => r(*dst)?,
+                    };
+                    bridge.run(
+                        be_,
+                        "deltanet_hist",
+                        &[
+                            B(r(*q)?),
+                            B(r(*k)?),
+                            B(r(*v)?),
+                            B(r(*b)?),
+                            B(r(*a)?),
+                            B(r(*a_coef)?),
+                            B(r(*dt_bias)?),
+                            B(r(*state)?),
+                            B(r(*dst)?),
+                            B(hist_buf),
+                            I(*rows as i32),
+                            I(*n_vhead as i32),
+                            I(*n_khead as i32),
+                            I(*head_k as i32),
+                            I(*head_v as i32),
+                            F(*eps),
+                            F(1.0 / (*head_k as f32).sqrt()),
+                            I(*src_stride as i32),
+                            I(i32::from(hist.is_some())),
+                        ],
+                        [n_vhead * head_v.div_ceil(16), 1, 1],
+                    )?;
+                }
+                Op::QkNormRope {
+                    x,
+                    weight,
+                    positions,
+                    dst,
+                    rows,
+                    n_head,
+                    head_dim,
+                    rope_dim,
+                    theta,
+                    eps,
+                    x_stride,
+                    ..
+                } => {
+                    use crate::ze::ZArg::{B, F, I};
+                    // Fused with the following KV write (`kv_write_peephole`): straight into the
+                    // cache at the write row.
+                    let (out, row0) = match fused_kv_write.get(&op_idx) {
+                        Some(&(cache, pos)) => (r(cache)?, pos),
+                        None => (r(*dst)?, 0),
+                    };
+                    let rp = rope_pos.get(&positions.0).copied().unwrap_or(0);
+                    bridge.run(
+                        be_,
+                        "qk_norm_rope",
+                        &[
+                            B(r(*x)?),
+                            B(r(*weight)?),
+                            B(out),
+                            I(*n_head as i32),
+                            I(*head_dim as i32),
+                            I(*rope_dim as i32),
+                            F(*theta),
+                            I(rp as i32),
+                            I(row0 as i32),
+                            F(*eps),
+                            I(*x_stride as i32),
+                        ],
+                        [rows * n_head, 1, 1],
+                    )?;
+                }
+                Op::Attention {
+                    q,
+                    k_cache,
+                    v_cache,
+                    dst,
+                    rows,
+                    kv_len,
+                    n_head,
+                    n_kv,
+                    scale,
+                    pos,
+                    ..
+                } if (*rows as usize) <= 16 => {
+                    bridge.attention_dec(
+                        be_,
+                        r(*q)?,
+                        r(*k_cache)?,
+                        r(*v_cache)?,
+                        r(*dst)?,
+                        *rows as usize,
+                        *kv_len as usize,
+                        *n_head as usize,
+                        *n_kv as usize,
+                        *pos as usize,
                         *scale,
                     )?;
                 }
@@ -6371,6 +6879,11 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
     }
     submitted_dispatches += last.dispatches();
     last.finish().map_err(|e| be(e.to_string()))?;
+    if ze_prof {
+        be_.ze_bridge()
+            .expect("ze_plan needs the bridge")
+            .profile_report()?;
+    }
     // The blocking finish above already waited the queue idle — draining just releases the
     // pipelined segments' command buffers/fences (every buffer they referenced outlives this
     // call: pooled scratch in `transient`, ring/tape/arenas on the session).

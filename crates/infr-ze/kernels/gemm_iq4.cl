@@ -303,7 +303,7 @@ inline void gemm_iq4xs_sk(__global const half* A, __global const uchar* W, __glo
     const int s1 = min(nsb, s0 + per);
     const size_t rowb = (size_t)nsb * BLK;
     __global const uchar* row0 = W + (size_t)(n0 + lane) * rowb;
-    __global const uchar* row1 = row0 + 16 * rowb;
+    __global const uchar* row1 = n0 + 16 < N ? row0 + 16 * rowb : row0;
     float8 acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     for (int s = s0; s < s1; s++) {
         __global const uchar* blk[2] = {row0 + s * BLK, row1 + s * BLK};
@@ -346,7 +346,7 @@ inline void gemm_iq4nl_sk(__global const half* A, __global const uchar* W, __glo
     const size_t rowb = (size_t)(K / 32) * 18;
     __global const uchar* rows[2];
     rows[0] = W + (size_t)(n0 + lane) * rowb;
-    rows[1] = rows[0] + 16 * rowb;
+    rows[1] = n0 + 16 < N ? rows[0] + 16 * rowb : rows[0];
     float8 acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     for (int bp = p0; bp < p1; bp++) {
         __attribute__((opencl_unroll_hint))
@@ -369,6 +369,48 @@ inline void gemm_iq4nl_sk(__global const half* A, __global const uchar* W, __glo
     sk_store(C, M, N, n0, mt, acc);
 }
 
+// Q8_0 (34-byte blocks of 32: f16 d, then 32 int8), walked in dword-aligned block pairs (K % 64
+// == 0) as IQ4_NL is. No codebook: int8 -> half is exact, then the block scale.
+inline void gemm_q8_0_sk(__global const half* A, __global const uchar* W, __global float* C,
+                         int M, int N, int K, int nsplit, const int mt, __local uint* lut) {
+    const int sg = get_sub_group_id();
+    const int lane = get_sub_group_local_id();
+    const int n0 = get_group_id(0) * 256 + sg * 32;
+    if (n0 >= N)
+        return;
+    const int npair = K / 64;
+    const int per = (npair + nsplit - 1) / nsplit;
+    const int p0 = get_group_id(1) * per;
+    const int p1 = min(npair, p0 + per);
+    const size_t rowb = (size_t)(K / 32) * 34;
+    __global const uchar* rows[2];
+    rows[0] = W + (size_t)(n0 + lane) * rowb;
+    rows[1] = n0 + 16 < N ? rows[0] + 16 * rowb : rows[0];
+    float8 acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (int bp = p0; bp < p1; bp++) {
+        __attribute__((opencl_unroll_hint))
+        for (int odd = 0; odd < 2; odd++) {
+            const int b = 2 * bp + odd;
+            half d[2];
+            uint4 q[2][2];
+            for (int j = 0; j < 2; j++) {
+                __global const uchar* blk = rows[j] + (size_t)b * 34;
+                d[j] = ld_d(blk, odd);
+                q[j][0] = ld16(blk + 2, !odd);
+                q[j][1] = ld16(blk + 18, !odd);
+            }
+            __attribute__((opencl_unroll_hint))
+            for (int h = 0; h < 2; h++) {
+                int8 bb[2];
+                for (int j = 0; j < 2; j++)
+                    bb[j] = as_int8(convert_half16(as_char16(q[j][h])) * d[j]);
+                sk_step(A, M, K, b * 32 + h * 16, mt, bb[0], bb[1], acc);
+            }
+        }
+    }
+    sk_store(C, M, N, n0, mt, acc);
+}
+
 #define IQ4_SKINNY(name, body, mt)                                                                 \
     __attribute__((intel_reqd_sub_group_size(16)))                                                 \
     __attribute__((reqd_work_group_size(128, 1, 1)))                                               \
@@ -384,3 +426,5 @@ IQ4_SKINNY(gemm_iq4xs_m8, gemm_iq4xs_sk, 1)
 IQ4_SKINNY(gemm_iq4xs_m16, gemm_iq4xs_sk, 2)
 IQ4_SKINNY(gemm_iq4nl_m8, gemm_iq4nl_sk, 1)
 IQ4_SKINNY(gemm_iq4nl_m16, gemm_iq4nl_sk, 2)
+IQ4_SKINNY(gemm_q8_0_m8, gemm_q8_0_sk, 1)
+IQ4_SKINNY(gemm_q8_0_m16, gemm_q8_0_sk, 2)

@@ -243,11 +243,11 @@ cfg_struct! {
         /// `docs/level-zero.md`), between Vulkan segments. Without Level Zero (or off Xe2) the
         /// Vulkan path runs unchanged.
         ze_gemm: bool = true,
-        /// `INFR_ZE_SKINNY` (opt-in): also run 2..=16-row GEMMs — a speculative verify, a DFlash
-        /// draft block — as Level Zero skinny DPAS kernels. The kernels stream weights ~3x faster
-        /// than Vulkan's multi-row GEMV, but each layer still crosses back to Vulkan for its other
-        /// ops, and those hand-offs cost more than the GEMMs save (`docs/level-zero.md`).
-        ze_skinny: bool = false,
+        /// `INFR_ZE_SKINNY` (`0` turns it off): on Intel Xe2 with Level Zero, run a speculative
+        /// verify's whole forward (DFlash, MTP) as one Level Zero chain — skinny DPAS GEMMs plus the
+        /// layer's DeltaNet, conv, norm, RoPE, KV-write and attention kernels — instead of
+        /// Vulkan's multi-row GEMV (`docs/level-zero.md`). Only verify graphs are affected.
+        ze_skinny: bool = true,
         /// `INFR_NO_I8DOT` (inverted).
         i8_dot: bool = true,
 

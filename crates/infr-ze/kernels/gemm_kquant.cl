@@ -208,7 +208,9 @@ inline void gemm_kq_sk(__global const half* A, __global const uchar* W, __global
     const int s1 = min(nsb, s0 + per);
     const size_t rowb = (size_t)nsb * BLK;
     __global const uchar* row0 = W + (size_t)(n0 + lane) * rowb;
-    __global const uchar* row1 = row0 + 16 * rowb;
+    // N % 32 == 16 (a 48-wide projection): the last subgroup's upper 16 columns do not exist —
+    // they re-read row0 and the bounded C write drops them.
+    __global const uchar* row1 = n0 + 16 < N ? row0 + 16 * rowb : row0;
 
     float8 acc[2][2];
     for (int i = 0; i < 2; i++) {

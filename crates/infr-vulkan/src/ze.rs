@@ -46,11 +46,52 @@ fn weight_block(dt: DType) -> Option<(usize, usize, usize)> {
 /// 2..=16 rows, a speculative verify or a DFlash draft block (the skinny GEMMs, opt-in with
 /// `skinny`: N a multiple of 32). Single-row decode stays on Vulkan.
 pub(crate) fn ze_shape(dt: DType, m: usize, in_f: usize, out_f: usize, skinny: bool) -> bool {
-    weight_block(dt).is_some_and(|(_, _, kmul)| {
-        in_f.is_multiple_of(kmul)
-            && ((m >= 256 && out_f.is_multiple_of(64))
-                || (skinny && (2..=SKINNY_MAX_M).contains(&m) && out_f.is_multiple_of(32)))
-    })
+    let prefill = weight_block(dt).is_some_and(|(_, _, kmul)| {
+        m >= 256 && out_f.is_multiple_of(64) && in_f.is_multiple_of(kmul)
+    });
+    let small = skinny
+        && (2..=SKINNY_MAX_M).contains(&m)
+        && out_f.is_multiple_of(16)
+        && skinny_block(dt).is_some_and(|(_, _, kmul)| in_f.is_multiple_of(kmul));
+    prefill || small
+}
+
+/// [`weight_block`] for the skinny GEMMs, which also cover Q8_0 (34-byte blocks of 32, walked in
+/// dword-aligned pairs).
+fn skinny_block(dt: DType) -> Option<(usize, usize, usize)> {
+    match dt {
+        DType::Q8_0 => Some((32, 34, 64)),
+        _ => weight_block(dt),
+    }
+}
+
+/// Can an op of `rows` rows run as one of the verify-sized Level Zero kernels (the chain that
+/// carries a whole speculative-verify layer, `INFR_ZE_SKINNY`)?
+pub(crate) fn ze_small(rows: usize, skinny: bool) -> bool {
+    skinny && (2..=SKINNY_MAX_M).contains(&rows)
+}
+
+/// The profile label of a skinny GEMM.
+fn skinny_label(dt: DType) -> &'static str {
+    match dt {
+        DType::Q4K => "gemm_sk_q4k",
+        DType::Q5K => "gemm_sk_q5k",
+        DType::Q6K => "gemm_sk_q6k",
+        DType::Q3K => "gemm_sk_q3k",
+        DType::Iq4Xs => "gemm_sk_iq4xs",
+        DType::Iq4Nl => "gemm_sk_iq4nl",
+        DType::Q8_0 => "gemm_sk_q8_0",
+        _ => "gemm_sk",
+    }
+}
+
+/// One argument of a [`ZeBridge::run`] launch.
+pub(crate) enum ZArg<'a> {
+    B(&'a dyn Buffer),
+    /// A buffer at a further byte offset.
+    O(&'a dyn Buffer, usize),
+    I(i32),
+    F(f32),
 }
 
 /// The skinny GEMMs' row cap (two DPAS row blocks).
@@ -60,17 +101,23 @@ const SKINNY_MAX_M: usize = 16;
 /// narrow one (a 5120-wide projection is 160 subgroups) splits K four ways so enough of them stream
 /// at once. Measured on the B70 at m=8: Q4_K 17408->5120 166 us unsplit, 97 us in 4 (517 GB/s).
 fn skinny_splits(dt: DType, in_f: usize, out_f: usize) -> usize {
-    let (vals, _, kmul) = weight_block(dt).expect("ze_shape admitted the dtype");
-    // Split units: superblocks, superblock pairs, or IQ4_NL block pairs.
+    let (vals, _, kmul) = skinny_block(dt).expect("ze_shape admitted the dtype");
+    // Split units: superblocks, superblock pairs, or IQ4_NL / Q8_0 block pairs.
     let units = in_f / kmul.max(vals);
     if out_f >= 32768 || units < 8 {
         1
-    } else {
+    } else if out_f >= 1024 {
         4
+    } else {
+        // A narrow output (the 48-wide DeltaNet beta/alpha projections: two subgroups' worth of
+        // columns) streams almost nothing per subgroup, so it is latency-bound: split K as far
+        // as two units a split, up to 16 ways (measured 26 us a call unsplit-ish at 4).
+        (units / 2).clamp(4, 16)
     }
 }
 
-/// Bytes of the skinny GEMMs' split-K partials buffer: 4 splits of [16, 32768) f32.
+/// Bytes of the skinny GEMMs' split-K partials buffer: 4 splits of [16, 32768) f32 (the up-to-16
+/// splits of a narrow output fit in the same bytes).
 const SKINNY_PARTIALS: usize = 4 * SKINNY_MAX_M * 32768 * 4;
 
 #[cfg(target_os = "linux")]
@@ -126,6 +173,10 @@ mod imp {
         sum_splits: infr_ze::Kernel,
         /// Split-K partials of the skinny GEMMs ([split][M][N] f32), Level Zero-owned.
         partials: infr_ze::DevBuf,
+        /// The verify-sized layer ops (`decode.cl`, `attn_dec.cl`) by kernel name.
+        dec: HashMap<&'static str, infr_ze::Kernel>,
+        /// `attn_dec256`'s chunk partials (o, then (m, l)), grown on demand.
+        attn_parts: Option<(infr_ze::DevBuf, infr_ze::DevBuf, usize)>,
         /// The Vulkan side of the timeline (signalled by segment submits, waited by the next).
         vk_sem: TpExportSemaphore,
         /// The same timeline imported into Level Zero.
@@ -189,6 +240,28 @@ mod imp {
                 skinny.insert((dt, false), kernel(m, &format!("{base}_m8"), 128)?);
                 skinny.insert((dt, true), kernel(m, &format!("{base}_m16"), 128)?);
             }
+            skinny.insert((DType::Q8_0, false), kernel(&iq, "gemm_q8_0_m8", 128)?);
+            skinny.insert((DType::Q8_0, true), kernel(&iq, "gemm_q8_0_m16", 128)?);
+            let dc = infr_ze::kernels::decode().ok_or("infr-ze built without ocloc")?;
+            let ad = infr_ze::kernels::attn_dec().ok_or("infr-ze built without ocloc")?;
+            let dc = gpu.module(dc).map_err(|e| e.to_string())?;
+            let ad = gpu.module(ad).map_err(|e| e.to_string())?;
+            let mut dec = HashMap::new();
+            for (name, wg) in [
+                ("copy_f32", 256),
+                ("copy_strided", 256),
+                ("store_f16", 256),
+                ("copy_f16", 256),
+                ("gated_act", 256),
+                ("conv1d_silu", 256),
+                ("deltanet_hist", 128),
+                ("gated_rmsnorm", 128),
+                ("qk_norm_rope", 64),
+            ] {
+                dec.insert(name, kernel(&dc, name, wg)?);
+            }
+            dec.insert("attn_dec256", kernel(&ad, "attn_dec256", 32)?);
+            dec.insert("attn_dec_combine", kernel(&ad, "attn_dec_combine", 256)?);
             let sum_splits = kernel(&ew, "sum_splits", 256)?;
             let partials = gpu.alloc(SKINNY_PARTIALS).map_err(|e| e.to_string())?;
             let vk_sem = be_.tp_export_timeline().map_err(|e| e.to_string())?;
@@ -212,6 +285,8 @@ mod imp {
                 skinny,
                 sum_splits,
                 partials,
+                dec,
+                attn_parts: None,
                 vk_sem,
                 ze_sem,
                 value: 0,
@@ -264,8 +339,13 @@ mod imp {
             in_f: usize,
             out_f: usize,
         ) -> Result<()> {
-            let (vals, bytes, _) = weight_block(dt)
-                .ok_or_else(|| be(format!("ze gemm: no Level Zero kernel for {dt:?}")))?;
+            let block = if m <= SKINNY_MAX_M {
+                skinny_block(dt)
+            } else {
+                weight_block(dt)
+            };
+            let (vals, bytes, _) =
+                block.ok_or_else(|| be(format!("ze gemm: no Level Zero kernel for {dt:?}")))?;
             let w_off_b = w_off / vals * bytes;
             let mut g = self.0.lock().unwrap();
             let (a_id, a_off) = g.import(be_, a16)?;
@@ -288,15 +368,22 @@ mod imp {
                 e(k.arg(4, out_f as i32))?;
                 e(k.arg(5, in_f as i32))?;
                 e(k.arg(6, nsplit as i32))?;
-                e(g.gpu
-                    .launch(k, [out_f.div_ceil(256) as u32, nsplit as u32, 1]))?;
+                e(g.gpu.launch_labeled(
+                    k,
+                    [out_f.div_ceil(256) as u32, nsplit as u32, 1],
+                    skinny_label(dt),
+                ))?;
                 if nsplit > 1 {
                     let s = &g.sum_splits;
                     e(s.arg_buf(0, &g.partials))?;
                     e(s.arg_buf_at(1, &g.imports[&c_id], c_off))?;
                     e(s.arg(2, (m * out_f) as i32))?;
                     e(s.arg(3, nsplit as i32))?;
-                    e(g.gpu.launch(s, [(m * out_f).div_ceil(256) as u32, 1, 1]))?;
+                    e(g.gpu.launch_labeled(
+                        s,
+                        [(m * out_f).div_ceil(256) as u32, 1, 1],
+                        "sum_splits",
+                    ))?;
                 }
                 return Ok(());
             }
@@ -320,7 +407,8 @@ mod imp {
                 e(k.arg_buf_at(0, &g.imports[&a_id], a_off + r0 * in_f * 2))?;
                 e(k.arg_buf_at(2, &g.imports[&c_id], c_off + r0 * out_f * 4))?;
                 e(k.arg(3, mc as i32))?;
-                e(g.gpu.launch(k, [1, (out_f / 64) as u32, 1]))?;
+                e(g.gpu
+                    .launch_labeled(k, [1, (out_f / 64) as u32, 1], "gemm_prefill"))?;
             }
             Ok(())
         }
@@ -352,7 +440,8 @@ mod imp {
             e(g.rmsnorm.arg(4, dim as i32))?;
             e(g.rmsnorm.arg(5, eps))?;
             e(g.rmsnorm.arg(6, i32::from(y16.is_some())))?;
-            e(g.gpu.launch(&g.rmsnorm, [rows as u32, 1, 1]))
+            e(g.gpu
+                .launch_labeled(&g.rmsnorm, [rows as u32, 1, 1], "rmsnorm"))
         }
 
         /// `y = silu(gate) * up` over `rows` rows of `[gate | up]` (`nff` each), with the optional
@@ -384,8 +473,11 @@ mod imp {
             e(g.swiglu.arg(5, i32::from(clamp.is_some())))?;
             e(g.swiglu.arg(6, clamp.unwrap_or(0.0)))?;
             e(g.swiglu.arg(7, i32::from(y16.is_some())))?;
-            e(g.gpu
-                .launch(&g.swiglu, [(rows * nff).div_ceil(256) as u32, 1, 1]))
+            e(g.gpu.launch_labeled(
+                &g.swiglu,
+                [(rows * nff).div_ceil(256) as u32, 1, 1],
+                "swiglu",
+            ))
         }
 
         /// Flash-attention prefill, head dim 256 (`attn_fa256`): `q` f16 `[rows, nh, 256]`, `kc`/`vc`
@@ -422,7 +514,8 @@ mod imp {
                 e(k.arg(4 + i as u32, *v as i32))?;
             }
             e(k.arg(10, scale))?;
-            e(g.gpu.launch(k, [(rows.div_ceil(32) * nh) as u32, 1, 1]))
+            e(g.gpu
+                .launch_labeled(k, [(rows.div_ceil(32) * nh) as u32, 1, 1], "attn_fa256"))
         }
 
         /// `dst = a + b` over `n` floats.
@@ -445,7 +538,8 @@ mod imp {
                 e(g.add.arg_buf_at(i as u32, &g.imports[id], *off))?;
             }
             e(g.add.arg(3, n as i32))?;
-            e(g.gpu.launch(&g.add, [n.div_ceil(256) as u32, 1, 1]))
+            e(g.gpu
+                .launch_labeled(&g.add, [n.div_ceil(256) as u32, 1, 1], "add"))
         }
 
         /// `y16 = (half) x` over `n` floats — a GEMM's A copy no producer wrote.
@@ -467,7 +561,139 @@ mod imp {
                 e(g.to_f16.arg_buf_at(i as u32, &g.imports[id], *off))?;
             }
             e(g.to_f16.arg(2, n as i32))?;
-            e(g.gpu.launch(&g.to_f16, [n.div_ceil(256) as u32, 1, 1]))
+            e(g.gpu
+                .launch_labeled(&g.to_f16, [n.div_ceil(256) as u32, 1, 1], "to_f16"))
+        }
+
+        /// Launch the verify-sized kernel `name` (`decode.cl`) with `args` in order — buffers are
+        /// imported (exportable allocations, at their offsets), ints and floats passed as values.
+        pub(crate) fn run(
+            &self,
+            be_: &VulkanBackend,
+            name: &'static str,
+            args: &[ZArg],
+            groups: [u32; 3],
+        ) -> Result<()> {
+            let mut g = self.0.lock().unwrap();
+            let mut ids = Vec::with_capacity(args.len());
+            for a in args {
+                ids.push(match a {
+                    ZArg::B(b) | ZArg::O(b, _) => Some(g.import(be_, *b)?),
+                    _ => None,
+                });
+            }
+            let g = &*g;
+            let k = g
+                .dec
+                .get(name)
+                .ok_or_else(|| be(format!("ze: no kernel {name}")))?;
+            let e = |r: infr_ze::Result<()>| r.map_err(|e| be(format!("ze {name}: {e}")));
+            for (i, (a, id)) in args.iter().zip(&ids).enumerate() {
+                let i = i as u32;
+                match (a, id) {
+                    (ZArg::B(_), Some((id, off))) => e(k.arg_buf_at(i, &g.imports[id], *off))?,
+                    (ZArg::O(_, extra), Some((id, off))) => {
+                        e(k.arg_buf_at(i, &g.imports[id], *off + *extra))?
+                    }
+                    (ZArg::I(v), _) => e(k.arg(i, *v))?,
+                    (ZArg::F(v), _) => e(k.arg(i, *v))?,
+                    (ZArg::B(_) | ZArg::O(..), None) => unreachable!("imported above"),
+                }
+            }
+            e(g.gpu.launch_labeled(k, groups, name))
+        }
+
+        /// Verify-sized attention, head dim 256 (`attn_dec256` + `attn_dec_combine`): `q` f16
+        /// `[rows, nh, 256]`, `kc`/`vc` f16 caches (no ring), `o` f32 `[rows, nh, 256]`; causal
+        /// from `pos`, `scale` (0 = 1/16). The key range is split into chunks so a long context
+        /// fills the card.
+        #[allow(clippy::too_many_arguments)]
+        pub(crate) fn attention_dec(
+            &self,
+            be_: &VulkanBackend,
+            q: &dyn Buffer,
+            kc: &dyn Buffer,
+            vc: &dyn Buffer,
+            o: &dyn Buffer,
+            rows: usize,
+            kv_len: usize,
+            nh: usize,
+            nkv: usize,
+            pos: usize,
+            scale: f32,
+        ) -> Result<()> {
+            // ~32 chunks of a multiple of the 32-key block, 64..=2048 keys each.
+            let chunk = kv_len.div_ceil(32).next_multiple_of(32).clamp(64, 2048);
+            let nchunk = kv_len.div_ceil(chunk).max(1);
+            let units = nchunk * rows * nh;
+            let mut g = self.0.lock().unwrap();
+            if g.attn_parts.as_ref().is_none_or(|(_, _, cap)| *cap < units) {
+                let cap = units.next_power_of_two();
+                let po = g
+                    .gpu
+                    .alloc(cap * 256 * 4)
+                    .map_err(|e| be(format!("ze alloc: {e}")))?;
+                let pml = g
+                    .gpu
+                    .alloc(cap * 2 * 4)
+                    .map_err(|e| be(format!("ze alloc: {e}")))?;
+                g.attn_parts = Some((po, pml, cap));
+            }
+            let ids = [q, kc, vc, o]
+                .iter()
+                .map(|b| g.import(be_, *b))
+                .collect::<Result<Vec<_>>>()?;
+            let g = &*g;
+            let (po, pml, _) = g.attn_parts.as_ref().expect("allocated above");
+            let e = |r: infr_ze::Result<()>| r.map_err(|e| be(format!("ze attention_dec: {e}")));
+            let k = &g.dec["attn_dec256"];
+            for (i, (id, off)) in ids[..3].iter().enumerate() {
+                e(k.arg_buf_at(i as u32, &g.imports[id], *off))?;
+            }
+            e(k.arg_buf(3, po))?;
+            e(k.arg_buf(4, pml))?;
+            for (i, v) in [rows, kv_len, nh, nkv, pos, chunk].iter().enumerate() {
+                e(k.arg(5 + i as u32, *v as i32))?;
+            }
+            e(k.arg(11, scale))?;
+            e(g.gpu.launch_labeled(
+                k,
+                [nh as u32, nchunk as u32, rows.div_ceil(8) as u32],
+                "attn_dec256",
+            ))?;
+            let c = &g.dec["attn_dec_combine"];
+            e(c.arg_buf(0, po))?;
+            e(c.arg_buf(1, pml))?;
+            let (oid, ooff) = ids[3];
+            e(c.arg_buf_at(2, &g.imports[&oid], ooff))?;
+            e(c.arg(3, rows as i32))?;
+            e(c.arg(4, nh as i32))?;
+            e(c.arg(5, nchunk as i32))?;
+            e(g.gpu
+                .launch_labeled(c, [(rows * nh) as u32, 1, 1], "attn_dec_combine"))
+        }
+
+        /// Open a Level Zero per-kernel profile (`INFR_PROF_OPS`) for the forward about to run.
+        pub(crate) fn profile_begin(&self) -> Result<()> {
+            let g = self.0.lock().unwrap();
+            g.gpu
+                .profile_begin(16384)
+                .map_err(|e| be(format!("ze profile: {e}")))
+        }
+
+        /// Close the profile and fold it, by label, into the `[prof:ze]` report.
+        pub(crate) fn profile_report(&self) -> Result<()> {
+            let g = self.0.lock().unwrap();
+            let rows = g
+                .gpu
+                .profile_take()
+                .map_err(|e| be(format!("ze profile: {e}")))?;
+            let mut p = infr_core::prof::OpProf::new("ze", infr_core::prof::Unit::Device);
+            for (label, ns) in rows {
+                p.add(label, ns / 1e3);
+            }
+            p.flush();
+            Ok(())
         }
 
         /// Drop the import of a retired exportable allocation.
