@@ -941,6 +941,38 @@ mod imp {
         ) -> Result<()> {
             match *self {}
         }
+        pub(crate) fn run(
+            &self,
+            _: &VulkanBackend,
+            _: &'static str,
+            _: &[super::ZArg],
+            _: [u32; 3],
+        ) -> Result<()> {
+            match *self {}
+        }
+        #[allow(clippy::too_many_arguments)]
+        pub(crate) fn attention_dec(
+            &self,
+            _: &VulkanBackend,
+            _: &dyn Buffer,
+            _: &dyn Buffer,
+            _: &dyn Buffer,
+            _: &dyn Buffer,
+            _: usize,
+            _: usize,
+            _: usize,
+            _: usize,
+            _: usize,
+            _: f32,
+        ) -> Result<()> {
+            match *self {}
+        }
+        pub(crate) fn profile_begin(&self) -> Result<()> {
+            match *self {}
+        }
+        pub(crate) fn profile_report(&self) -> Result<()> {
+            match *self {}
+        }
     }
 
     impl VulkanBackend {
